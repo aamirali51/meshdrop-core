@@ -1,0 +1,33 @@
+{
+  "name": "@mesh/core",
+  "version": "1.0.0-beta.1",
+  "description": "Zero-cloud P2P messenger and file-transfer engine. Platform-agnostic core for MeshDrop (iOS, Android, macOS, Windows, Linux). No Electron, no IPC, no cloud.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "protocol.js",
+    "crypto.js",
+    "noiseKeypair.js",
+    "storage.js",
+    "connections/",
+    "engine/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test-sync-unit.js && node test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "compact-encoding": "^3.0.0",
+    "corestore": "^7.9.1",
+    "hyperbee": "^2.27.3",
+    "hypercore-crypto": "^3.3.0",
+    "hyperswarm": "^4.17.0",
+    "protomux": "^3.11.0"
+  }
+}

@@ -1,0 +1,607 @@
+'use strict'
+
+// TrustManager owns the pairing-code lifecycle and the challenge-response
+// handshake. Trust is granted ONLY after a peer proves knowledge of the code
+// (keyed MAC over our random nonce). Nothing here fabricates trust.
+//
+// Deleting a device revokes its key until it completes a FRESH pairing: the
+// host code is rotated so its memorized secret dies, and the key is refused
+// from the auto-trust paths (stale records, LAN auto-trust). Pairing with the
+// current code again re-admits it (unrevokeKey in handleResponse).
+
+const b4a = require('b4a')
+const { randomBytes, generatePairingCode, normalizePairingCode, mac, codeId } = require('../crypto.js')
+const { MESSAGES } = require('../protocol.js')
+
+const PAIRING_TTL = 15 * 60 * 1000 // pairing code lifetime (15 minutes)
+// Watchdog for the challenge-response phase. It is armed ONLY when a
+// PAIRING_CHALLENGE is actually sent or received (_armPairingTimeout), never
+// on raw connection open — so a user typing a pairing code is not racing a
+// timer that started when the connection formed. It is cleared on successful
+// verification (handleResponse) so a verified connection is never killed by
+// a leftover timer while the HANDSHAKE is still in flight.
+const PAIRING_TIMEOUT = 30 * 1000 // max time between challenge activity and verification
+
+class TrustManager {
+  constructor({
+    getBee,
+    computeTopicHash,
+    swarm,
+    topicRegistry,
+    getPeers,
+    sendHandshake,
+    onTrustGranted
+  }) {
+    this.getBee = getBee
+    this.computeTopicHash = computeTopicHash
+    this.swarm = swarm
+    this.topicRegistry = topicRegistry
+    this.getPeers = getPeers // () => Map<peerId, peerObj>
+    this.sendHandshake = sendHandshake // (peerId) => void
+    this.onTrustGranted = onTrustGranted || (() => {}) // (peerId, code) => void
+    this.pairingSecrets = new Map() // codeId -> { code, role, createdAt, expiresAt, codeId }
+    this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
+    this.revokedKeys = new Map() // hex noise public key -> revokedAt ms; refused until a fresh pairing
+    this.pairingCodePromise = null // single-flight guard for concurrent code fetches
+  }
+
+  // Hydrate the revoked-key set (deleted devices awaiting re-pairing). Must
+  // run before loadTrustedPeerKeys so a stale device record can never re-admit
+  // a key that was revoked by deletion.
+  async loadRevokedKeys() {
+    try {
+      const bee = await this.getBee('revokedPeers')
+      for await (const node of bee.createReadStream()) {
+        const v = node.value
+        if (v && typeof v.publicKey === 'string' && v.publicKey.length === 64) {
+          // Persisted revokedAt is an ISO string; normalize to epoch ms so the
+          // freshness comparison in handleResponse stays numeric.
+          const ts = typeof v.revokedAt === 'number' ? v.revokedAt : Date.parse(v.revokedAt || '')
+          this.revokedKeys.set(v.publicKey, Number.isFinite(ts) ? ts : Date.now())
+        }
+      }
+      if (this.revokedKeys.size > 0) {
+        console.log(
+          `[MeshEngine] Loaded ${this.revokedKeys.size} revoked peer key(s): ${Array.from(this.revokedKeys)
+            .map((k) => k[0].slice(0, 12))
+            .join(', ')}`
+        )
+      }
+    } catch (err) {
+      console.warn('[MeshEngine] loadRevokedKeys failed:', err.message)
+    }
+  }
+
+  async loadTrustedPeerKeys() {
+    try {
+      const bee = await this.getBee('devices')
+      for await (const node of bee.createReadStream()) {
+        const dev = node.value
+        if (
+          dev &&
+          dev.isTrusted === true &&
+          dev.trustedAt &&
+          dev.publicKey &&
+          dev.publicKey.length === 64 &&
+          !this.revokedKeys.has(dev.publicKey) // a revoked key is never trusted
+        ) {
+          this.trustedPeerKeys.add(dev.publicKey)
+        }
+      }
+      console.log(`[MeshEngine] Loaded ${this.trustedPeerKeys.size} trusted peer key(s)`)
+      if (this.trustedPeerKeys.size > 0) {
+        console.log(
+          `[MeshEngine] Trusted keys: ${Array.from(this.trustedPeerKeys)
+            .map((k) => k.slice(0, 12))
+            .join(', ')}`
+        )
+      }
+    } catch (err) {
+      console.warn('[MeshEngine] loadTrustedPeerKeys failed:', err.message)
+    }
+  }
+
+  isTrustedPublicKey(pubKeyHex) {
+    return (
+      typeof pubKeyHex === 'string' &&
+      pubKeyHex.length === 64 &&
+      !this.revokedKeys.has(pubKeyHex) &&
+      this.trustedPeerKeys.has(pubKeyHex)
+    )
+  }
+
+  isRevoked(pubKeyHex) {
+    return typeof pubKeyHex === 'string' && this.revokedKeys.has(pubKeyHex)
+  }
+
+  addTrustedKey(pubKeyHex) {
+    if (typeof pubKeyHex !== 'string' || pubKeyHex.length !== 64) return
+    // A revoked key is not trusted until it is explicitly re-paired
+    // (handleResponse un-revokes it on a successful fresh challenge).
+    if (this.revokedKeys.has(pubKeyHex)) return
+    this.trustedPeerKeys.add(pubKeyHex)
+  }
+
+  removeTrustedKey(pubKeyHex) {
+    this.trustedPeerKeys.delete(pubKeyHex)
+  }
+
+  // Refuse a peer key until it completes a fresh pairing. Called when a device
+  // is deleted: deletion breaks the CURRENT trust, so the key cannot sneak back
+  // via a stale record, LAN auto-trust, or the memorized old pairing code — but
+  // pairing with a code registered AFTER this moment re-admits it
+  // (handleResponse -> unrevokeKey).
+  async revokeKey(pubKeyHex) {
+    if (typeof pubKeyHex !== 'string' || pubKeyHex.length !== 64) return
+    const revokedAt = Date.now()
+    this.revokedKeys.set(pubKeyHex, revokedAt)
+    this.trustedPeerKeys.delete(pubKeyHex)
+    try {
+      const bee = await this.getBee('revokedPeers')
+      await bee.put(pubKeyHex, {
+        publicKey: pubKeyHex,
+        revokedAt: new Date(revokedAt).toISOString()
+      })
+      console.log(
+        `[MeshEngine] Revoked peer key ${pubKeyHex.slice(0, 12)}... (deleted device; re-pairing required)`
+      )
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to persist revoked key:', err.message)
+    }
+  }
+
+  // Re-admit a key after it completes a fresh explicit pairing. The in-memory
+  // removal is synchronous because handleResponse grants trust immediately
+  // after this; persistence is best-effort fire-and-forget.
+  unrevokeKey(pubKeyHex) {
+    if (typeof pubKeyHex !== 'string') return
+    this.revokedKeys.delete(pubKeyHex)
+    this.getBee('revokedPeers')
+      .then((bee) => bee.del(pubKeyHex))
+      .catch((err) => console.warn('[MeshEngine] Failed to clear revoked key:', err.message))
+  }
+
+  // Delete rotates the pairing secret(s) so the deleted peer's memorized code
+  // becomes useless: a fresh host code is generated and every joiner code is
+  // dropped (the deleted peer could answer challenges for the codes it took
+  // part in). This is what makes deletion permanent WITHOUT a blacklist — the
+  // deleted peer can only come back by pairing with the CURRENT code again.
+  async rotateHostPairingCode() {
+    for (const [cid, secret] of this.pairingSecrets.entries()) {
+      this.pairingSecrets.delete(cid)
+      if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${secret.code}`)
+    }
+    try {
+      const bee = await this.getBee('pairingCodes')
+      await bee.del('active')
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to clear persisted pairing code:', err.message)
+    }
+    // Force a fresh code: getOrCreatePairingCode reuses the active secret and
+    // single-flights through pairingCodePromise, so both must be reset.
+    this.pairingCodePromise = null
+    const fresh = await this.getOrCreatePairingCode()
+    console.log(`[MeshEngine] Rotated pairing code after device deletion: ${fresh}`)
+    return fresh
+  }
+
+  // Reuse active in-memory host code (permanent per device)
+  getActiveHostCode() {
+    const now = Date.now()
+    for (const [, secret] of this.pairingSecrets.entries()) {
+      if (secret.role === 'host' && (secret.expiresAt === 0 || now < secret.expiresAt)) {
+        return secret.code
+      }
+    }
+    return null
+  }
+
+  async getOrCreatePairingCode() {
+    const active = this.getActiveHostCode()
+    if (active) return active
+    // Single-flight: concurrent callers must all see the SAME code. Without
+    // this each call generated its own code and every extra secret was
+    // orphaned.
+    if (this.pairingCodePromise) return this.pairingCodePromise
+    this.pairingCodePromise = this._generatePairingCode().finally(() => {
+      this.pairingCodePromise = null
+    })
+    return this.pairingCodePromise
+  }
+
+  async _generatePairingCode() {
+    const now = Date.now()
+
+    // Reuse a persisted host code across restarts. The code lives in its OWN
+    // bee ('pairingCodes'). Host pairing codes are permanent per device (expiresAt = 0).
+    try {
+      const bee = await this.getBee('pairingCodes')
+      const entry = await bee.get('active')
+      if (entry && entry.value && entry.value.code) {
+        const p = entry.value
+        const cid = codeId(p.code)
+        this.pairingSecrets.set(cid, {
+          code: p.code,
+          role: 'host',
+          createdAt: p.createdAt,
+          expiresAt: 0,
+          codeId: cid
+        })
+        this._joinPairingTopic(p.code)
+        console.log(`[MeshEngine] Restored permanent pairing code: ${p.code}`)
+        return p.code
+      }
+    } catch (err) {
+      console.warn(
+        '[MeshEngine] Persisted pairing code unavailable; generating a fresh code:',
+        err.message
+      )
+    }
+
+    // Generate a fresh random 80-bit code
+    const code = generatePairingCode()
+    const secret = {
+      code,
+      role: 'host',
+      createdAt: now,
+      expiresAt: 0, // Permanent host code until user explicitly rotates
+      codeId: codeId(code)
+    }
+    this.pairingSecrets.set(secret.codeId, secret)
+    try {
+      const bee = await this.getBee('pairingCodes')
+      await bee.put('active', {
+        code,
+        codeId: secret.codeId,
+        createdAt: secret.createdAt,
+        expiresAt: 0
+      })
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to persist pairing code:', err.message)
+    }
+    try {
+      this._joinPairingTopic(code)
+      this.sendChallengesToAll()
+    } catch (err) {
+      // Never let topic join/sync break code delivery: callers must always
+      // receive a code.
+      console.warn('[MeshEngine] Pairing topic join failed:', err.message)
+    }
+    console.log(`[MeshEngine] Permanent pairing code generated: ${code}`)
+    return code
+  }
+
+  // Register a code the user is pairing with (joiner side) and join its topic.
+  // Returns the canonical code, or null if the format is invalid.
+  registerJoinerCode(rawCode) {
+    const cleanCode = normalizePairingCode(rawCode)
+    if (!cleanCode) return null
+    const now = Date.now()
+    this.pairingSecrets.set(codeId(cleanCode), {
+      code: cleanCode,
+      role: 'joiner',
+      createdAt: now,
+      expiresAt: now + PAIRING_TTL,
+      codeId: codeId(cleanCode)
+    })
+    // Snapshot peers that were already trusted BEFORE this registration:
+    // sendChallengesToAll may complete a fresh pairing for an untrusted peer (which
+    // emits its own events), so only pre-existing trusted peers need probing.
+    const trustedIds = new Set()
+    for (const [pId, peerObj] of this.getPeers().entries()) {
+      if (peerObj.pairing && peerObj.pairing.trusted && !this.isRevoked(pId)) trustedIds.add(pId)
+    }
+    this._joinPairingTopic(cleanCode)
+    this.sendChallengesToAll()
+    // Untrusted peers were just challenged by sendChallengesToAll. Trusted peers are
+    // skipped there, but the code's host may already be connected and trusted
+    // (LAN auto-trust, or a pairing completed before the code was entered) —
+    // probe them so the host can identify itself without a fresh handshake.
+    this._probeTrustedPeers(cleanCode, codeId(cleanCode), trustedIds)
+    return cleanCode
+  }
+
+  /**
+   * Broadcast pairing challenges to all connected peers that require verification,
+   * and answer any pending challenges that arrived before the secret was registered.
+   */
+  sendChallengesToAll() {
+    for (const [peerId, peerObj] of this.getPeers().entries()) {
+      if (!peerObj || !peerObj.signaling || !peerObj.pairing) continue
+      // Flush any pending challenges that arrived before we registered a matching code
+      if (peerObj.pairing.pendingChallenges && peerObj.pairing.pendingChallenges.length > 0) {
+        const pending = peerObj.pairing.pendingChallenges
+        peerObj.pairing.pendingChallenges = []
+        for (const ch of pending) {
+          this.handleChallenge(peerId, ch)
+        }
+      }
+      if (!peerObj.pairing.trusted || this.isRevoked(peerId)) {
+        this.sendChallenges(peerId)
+      }
+    }
+  }
+
+  // Ask already-connected trusted peers whether they hold the freshly
+  // registered code. Only the real host can answer (keyed MAC over the nonce),
+  // which lets the caller complete the pairing instantly instead of waiting
+  // for a handshake that will never come on an already-established connection.
+  _probeTrustedPeers(code, cid, trustedIds) {
+    for (const pId of trustedIds) {
+      const peerObj = this.getPeers().get(pId)
+      if (!peerObj || !peerObj.signaling || !peerObj.pairing || !peerObj.pairing.trusted) continue
+      if (this.isRevoked(pId)) continue // revoked peers are never probed
+      if (peerObj.pairing.outstanding.some((o) => o.codeId === cid)) continue
+      const nonce = randomBytes(16)
+      peerObj.pairing.outstanding.push({ nonce, code, codeId: cid })
+      try {
+        peerObj.signaling.send({
+          type: MESSAGES.PAIRING_CHALLENGE,
+          codeId: cid,
+          nonce: b4a.toString(nonce, 'hex')
+        })
+      } catch (err) {
+        console.error('[MeshEngine] Failed to probe trusted peer:', err.message)
+      }
+    }
+  }
+
+  _joinPairingTopic(code) {
+    const label = `p2p-pair-${code}`
+    if (this.topicRegistry) this.topicRegistry.ensure(label, { client: true, server: true })
+    else {
+      const topicHash = this.computeTopicHash(label)
+      this.swarm.join(topicHash, { client: true, server: true })
+      this.swarm.flush().catch(() => {})
+    }
+  }
+
+  // Arm (or re-arm) the pairing watchdog for a peer. The timer is tied to
+  // challenge activity, not connection open, and only runs while the peer is
+  // still in an unverified pairing state. On fire it destroys the connection
+  // so an abandoned pairing never lingers forever.
+  _armPairingTimeout(peerId) {
+    const peerObj = this.getPeers().get(peerId)
+    if (!peerObj || !peerObj.pairing) return
+    if (peerObj.pairing.trusted || peerObj.pairing.complete) return
+    if (peerObj.pairing.timeout) clearTimeout(peerObj.pairing.timeout)
+    peerObj.pairing.timeout = setTimeout(() => {
+      peerObj.pairing.timeout = null
+      const p = this.getPeers().get(peerId)
+      if (!p || !p.pairing) return
+      if (p.pairing.trusted || p.pairing.complete) return
+      console.warn(
+        `[MeshEngine] Pairing timed out for ${peerId.slice(0, 12)}... (challenge never verified)`
+      )
+      try {
+        p.connection.destroy()
+      } catch {}
+    }, PAIRING_TIMEOUT)
+    if (peerObj.pairing.timeout.unref) peerObj.pairing.timeout.unref()
+  }
+
+  // Clear the watchdog for a peer (called on successful verification and on
+  // failure paths where the connection is being torn down anyway).
+  _clearPairingTimeout(peerId) {
+    const peerObj = this.getPeers().get(peerId)
+    if (!peerObj || !peerObj.pairing) return
+    if (peerObj.pairing.timeout) {
+      clearTimeout(peerObj.pairing.timeout)
+      peerObj.pairing.timeout = null
+    }
+  }
+
+  // Send a pairing challenge for every active pairing secret, one outstanding
+  // challenge per (peer, secret) so MACs tie to a single nonce. Revoked peers
+  // are challenged too: they can only answer with a CURRENT code (the old ones
+  // were rotated away on deletion), which is exactly what a fresh pairing needs.
+  sendChallenges(peerId) {
+    const peerObj = this.getPeers().get(peerId)
+    if (!peerObj || !peerObj.signaling || !peerObj.pairing) return
+    if (peerObj.pairing.trusted && !this.isRevoked(peerId)) return
+    const sentCodeIds = new Set(peerObj.pairing.outstanding.map((o) => o.codeId))
+    let sentAny = false
+    for (const [, secret] of this.pairingSecrets.entries()) {
+      if (sentCodeIds.has(secret.codeId)) continue
+      if (secret.expiresAt > 0 && Date.now() >= secret.expiresAt) continue
+      const nonce = randomBytes(16)
+      peerObj.pairing.outstanding.push({ nonce, code: secret.code, codeId: secret.codeId })
+      try {
+        peerObj.signaling.send({
+          type: MESSAGES.PAIRING_CHALLENGE,
+          codeId: secret.codeId,
+          nonce: b4a.toString(nonce, 'hex')
+        })
+        sentAny = true
+      } catch (err) {
+        console.error('[MeshEngine] Failed to send PAIRING_CHALLENGE:', err.message)
+      }
+    }
+    // A challenge went out: start the watchdog from actual pairing activity.
+    if (sentAny) this._armPairingTimeout(peerId)
+  }
+
+  // Respond to a peer's challenge using the secret matching its codeId.
+  // Trust is NEVER granted here; we only prove knowledge of the code. We answer
+  // even if the peer is already trusted, otherwise a peer whose challenge
+  // arrives after we verified its response could never verify ours (deadlock).
+  handleChallenge(peerId, msg) {
+    const peerObj = this.getPeers().get(peerId)
+    if (!peerObj || !peerObj.pairing) {
+      return
+    }
+    // A revoked (deleted) peer's challenge is left unanswered UNLESS we have an
+    // active matching secret registered (e.g. user explicitly entered the code to
+    // re-pair). Re-admission happens on OUR challenge to it (handleResponse).
+    if (this.isRevoked(peerId)) {
+      const secret = typeof msg.codeId === 'string' ? this.pairingSecrets.get(msg.codeId) : null
+      if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) {
+        return
+      }
+    }
+    if (typeof msg.codeId !== 'string' || typeof msg.nonce !== 'string') return
+
+    // Receiving a challenge means pairing activity is underway: start (or
+    // reset) the watchdog now, not at connection open. No-op for trusted peers
+    // (the watchdog guard below) and harmless for direct-mode ones.
+    this._armPairingTimeout(peerId)
+
+    const secret = this.pairingSecrets.get(msg.codeId)
+    if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) {
+      // We don't know this code (yet). Remember it so we can answer once a
+      // matching secret is registered (e.g. code entered after connection).
+      // This applies to TRUSTED peers too: if the challenger's stored trust
+      // for us is stale (noise key changed before persistence), answering its
+      // challenge once the code is entered is the only way it can verify us
+      // and complete its side — dropping the challenge here deadlocks it in
+      // a one-way trust state (it keeps challenging, we keep not answering).
+      if (!peerObj.pairing.pendingChallenges) peerObj.pairing.pendingChallenges = []
+      peerObj.pairing.pendingChallenges.push({ codeId: msg.codeId, nonce: msg.nonce })
+      if (peerObj.pairing.pendingChallenges.length > 16) peerObj.pairing.pendingChallenges.shift()
+      return
+    }
+
+    const nonceBuf = b4a.from(msg.nonce, 'hex')
+    if (nonceBuf.length !== 16) return
+    const signature = mac(secret.code, nonceBuf)
+    try {
+      peerObj.signaling.send({
+        type: MESSAGES.PAIRING_RESP,
+        nonce: msg.nonce,
+        mac: b4a.toString(signature, 'hex')
+      })
+    } catch (err) {
+      console.error('[MeshEngine] Failed to send PAIRING_RESP:', err.message)
+    }
+  }
+
+  // Verify the peer's response to OUR challenge. Only here do we grant trust.
+  // On failure the connection is destroyed (untrusted peers only).
+  handleResponse(peerId, msg) {
+    const peerObj = this.getPeers().get(peerId)
+    if (!peerObj || !peerObj.pairing) {
+      return
+    }
+    const alreadyTrusted = peerObj.pairing.trusted
+    if (!alreadyTrusted && peerObj.pairing.mode !== 'pairing') {
+      return
+    }
+    if (typeof msg.nonce !== 'string' || typeof msg.mac !== 'string') return
+
+    const idx = peerObj.pairing.outstanding.findIndex((o) => b4a.toString(o.nonce, 'hex') === msg.nonce)
+    if (idx === -1) {
+      if (alreadyTrusted) return // stale/duplicate response — never kill a live peer
+      console.warn(`[MeshEngine] Pairing response nonce mismatch from ${peerId}, disconnecting`)
+      this._clearPairingTimeout(peerId)
+      try {
+        peerObj.connection.destroy()
+      } catch {}
+      return
+    }
+    const outstanding = peerObj.pairing.outstanding[idx]
+    const expected = b4a.toString(mac(outstanding.code, outstanding.nonce), 'hex')
+    if (msg.mac !== expected) {
+      if (alreadyTrusted) return // probe mismatch — ignore rather than kill a live peer
+      console.warn(`[MeshEngine] Pairing challenge FAILED from ${peerId}, disconnecting`)
+      this._clearPairingTimeout(peerId)
+      try {
+        peerObj.connection.destroy()
+      } catch {}
+      return
+    }
+
+    peerObj.pairing.outstanding.splice(idx, 1)
+    if (alreadyTrusted) {
+      // The peer proved knowledge of a registered code over an already-trusted
+      // connection: it is the code's host (LAN auto-trust, or a pairing that
+      // completed before the code was entered). Re-confirm so the caller gets
+      // a fresh completion signal without re-running the handshake.
+      console.log(`[MeshEngine] Pairing re-confirmed for ${peerId} (${outstanding.code})`)
+      this._clearPairingTimeout(peerId)
+      this.onTrustGranted(peerId, outstanding.code)
+      return
+    }
+
+    // A deleted (revoked) peer is re-admitted ONLY if it answers with a code
+    // registered AFTER the revocation (the pairing code was rotated on
+    // deletion, so such a code can only be known through an explicit fresh
+    // pairing). An answer with a stale, memorized code is refused — this holds
+    // even if the code rotation write above ever failed.
+    if (this.isRevoked(peerId)) {
+      const revokedAt = this.revokedKeys.get(peerId)
+      const secret = this.pairingSecrets.get(outstanding.codeId)
+      const secretIsFresh = secret && typeof secret.createdAt === 'number' && secret.createdAt >= revokedAt
+      if (!secretIsFresh) {
+        console.warn(
+          `[MeshEngine] Refusing stale-code pairing from revoked peer ${peerId.slice(0, 12)}... (re-pairing required)`
+        )
+        this._clearPairingTimeout(peerId)
+        try {
+          peerObj.connection.destroy()
+        } catch {}
+        return
+      }
+      console.log(
+        `[MeshEngine] Pairing re-admitted previously revoked peer ${peerId.slice(0, 12)}... (${outstanding.code})`
+      )
+      this.unrevokeKey(peerId)
+    }
+
+    peerObj.pairing.trusted = true
+    peerObj.device.isTrusted = true
+    peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
+    // Challenge VERIFIED: drop the watchdog so the connection is never killed
+    // while the reciprocal HANDSHAKE is still in flight.
+    this._clearPairingTimeout(peerId)
+    console.log(`[MeshEngine] Pairing challenge VERIFIED for ${peerId} (${outstanding.code})`)
+    this.getPeers().set(peerId, peerObj)
+    this.onTrustGranted(peerId, outstanding.code)
+    this.sendHandshake(peerId)
+  }
+
+  // Called whenever a new pairing secret is registered: answer any previously
+  // unanswered challenges and send fresh challenges to still-untrusted peers.
+  syncToPeers() {
+    for (const [pId, peerObj] of this.getPeers().entries()) {
+      if (!peerObj.pairing) continue
+      // Answer challenges we could not answer before — for ANY peer, including
+      // trusted ones: a challenger whose stored trust for us is stale can only
+      // complete its side if we answer its challenge once the code is entered.
+      if (Array.isArray(peerObj.pairing.pendingChallenges)) {
+        const still = []
+        for (const pc of peerObj.pairing.pendingChallenges) {
+          const secret = this.pairingSecrets.get(pc.codeId)
+          if (secret && (secret.expiresAt === 0 || Date.now() < secret.expiresAt)) {
+            const signature = mac(secret.code, b4a.from(pc.nonce, 'hex'))
+            try {
+              peerObj.signaling.send({
+                type: MESSAGES.PAIRING_RESP,
+                nonce: pc.nonce,
+                mac: b4a.toString(signature, 'hex')
+              })
+            } catch {}
+          } else {
+            still.push(pc)
+          }
+        }
+        peerObj.pairing.pendingChallenges = still
+      }
+      // Fresh challenges only go to untrusted peers still in the pairing phase.
+      if (peerObj.pairing.mode !== 'pairing' || peerObj.pairing.trusted) continue
+      this.sendChallenges(pId)
+    }
+  }
+
+  // Drop expired pairing secrets so stale codes cannot be used indefinitely.
+  expireSecrets() {
+    const now = Date.now()
+    for (const [cid, secret] of this.pairingSecrets.entries()) {
+      if (secret.expiresAt > 0 && now >= secret.expiresAt) {
+        this.pairingSecrets.delete(cid)
+        if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${secret.code}`)
+      }
+    }
+  }
+}
+
+module.exports = { TrustManager, PAIRING_TTL, PAIRING_TIMEOUT }
