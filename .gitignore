@@ -1,0 +1,5 @@
+# Node dependencies — installed by `npm ci` in CI, never committed.
+node_modules/
+
+# Test/scratch output
+*.log
