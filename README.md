@@ -4,6 +4,14 @@ Zero-cloud, P2P messenger + file-transfer engine extracted from the MeshDrop
 app. Pure JavaScript, platform-agnostic (Node >= 18; runs on desktop
 and mobile Node threads). **No Electron, no IPC, no cloud.**
 
+Part of the [MeshDrop](https://github.com/aamirali51/meshdrop-app) ecosystem.
+
+| Repository | Visibility | Contents |
+|------------|-----------|----------|
+| [meshdrop-app](https://github.com/aamirali51/meshdrop-app) | Private | Desktop + mobile clients |
+| **meshdrop-core** (this repo) | Public | P2P engine — `@mesh/core` |
+| [meshdrop-releases](https://github.com/aamirali51/meshdrop-releases) | Public | Release artifacts for the auto-updater |
+
 ## Install
 
 ```sh
@@ -93,3 +101,7 @@ node test.js
 Spawns two real `MeshEngine` instances in separate processes and storage
 directories, pairs them over the public DHT, transfers a file, and verifies
 the received bytes against the source hash.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
