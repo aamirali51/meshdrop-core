@@ -47,6 +47,13 @@ const SYNC_STREAM_PROTOCOL = 'meshdrop-sync-v1'
 const SYNC_STREAM_WINDOW = 32
 const SYNC_ACK_EVERY = 8
 const SYNC_HANDSHAKE_TIMEOUT = 60 * 1000
+// No-ACK / no-block deadlines. A half-dead connection (dead relay node, phone
+// that lost its network without closing TCP cleanly) never fires 'close', so
+// without these the flow-control waits would hang the transfer forever at the
+// exact byte offset it stalled on. The errors carry "interrupted" so the
+// transfer parks as resumable instead of failing hard.
+const SYNC_FLOW_TIMEOUT = 60 * 1000 // sender: no ACK progress in this window → interrupt
+const SYNC_RECEIVE_IDLE_TIMEOUT = 90 * 1000 // receiver: no blocks after the manifest → interrupt
 
 // ─── ChunkScheduler ────────────────────────────────────────────────────────
 
@@ -1048,7 +1055,9 @@ class TransferEngine {
 
   // Poll for async channel signals (ready/ack/done/close/error) plus pause and
   // cancel flags. Polling keeps the flow control loop simple and race-free.
-  async _waitSync(info, predicate, timeoutMs, label) {
+  // deadlineFn (optional) is polled alongside: a transfer that is stalled but
+  // whose channel has NOT closed (dead relay, silent peer) must still abort.
+  async _waitSync(info, predicate, timeoutMs, label, deadlineFn) {
     const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0
     for (;;) {
       if (info.flags.cancelled) throw new Error('interrupted')
@@ -1056,6 +1065,7 @@ class TransferEngine {
       if (info.errorMsg) throw new Error(info.errorMsg)
       if (predicate()) return
       if (deadline > 0 && Date.now() >= deadline) throw new Error(label + ' timed out')
+      if (deadlineFn && deadlineFn()) throw new Error(label + ' timed out')
       await sleep(25)
     }
   }
@@ -1081,6 +1091,7 @@ class TransferEngine {
       record: transfer,
       readyByteOffset: null,
       ackedBlocks: 0,
+      lastAckAt: 0,
       doneReceived: false,
       errorMsg: null,
       channelClosed: false
@@ -1129,6 +1140,7 @@ class TransferEngine {
         },
         onAck: (n) => {
           info.ackedBlocks = Math.max(info.ackedBlocks, Number(n) || 0)
+          info.lastAckAt = Date.now()
         },
         onClose: () => {
           info.channelClosed = true
@@ -1136,6 +1148,9 @@ class TransferEngine {
       })
       if (!chan) throw new Error('Could not open sync stream channel')
       info.channel = chan
+      // Anchor the no-ACK deadline at channel open: a peer that dies before
+      // the first ACK must not hold the flow-control wait open forever.
+      info.lastAckAt = Date.now()
       const { manifest: manifestMsg, block: blockMsg } = chan
 
       // 2. Integrity manifest — streamed hash of the file (memory-safe).
@@ -1202,7 +1217,8 @@ class TransferEngine {
             info,
             () => info.ackedBlocks >= sentBlocks - Math.floor(SYNC_STREAM_WINDOW / 2),
             0,
-            'flow control'
+            'interrupted: flow control (no ACKs from peer)',
+            () => Date.now() - info.lastAckAt > SYNC_FLOW_TIMEOUT
           )
         }
 
@@ -1301,6 +1317,7 @@ class TransferEngine {
       blockSize: 0,
       blockCount: 0,
       receivedBlocks: 0,
+      lastBlockAt: 0,
       verifiedBytes: 0,
       pendingWrites: 0,
       finalized: false,
@@ -1370,6 +1387,10 @@ class TransferEngine {
       info.manifest = manifest
       info.blockSize = manifest.blockSize
       info.blockCount = manifest.blockCount
+      // Anchor the no-block deadline: from the manifest on, blocks must keep
+      // arriving or the receive is interrupted (the sender may have died on a
+      // silent link that never closes the channel).
+      info.lastBlockAt = Date.now()
       // Re-sync skip: the destination already holds this exact version — the
       // sender was told byteOffset = fileSize, so no blocks will arrive.
       if (manifest.blockCount === 0 || info.skipFile) await finalizeReceive()
@@ -1404,6 +1425,7 @@ class TransferEngine {
       info.pendingWrites--
       info.receivedBlocks++
       info.verifiedBytes += block.length
+      info.lastBlockAt = Date.now()
 
       // Progress: real verified bytes written to disk.
       const now = Date.now()
@@ -1486,12 +1508,20 @@ class TransferEngine {
         try {
           const dst = await fsp.stat(destPath)
           if (dst.size === transfer.fileSize && Math.abs(dst.mtimeMs - transfer.syncMtimeMs) < 1500) {
-            skipFile = true
-            info.skipFile = true
-            resumeBytes = transfer.fileSize
-            transfer.byteOffset = resumeBytes
-            info.verifiedBytes = resumeBytes
-            lastEmitBytes = resumeBytes
+            // Only skip when WE delivered this exact version (strict verify
+            // records it). A same-size / close-mtime coincidence must never
+            // suppress a real push — that is how content silently desynced.
+            const delivered =
+              !this.syncDelivered ||
+              (await this.syncDelivered(transfer.syncLibraryId, transfer.syncRelPath, transfer.syncMtimeMs))
+            if (delivered) {
+              skipFile = true
+              info.skipFile = true
+              resumeBytes = transfer.fileSize
+              transfer.byteOffset = resumeBytes
+              info.verifiedBytes = resumeBytes
+              lastEmitBytes = resumeBytes
+            }
           }
         } catch {}
       }
@@ -1552,6 +1582,12 @@ class TransferEngine {
         if (info.finalized) break
         if (info.channelClosed) throw new Error('interrupted: peer disconnected')
         if (info.errorMsg) throw new Error(info.errorMsg)
+        // A silent sender (dead relay, lost network — channel never closes)
+        // must not hold the receive open forever. The sender aborts first via
+        // its own no-ACK timeout; this bounds the receiver either way.
+        if (info.manifest && Date.now() - info.lastBlockAt > SYNC_RECEIVE_IDLE_TIMEOUT) {
+          throw new Error('interrupted: no blocks received from peer')
+        }
         await sleep(25)
       }
     } catch (err) {

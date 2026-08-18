@@ -53,12 +53,40 @@ function isIgnored(name) {
   return false
 }
 
-// Normalize a relative path from the wire: reject path traversal and backslashes.
+// Characters Windows (NTFS) and FAT32/exFAT (SD cards, USB sticks) reject in
+// file names. Linux allows all of them, so a sender can offer "Artist: Album"
+// and the receiver's mkdir fails with EINVAL. Normalizing at the rel-key
+// boundary keeps sender index, receiver index, delivered rows and the on-disk
+// name identical on every platform.
+const INVALID_FS_CHARS = /[<>:"/\\|?*\u0000-\u001F]/g
+// FAT32/exFAT cap component names at 255 chars; keep headroom for the " (2)"
+// dedupe suffix _uniqueFinalPath appends at write time.
+const MAX_COMPONENT_LEN = 240
+
+// Normalize a relative path from the wire: reject path traversal, and scrub
+// every component to a name any target filesystem can store.
 function safeRelPath(relPath) {
   if (typeof relPath !== 'string' || relPath.length === 0 || relPath.length > 1024) return ''
   const segments = relPath.split(/[\\/]+/).filter((s) => s !== '' && s !== '.' && s !== '..')
   if (segments.length === 0) return ''
-  return segments.join('/')
+  return segments
+    .map((seg) => {
+      // FAT also forbids trailing dots/spaces in names.
+      let s = seg.replace(INVALID_FS_CHARS, '_').replace(/[. ]+$/, '')
+      if (s.length > MAX_COMPONENT_LEN) {
+        // Keep the extension when truncating: a long title cut to 240 chars
+        // without its suffix stops being playable music on the receiver.
+        const dot = s.lastIndexOf('.')
+        const ext = dot > 0 ? s.slice(dot) : ''
+        if (ext && ext.length < MAX_COMPONENT_LEN) {
+          s = s.slice(0, MAX_COMPONENT_LEN - ext.length) + ext
+        } else {
+          s = s.slice(0, MAX_COMPONENT_LEN)
+        }
+      }
+      return s === '' ? '_' : s
+    })
+    .join('/')
 }
 
 // Fast stat-only directory walker with bounded concurrency.
@@ -119,7 +147,11 @@ async function scanFolder(fsp, dir, baseDir, out, limit = MAX_LIBRARY_FILES) {
           if (isDir) {
             queue.push(item.abs)
           } else {
-            const rel = p.relative(baseDir, item.abs).split(p.sep).join('/')
+            // Normalize the key exactly like wire paths: the on-disk name may
+            // contain chars the receiving filesystem can't store (e.g. ":" on
+            // an SD card), and both peers must agree on the rel string.
+            const rel = safeRelPath(p.relative(baseDir, item.abs).split(p.sep).join('/'))
+            if (!rel) continue
             const rawMtime = item.st.mtimeMs || (item.st.mtime && typeof item.st.mtime.getTime === 'function' ? item.st.mtime.getTime() : item.st.mtime)
             const mtimeMs = Number(rawMtime) || Date.now()
             const size = Number(item.st.size) || 0
@@ -1183,6 +1215,10 @@ class SyncEngine {
     }
     const have = []
     if (!lib.paused) {
+      let bee = null
+      try {
+        bee = await this.getBee('sync')
+      } catch {}
       const CHUNK = 32
       for (let i = 0; i < msg.files.length; i += CHUNK) {
         const chunk = msg.files.slice(i, i + CHUNK)
@@ -1198,7 +1234,17 @@ class SyncEngine {
               Number(st.size) === Number(f.size) &&
               Math.abs(Number(st.mtimeMs || 0) - Number(f.mtimeMs || 0)) < VERIFY_TOLERANCE_MS
             ) {
-              return rel
+              // Strict match: only trust a stat match when WE delivered this
+              // exact version (recorded at transfer completion). A pre-existing
+              // file that happens to share size + mtime must not count as
+              // synced — that is how stale content stayed "Synchronized"
+              // despite rescan on both sides.
+              if (!bee) return null
+              const node = await bee.get(`delivered/${lib.id}/${rel}`).catch(() => null)
+              const del = node && node.value
+              if (del && Math.abs(Number(del.mtimeMs || 0) - Number(f.mtimeMs || 0)) < VERIFY_TOLERANCE_MS) {
+                return rel
+              }
             }
             return null
           })
@@ -1220,6 +1266,23 @@ class SyncEngine {
     if (!lib || !lib._verifyResolver) return
     const have = new Set((msg.have || []).map((r) => safeRelPath(r)).filter(Boolean))
     lib._verifyResolver.resolve(have)
+  }
+
+  // Strict-verify helper: did WE deliver this exact version of rel to lib?
+  // The transfer-level re-sync skip consults this before trusting a size+mtime
+  // stat match on the destination file, so a coincidental match never
+  // suppresses a real push.
+  async isDeliveredVersion(libId, rel, mtimeMs) {
+    try {
+      const safe = safeRelPath(rel)
+      if (!safe || !libId) return false
+      const bee = await this.getBee('sync')
+      const node = await bee.get(`delivered/${libId}/${safe}`).catch(() => null)
+      const del = node && node.value
+      return !!(del && Math.abs(Number(del.mtimeMs || 0) - Number(mtimeMs || 0)) < VERIFY_TOLERANCE_MS)
+    } catch {
+      return false
+    }
   }
 
   async handleSyncInviteAccept(peerId, msg) {
@@ -1504,6 +1567,15 @@ class SyncEngine {
     }
 
     if (record.direction === 'receive') {
+      // Record that WE delivered this exact version (size + sender mtime).
+      // Strict re-verification only trusts stat matches for these files.
+      if (record.status === 'completed' && rel) {
+        const size = Number(record.fileSize) || 0
+        const mtimeMs = Number(record.syncMtimeMs) || 0
+        if (size > 0 && mtimeMs > 0) {
+          this._writeRows('delivered', lib.id, [[rel, { size, mtimeMs, sig: `${size}-${mtimeMs}` }]]).catch(() => {})
+        }
+      }
       // Receiver side: count down active receives; when the last one finishes,
       // the round is done.
       lib._activeReceives = Math.max(0, (lib._activeReceives || 0) - 1)

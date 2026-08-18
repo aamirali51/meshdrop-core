@@ -225,6 +225,10 @@ function createConnections(engine) {
 
   async function initSwarm() {
     ctx.stopped = false
+    // refreshNetwork() may have replaced engine.swarm — always rebind so the
+    // connection handler and every module ref read the live swarm.
+    ctx.swarm = engine.swarm
+    ctx.dhtReady = false
     ctx.swarm.on('connection', onConnection)
 
     try {
@@ -243,9 +247,17 @@ function createConnections(engine) {
         client: true,
         server: true
       })
+      // Re-join every other active topic (paired peers, pairing codes, drop
+      // shares) on the possibly-new swarm — after a network-change rebuild
+      // this re-announces them on the fresh DHT node. Harmless no-op for
+      // labels already joined on the same swarm.
+      engine.topicRegistry.reattach(ctx.swarm)
 
       await ctx.swarm.listen()
       if (engine.lanDiscovery) {
+        // A network change leaves the old multicast socket bound to the dead
+        // interface — stop it and rebind on the current one.
+        engine.lanDiscovery.stop()
         engine.lanDiscovery.start()
       }
       ctx.swarm.flush().catch(() => {})
@@ -253,6 +265,14 @@ function createConnections(engine) {
 
     // Automatically reconnect to all stored paired peers on startup and interval
     await devices.reconnectKnownPeers()
+    startIntervals()
+  }
+
+  // Maintenance intervals are started once per engine lifetime; initSwarm is
+  // re-entered by refreshNetwork() and must not stack duplicate timers.
+  function startIntervals() {
+    if (ctx.intervalsStarted) return
+    ctx.intervalsStarted = true
     setInterval(devices.reconnectKnownPeers, 60000).unref()
     // PING/PONG latency probe
     setInterval(keepalive.sendPings, PING_INTERVAL_MS).unref()

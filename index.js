@@ -51,13 +51,25 @@ function getDurationMs(preset) {
 // from the local routing table and prefer it only when the DHT reports we are
 // behind a random/symmetric NAT (randomized) or a direct punch already failed
 // (force), so direct connections stay preferred whenever they work.
+//
+// Relay quality matters: most DHT nodes are ephemeral (phones, laptops that
+// sleep), and a relay that dies mid-connection silently kills every transfer
+// on it. Residency in the routing table is a usable uptime proxy — dht-rpc
+// pings dead nodes out — so the longest-resident candidate wins, and the last
+// relay used is rotated away from so a dead relay is never re-picked.
+let lastRelayId = null
 function pickRelayNode(dht) {
   try {
     const nodes = dht && dht.nodes
     if (!nodes || nodes.length === 0) return null
+    let best = null
     for (let node = nodes.latest; node; node = node.prev) {
-      if (node.id && node.host && node.port) return node.id
+      if (!node.id || !node.host || !node.port) continue
+      if (node.id === lastRelayId) continue
+      if (!best || node.added < best.added) best = node
     }
+    if (best) lastRelayId = best.id
+    return best ? best.id : null
   } catch {}
   return null
 }
@@ -131,6 +143,45 @@ class MeshEngine extends EventEmitter {
     return this.storage.getBee(name)
   }
 
+  // Build a fresh Hyperswarm around the persistent noise keypair. Used at
+  // boot and again by refreshNetwork() — the relay picker must be re-created
+  // with the swarm because it binds to the new DHT node at call time.
+  _createSwarm() {
+    return new Hyperswarm({
+      keyPair: this.noiseKeyPair,
+      relayThrough: (force, s) => {
+        if (!force && !s.dht.randomized) return null
+        return pickRelayNode(s.dht)
+      }
+    })
+  }
+
+  // Rebuild the swarm after a network/interface change (Wi-Fi → cellular,
+  // router swap, VPN toggle). The old DHT node + UDP/TCP sockets are bound to
+  // the previous interface: lookups and topic announcements silently die with
+  // them, so paired devices can no longer find this node even though the app
+  // has connectivity. A fresh swarm re-binds to the current interface and
+  // re-announces every active topic (identity, paired peers, pairing codes,
+  // drop shares) via TopicRegistry.reattach. Identity, trust, pairing codes,
+  // and stores are untouched.
+  async refreshNetwork() {
+    if (!this.started) return this
+    console.log('[MeshEngine] Network change detected — rebuilding swarm')
+    try {
+      await this.swarm.destroy().catch(() => {})
+    } catch (err) {
+      console.warn('[MeshEngine] swarm.destroy during refresh:', err.message)
+    }
+    this.swarm = this._createSwarm()
+    if (this.metricsCollector && typeof this.metricsCollector.rebind === 'function') {
+      this.metricsCollector.rebind(this.swarm)
+    }
+    await this.connections.initSwarm()
+    await this.connections.reconnectKnownPeers()
+    console.log('[MeshEngine] Swarm rebuilt on new network')
+    return this
+  }
+
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   async start() {
@@ -147,18 +198,14 @@ class MeshEngine extends EventEmitter {
     // The swarm noise keypair is this node's peer identity and MUST persist
     // across restarts: trust, device records, and direct reconnects all key
     // on it. A fresh keypair per boot orphans every previously paired device.
-    const noiseKeyPair = loadOrCreateNoiseKeypair(this.storageDir)
+    // It is also reused verbatim when refreshNetwork() rebuilds the swarm
+    // after a network/interface change — identity must never rotate there.
+    this.noiseKeyPair = loadOrCreateNoiseKeypair(this.storageDir)
     console.log(
-      `[MeshEngine] Noise key (stable): ${noiseKeyPair.publicKey.toString('hex').slice(0, 12)}...`
+      `[MeshEngine] Noise key (stable): ${this.noiseKeyPair.publicKey.toString('hex').slice(0, 12)}...`
     )
 
-    this.swarm = new Hyperswarm({
-      keyPair: noiseKeyPair,
-      relayThrough: (force, s) => {
-        if (!force && !s.dht.randomized) return null
-        return pickRelayNode(s.dht)
-      }
-    })
+    this.swarm = this._createSwarm()
 
     this.storage = createStorage({
       storageDir: this.storageDir,
@@ -322,6 +369,10 @@ class MeshEngine extends EventEmitter {
     // Pause/delete authority: TransferEngine rejects incoming sync offers for
     // libraries that are paused or removed instead of routing them somewhere.
     this.transferEngine.syncAllowed = (offer) => this.syncEngine.isSyncAllowed(offer)
+    // Strict-verify authority: the transfer-level re-sync skip only trusts a
+    // size+mtime match when WE delivered that exact version.
+    this.transferEngine.syncDelivered = (libId, rel, mtimeMs) =>
+      this.syncEngine.isDeliveredVersion(libId, rel, mtimeMs)
     // A failed/interrupted sync push must retry: drop the optimistic remote
     // mark so the next round re-pushes the file instead of assuming the peer
     // has it (the streaming sender cannot mark delivery before 'done'). All

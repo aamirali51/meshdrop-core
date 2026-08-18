@@ -38,6 +38,12 @@ class MetricsCollector {
     if (this.timer.unref) this.timer.unref()
   }
 
+  // Point the sampler at a replacement swarm (network-change rebuild).
+  rebind(swarm) {
+    this.dht = swarm && swarm.dht ? swarm.dht : null
+    this.samples = []
+  }
+
   stop() {
     if (this.timer) clearInterval(this.timer)
     this.timer = null

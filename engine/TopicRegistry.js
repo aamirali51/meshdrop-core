@@ -8,13 +8,14 @@ class TopicRegistry {
   constructor({ computeTopicHash, swarm }) {
     this.computeTopicHash = computeTopicHash
     this.swarm = swarm
-    this.counts = new Map() // label -> refcount
+    this.counts = new Map() // label -> { count, opts }
   }
 
   join(label, opts) {
     const topicHash = this.computeTopicHash(label)
-    const count = (this.counts.get(label) || 0) + 1
-    this.counts.set(label, count)
+    const entry = this.counts.get(label)
+    const count = entry ? entry.count + 1 : 1
+    this.counts.set(label, { count, opts })
     if (count === 1) {
       this.swarm.join(topicHash, opts)
       this.swarm.flush().catch(() => {})
@@ -30,15 +31,29 @@ class TopicRegistry {
   }
 
   leave(label) {
-    const count = this.counts.get(label)
-    if (!count) return
-    if (count > 1) {
-      this.counts.set(label, count - 1)
+    const entry = this.counts.get(label)
+    if (!entry) return
+    if (entry.count > 1) {
+      this.counts.set(label, { count: entry.count - 1, opts: entry.opts })
       return
     }
     this.counts.delete(label)
     const topicHash = this.computeTopicHash(label)
     this.swarm.leave(topicHash)
+    this.swarm.flush().catch(() => {})
+  }
+
+  // Re-join every tracked label on a (possibly new) swarm. Called after
+  // refreshNetwork() rebuilds the Hyperswarm: the old node's announcements
+  // died with its sockets, and only re-announcing on the fresh DHT node makes
+  // this device findable again. Refcounts are preserved untouched.
+  reattach(swarm) {
+    this.swarm = swarm
+    for (const [label, entry] of this.counts.entries()) {
+      if (entry && entry.count > 0) {
+        this.swarm.join(this.computeTopicHash(label), entry.opts)
+      }
+    }
     this.swarm.flush().catch(() => {})
   }
 
@@ -48,7 +63,8 @@ class TopicRegistry {
   }
 
   count(label) {
-    return this.counts.get(label) || 0
+    const entry = this.counts.get(label)
+    return entry ? entry.count : 0
   }
 
   activeLabels() {

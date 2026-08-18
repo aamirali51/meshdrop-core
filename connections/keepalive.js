@@ -5,12 +5,20 @@
 // authenticated peer; the peer echoes it back as a PONG. RTT feeds a rolling
 // per-peer average (avgLatencyMs), and pings without a PONG feed a rolling
 // success rate (packet-loss proxy).
+//
+// The probe also enforces liveness: a peer that misses MAX_MISSED_PONGS in a
+// row is declared unreachable and its connection is destroyed. Half-dead
+// connections (a relay node that vanished, a phone that lost its network
+// without closing TCP cleanly) never fire 'close' on their own — without this,
+// sync transfers stall forever behind a channel that is neither alive nor
+// closed.
 
 const { MESSAGES } = require('../protocol.js')
 
 const PING_INTERVAL_MS = 30000 // how often to ping each authenticated peer (30s: keeps the link alive without heating the radio)
 const PING_TIMEOUT = 3000 // a ping without a PONG inside this window counts as lost
 const PING_WINDOW = 20 // rolling outcomes / RTT samples kept per peer
+const MAX_MISSED_PONGS = 3 // consecutive lost PONGs → connection is destroyed
 
 function createKeepAlive(ctx) {
   const { engine, peers } = ctx
@@ -21,7 +29,8 @@ function createKeepAlive(ctx) {
       nextId: 0,
       outstanding: new Map(), // id -> { sentAt, timer }
       rttSamples: [], // rolling RTT values (ms)
-      window: [] // rolling ping outcomes: { ok: boolean }
+      window: [], // rolling ping outcomes: { ok: boolean }
+      missed: 0 // consecutive lost PONGs — enforces liveness
     }
   }
 
@@ -55,6 +64,23 @@ function createKeepAlive(ctx) {
       const timer = setTimeout(() => {
         peerObj.pings.outstanding.delete(id)
         pushPingResult(peerObj, false, null)
+        // Liveness enforcement: a peer that stops answering pings is dead —
+        // destroy the connection so channel waits abort (transfers park and
+        // resume on reconnect) instead of hanging forever.
+        peerObj.pings.missed++
+        if (peerObj.pings.missed >= MAX_MISSED_PONGS) {
+          peerObj.pings.missed = 0
+          console.warn(
+            `[MeshEngine] Peer ${peerId.slice(0, 12)}... unreachable (${MAX_MISSED_PONGS} consecutive PINGs unanswered) — closing connection`
+          )
+          try {
+            if (peerObj.connection && typeof peerObj.connection.destroy === 'function') {
+              peerObj.connection.destroy(new Error('peer unreachable: consecutive PINGs unanswered'))
+            }
+          } catch (err) {
+            console.warn('[MeshEngine] Failed to destroy unreachable connection:', err.message)
+          }
+        }
       }, PING_TIMEOUT)
       if (timer.unref) timer.unref()
       peerObj.pings.outstanding.set(id, { sentAt, timer })
@@ -87,6 +113,7 @@ function createKeepAlive(ctx) {
     if (!entry) return
     peerObj.pings.outstanding.delete(msg.id)
     clearTimeout(entry.timer)
+    peerObj.pings.missed = 0
     pushPingResult(peerObj, true, Date.now() - msg.sentAt)
   }
 
