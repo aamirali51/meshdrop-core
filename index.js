@@ -166,9 +166,50 @@ class MeshEngine extends EventEmitter {
   // and stores are untouched.
   async refreshNetwork() {
     if (!this.started) return this
-    console.log('[MeshEngine] Network change detected — rebuilding swarm')
+    // Serialize refreshes: a rapid Wi-Fi → cellular → Wi-Fi toggle fires
+    // several distinct network events while the first rebuild is still in
+    // flight. Without this, a second refresh can destroy the swarm the first
+    // one just created mid-initSwarm and the engine stays offline until the
+    // next event.
+    if (this._refreshing) {
+      this._refreshQueued = true
+      return this
+    }
+    this._refreshing = true
     try {
-      await this.swarm.destroy().catch(() => {})
+      await this._rebuildSwarm()
+    } finally {
+      this._refreshing = false
+    }
+    if (this._refreshQueued) {
+      this._refreshQueued = false
+      await this.refreshNetwork()
+    }
+    return this
+  }
+
+  async _rebuildSwarm() {
+    console.log('[MeshEngine] Network change detected — rebuilding swarm')
+    // Tear down established peer connections FIRST. swarm.destroy() kills the
+    // DHT transport (UDP socket → NAT mappings, relay TCP) but does not iterate
+    // the established noise streams, so without this a peer entry stays
+    // 'online' on a dead transport until keepalive (~90s) evicts it, and
+    // in-flight transfers keep writing into the dead socket. Destroying each
+    // connection triggers the on('close') cleanup (peers map, replication
+    // scope, claim streams, transfer park) immediately.
+    for (const peerObj of this.peers.values()) {
+      const conn = peerObj && peerObj.connection
+      if (conn && typeof conn.destroy === 'function') {
+        try {
+          conn.destroy(new Error('network changed'))
+        } catch {}
+      }
+    }
+    try {
+      // force: the graceful path (pending DHT flush waits, server close) can
+      // hang for minutes on a vanished network (TCP half-open relays). A
+      // network-switch rebuild must not block on the dead transport.
+      await this.swarm.destroy({ force: true }).catch(() => {})
     } catch (err) {
       console.warn('[MeshEngine] swarm.destroy during refresh:', err.message)
     }
@@ -179,7 +220,6 @@ class MeshEngine extends EventEmitter {
     await this.connections.initSwarm()
     await this.connections.reconnectKnownPeers()
     console.log('[MeshEngine] Swarm rebuilt on new network')
-    return this
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
