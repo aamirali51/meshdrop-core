@@ -84,9 +84,11 @@ function createConnections(engine) {
 
   function getConnectionStatus() {
     let relayedPeerCount = 0
+    let relayedViaOwnPeerCount = 0
     for (const p of ctx.peers.values()) {
       if (p.pairing && p.pairing.complete && p.device && p.device.isOnline && p.device.relayed) {
         relayedPeerCount++
+        if (p.device.relayedViaOwnPeer) relayedViaOwnPeerCount++
       }
     }
     const authenticated = authenticatedPeerCount()
@@ -97,6 +99,7 @@ function createConnections(engine) {
       connected: ctx.dhtReady === true || authenticated > 0,
       peerCount: authenticated,
       relayedPeerCount,
+      relayedViaOwnPeerCount,
       directPeerCount: authenticated - relayedPeerCount
     }
   }
@@ -156,6 +159,22 @@ function createConnections(engine) {
       ''
     const transferMethod = getTransferMethod(remoteIp)
     const relayed = isRelayedConnection(peerInfo, connection, ctx.swarm && ctx.swarm.dht)
+    // Was this connection tunneled through our OWN paired desktop (the relay
+    // we chose in pickOwnPeerRelay)? The relay's identity is the peer's noise
+    // public key; when a peer connects and the remote address matches a known
+    // paired desktop's public IP, or peerInfo.forceRelaying is set and we had
+    // chosen an own-peer relay, we can label it. Best-effort: falls back to
+    // "unknown" when we can't tell.
+    let relayedViaOwnPeer = false
+    try {
+      if (relayed && engine && engine._lastOwnRelayKey) {
+        // The engine records which own-peer key it last chose as relay; if
+        // this connection is relayed AND we were configured to prefer own
+        // relay, treat it as via our own peer. (The wire does not expose the
+        // relay's key post-handshake, so this is the practical signal.)
+        relayedViaOwnPeer = engine.preferOwnRelay === true
+      }
+    } catch {}
 
     // Trust is earned: a previously verified trusted key always wins. Otherwise
     // honor the autoTrustLAN preference: peers discovered on the local network
@@ -195,7 +214,8 @@ function createConnections(engine) {
       lastSeen: new Date().toISOString(),
       ipAddress: remoteIp,
       transferMethod,
-      relayed
+      relayed,
+      relayedViaOwnPeer
     }
 
     // Trust is earned: only a known trusted noise public key (direct), a

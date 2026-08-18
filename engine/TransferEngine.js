@@ -1113,6 +1113,23 @@ class TransferEngine {
     }
   }
 
+  // Wait for the receive-side staging fd to be opened. Blocks can arrive
+  // before the fd is assigned (the sender streams right after the manifest;
+  // the receiver opens the file between the ready handshake and the first
+  // block). Bounded by the receive idle timeout so a stuck sender still
+  // interrupts instead of hanging forever.
+  async _waitForFd(info, timeoutMs = SYNC_RECEIVE_IDLE_TIMEOUT) {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      if (info.flags.cancelled) throw new Error('interrupted')
+      if (info.channelClosed) throw new Error('interrupted: peer disconnected')
+      if (info.errorMsg) throw new Error(info.errorMsg)
+      if (info.fd) return
+      if (Date.now() >= deadline) throw new Error('interrupted: timed out waiting for file open')
+      await sleep(10)
+    }
+  }
+
   // ─── Sync streaming send ───────────────────────────────────────────────────
   // Reads the file from its source path and streams blocks over the sync
   // channel. Nothing is appended to the exchange store — the payload is never
@@ -1460,6 +1477,16 @@ class TransferEngine {
       const actual = b4a.toString(sha256(block), 'hex')
       if (expected && actual !== expected) throw new Error('Block hash mismatch at index ' + index)
 
+      // A block can arrive before the fd is open (the sender streams as soon as
+      // it has the manifest; the receiver opens the staging file between the
+      // ready handshake and the first block — and on the skip path the fd is
+      // never opened because zero blocks are expected). Buffer the payload and
+      // wait for the fd instead of crashing on a null dereference.
+      if (!info.fd) {
+        await this._waitForFd(info)
+        if (!info.fd) throw new Error('interrupted: receive aborted before file open')
+      }
+
       const offset = (index - 1) * manifest.blockSize
       info.pendingWrites++
       const write = lastWrite.then(() => info.fd.write(block, 0, block.length, offset))
@@ -1586,7 +1613,7 @@ class TransferEngine {
           if (msg && msg.type === 'error') info.errorMsg = String(msg.message || 'peer error')
         }
         reg.manifest = (buf) => handleManifest(buf).catch((err) => failReceive(err))
-        reg.block = (buf) => handleBlock(buf)
+        reg.block = (buf) => handleBlock(buf).catch((err) => failReceive(err))
         reg.ack = () => {}
         reg.close = () => { info.channelClosed = true }
         reg.error = (err) => failReceive(err)
@@ -1609,7 +1636,7 @@ class TransferEngine {
           onManifest: (buf) => {
             handleManifest(buf).catch((err) => failReceive(err))
           },
-          onBlock: (buf) => handleBlock(buf),
+          onBlock: (buf) => handleBlock(buf).catch((err) => failReceive(err)),
           onError: (err) => failReceive(err),
           onClose: () => {
             info.channelClosed = true

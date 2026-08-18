@@ -62,10 +62,20 @@ class TransferQueue {
 
   _hasSlot(transfer) {
     const dir = transfer.direction
-    if (this.active[dir] >= this.maxConcurrent) return false
+    // Sync transfers of small files are the many-files case (a photo library
+    // round pushes hundreds of 1-10KB files). Serializing them per-peer (
+    // maxPerPeer = 1) costs a full ready->manifest->blocks->done handshake
+    // round-trip per file, which on a phone adds seconds per file. The sync
+    // stream is ACK-windowed (bounded memory: 32 blocks ~ 2MB in flight), so
+    // a modest per-peer + global sync concurrency pipelines small files
+    // without disk thrash. Large regular transfers stay serialized.
+    const isSync = transfer.source === 'sync' || transfer.isSync
+    const maxGlobal = isSync ? Math.max(this.maxConcurrent, 4) : this.maxConcurrent
+    if (this.active[dir] >= maxGlobal) return false
+    const maxForPeer = isSync ? Math.max(this.maxPerPeer, 4) : this.maxPerPeer
     const key = transfer.peerId || 'anon'
     const entry = this.activeByPeer.get(key)
-    return !entry || entry[dir] < this.maxPerPeer
+    return !entry || entry[dir] < maxForPeer
   }
 }
 

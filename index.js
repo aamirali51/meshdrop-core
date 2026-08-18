@@ -72,6 +72,37 @@ const BOOTSTRAP_HOSTS = new Set([
   '138.68.147.8'
 ])
 
+// Pass 0: an online, trusted, desktop-class paired peer — our own relay.
+// Only called when preferOwnRelay is on. The peer must be a desktop (os match)
+// and its own connection must NOT already be relayed (a phone relaying through
+// a phone is pointless). Returns the peer's noise public key (hex) — the DHT
+// dials relays by key.
+function pickOwnPeerRelay(engine) {
+  try {
+    if (!engine || !engine.preferOwnRelay) return null
+    const peers = engine.peers
+    if (!peers || peers.size === 0) return null
+    for (const [peerId, peerObj] of peers.entries()) {
+      const dev = peerObj && peerObj.device
+      if (!dev || !dev.isOnline || !dev.isTrusted || !dev.publicKey) continue
+      // Desktop-class only: a phone behind cellular CGNAT is a poor relay.
+      const osName = String(dev.os || '').toLowerCase()
+      const isDesktop = /win|mac|darwin|linux|ubuntu|debian|fedora/.test(osName)
+      if (!isDesktop) continue
+      // If this peer's own link to us is relayed, relaying back through it is
+      // a loop — skip. Also skip the peer we last used as relay (rotation).
+      if (dev.relayed) continue
+      if (lastRelayId === peerId) continue
+      // Remember which own-peer key we chose so onConnection can label
+      // relayed links as "via your Desktop".
+      if (engine) engine._lastOwnRelayKey = peerId
+      lastRelayId = peerId
+      return peerId // hex noise public key — exactly what dht.connect() wants
+    }
+  } catch {}
+  return null
+}
+
 function pickRelayNode(dht) {
   try {
     const nodes = dht && dht.nodes
@@ -138,6 +169,11 @@ class MeshEngine extends EventEmitter {
     // discovery only helps the connection establish, it grants no trust.
     this.autoTrustLAN = config.autoTrustLAN === true
     this.lanDiscoveryEnabled = config.lanDiscovery !== false
+    // Own-device relay: when true, this node prefers an online paired desktop
+    // as the relay for connections that can't holepunch directly (instead of
+    // going straight to the public bootstrap nodes). Only paired, trusted
+    // devices ever see this node's key, so the relay is private to the mesh.
+    this.preferOwnRelay = config.preferOwnRelay === true
 
     this.started = false
 
@@ -195,7 +231,9 @@ class MeshEngine extends EventEmitter {
       // REMOTE_NOT_HOLEPUNCHABLE) — which is exactly when a relay is needed.
       // Gating this on `dht.randomized` broke relaying entirely (that property
       // is never set in hyperdht 6.x) and made cross-network pairing time out.
-      relayThrough: (force, s) => pickRelayNode(s.dht)
+      // Pass 0 prefers an online paired desktop (own relay, private to the
+      // mesh); Pass 1/2 fall back to public bootstrap + routing-table nodes.
+      relayThrough: (force, s) => pickOwnPeerRelay(this) || pickRelayNode(s.dht)
     })
   }
 
@@ -565,6 +603,7 @@ class MeshEngine extends EventEmitter {
       const s = entry && entry.value
       if (s && typeof s.autoTrustLAN === 'boolean') this.autoTrustLAN = s.autoTrustLAN
       if (s && typeof s.autoAcceptOffers === 'boolean') this.autoAcceptOffers = s.autoAcceptOffers
+      if (s && typeof s.preferOwnRelay === 'boolean') this.preferOwnRelay = s.preferOwnRelay
     } catch {}
 
     await this.replicationScope.init()
@@ -1116,10 +1155,15 @@ class MeshEngine extends EventEmitter {
       return {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
+        preferOwnRelay: this.preferOwnRelay,
         ...(entry?.value || {})
       }
     } catch {
-      return { autoAcceptOffers: this.autoAcceptOffers, autoTrustLAN: this.autoTrustLAN }
+      return {
+        autoAcceptOffers: this.autoAcceptOffers,
+        autoTrustLAN: this.autoTrustLAN,
+        preferOwnRelay: this.preferOwnRelay
+      }
     }
   }
 
@@ -1150,6 +1194,25 @@ class MeshEngine extends EventEmitter {
       console.warn('[MeshEngine] setAutoTrustLAN persist failed:', err.message)
     }
     return this.autoTrustLAN
+  }
+
+  /**
+   * Toggle "prefer my own desktop as relay" (persisted). When on, this node
+   * prefers an online paired desktop over the public bootstrap nodes for
+   * connections that need a relay. The relay is private to the mesh: only
+   * paired, trusted devices hold the desktop's key, so it can never be used
+   * by other MeshDrop nodes.
+   */
+  async setPreferOwnRelay(value) {
+    this.preferOwnRelay = value !== false
+    try {
+      const bee = await this.getBee('settings')
+      const entry = await bee.get('settings')
+      await bee.put('settings', { ...(entry?.value || {}), preferOwnRelay: this.preferOwnRelay })
+    } catch (err) {
+      console.warn('[MeshEngine] setPreferOwnRelay persist failed:', err.message)
+    }
+    return this.preferOwnRelay
   }
 
   getStatus() {

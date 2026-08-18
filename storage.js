@@ -6,7 +6,48 @@
 // Storage roots come from the engine config (storageDir) — never from an
 // Electron app.getPath() default.
 
-const { path, fsp } = require('./compat.js')
+const { path, fsp, isBare } = require('./compat.js')
+
+// Android FUSE storage (Android 11+; CalyxOS, stock) does not support flock —
+// fd-lock's tryLock returns false and hypercore-storage throws
+// "File descriptor could not be locked" on every core open. The flock is a
+// single-process safety (two processes sharing a corestore); the engine is
+// single-process, so on Bare/Android we patch device-file to skip the native
+// lock entirely. Desktop keeps the lock.
+//
+// MUST run before `require('corestore')` — corestore pulls in hypercore-storage
+// → device-file at require time, and the patch replaces the module export in
+// the require cache.
+try {
+  if (isBare) {
+    const DeviceFile = require('device-file')
+    if (typeof DeviceFile === 'function') {
+      // module.exports = DeviceFile (the class itself). Subclass it and force
+      // `lock: false` so no FDLock (flock) is ever created on Bare.
+      class NoLockDeviceFile extends DeviceFile {
+        constructor(filename, opts = {}) {
+          super(filename, { ...opts, lock: false })
+        }
+      }
+      // Preserve the static helpers (validate etc.) on the subclass.
+      for (const k of Object.keys(DeviceFile)) {
+        if (typeof DeviceFile[k] === 'function') NoLockDeviceFile[k] = DeviceFile[k]
+      }
+      // Re-assign the module export so hypercore-storage's require picks it up.
+      delete require.cache[require.resolve('device-file')]
+      require.cache[require.resolve('device-file')] = {
+        id: require.resolve('device-file'),
+        filename: require.resolve('device-file'),
+        loaded: true,
+        exports: NoLockDeviceFile
+      }
+      console.log('[Storage] Bare platform: device-file flock disabled (Android FUSE)')
+    }
+  }
+} catch (err) {
+  console.warn('[Storage] device-file lock patch skipped:', err.message)
+}
+
 const Corestore = require('corestore')
 const Hyperbee = require('hyperbee')
 const hcrypto = require('hypercore-crypto')
