@@ -48,24 +48,60 @@ function getDurationMs(preset) {
 // DHT relay fallback: on restrictive networks (symmetric NAT, TCP-only VPNs)
 // direct UDP hole-punching fails. hyperswarm then reconnects the peer through
 // a DHT relay node, which tunnels the noise stream over TCP. We pick a relay
-// from the local routing table and prefer it only when the DHT reports we are
-// behind a random/symmetric NAT (randomized) or a direct punch already failed
-// (force), so direct connections stay preferred whenever they work.
+// from the known-good bootstrap nodes first — they are the Holepunch-operated
+// public DHT nodes (stable, publicly reachable, relay-capable) — and fall back
+// to the longest-resident routing-table node only if the bootstrap nodes are
+// not in our routing table yet.
 //
-// Relay quality matters: most DHT nodes are ephemeral (phones, laptops that
-// sleep), and a relay that dies mid-connection silently kills every transfer
-// on it. Residency in the routing table is a usable uptime proxy — dht-rpc
-// pings dead nodes out — so the longest-resident candidate wins, and the last
-// relay used is rotated away from so a dead relay is never re-picked.
+// The Pear docs (docs.pears.com "Connect two peers by key with HyperDHT"):
+// "HyperDHT's holepunching will fail if both the client peer and the server
+// peer are on randomizing NATs, in which case the connection must be relayed
+// through a third peer. HyperDHT does not do any relaying by default." Keet
+// relays through other participants; our equivalent is the public bootstrap
+// nodes, which are always reachable.
+//
+// NOTE: the first connection attempt must NOT be gated on `dht.randomized` —
+// that property is never set to true in hyperdht 6.x (the holepuncher tracks
+// randomized NAT on its own field and bumps dht._randomPunches, not
+// dht.randomized), so gating on it silently disabled relaying and pairing
+// across different networks timed out.
 let lastRelayId = null
+const BOOTSTRAP_HOSTS = new Set([
+  '88.99.3.86',
+  '142.93.90.113',
+  '138.68.147.8'
+])
+
 function pickRelayNode(dht) {
   try {
     const nodes = dht && dht.nodes
     if (!nodes || nodes.length === 0) return null
+
+    // Pass 1: prefer a stable public bootstrap node from the routing table.
+    // These are the Holepunch-operated relay-capable nodes; ephemeral peers
+    // (phones, laptops behind NAT) make terrible relays.
     let best = null
     for (let node = nodes.latest; node; node = node.prev) {
       if (!node.id || !node.host || !node.port) continue
       if (node.id === lastRelayId) continue
+      if (!BOOTSTRAP_HOSTS.has(node.host)) continue
+      if (!best || node.added < best.added) best = node
+    }
+    if (best) {
+      lastRelayId = best.id
+      return best.id
+    }
+
+    // Pass 2: fall back to the longest-resident routing-table node. A DHT node
+    // that has stayed in the table longest is the best uptime proxy we have
+    // for ephemeral peers; bootstrap nodes are preferred above, so this only
+    // catches the no-bootstrap-in-table case (e.g. custom bootstrap).
+    best = null
+    for (let node = nodes.latest; node; node = node.prev) {
+      if (!node.id || !node.host || !node.port) continue
+      if (node.id === lastRelayId) continue
+      // Never relay through a private-range peer — it is behind NAT itself.
+      if (/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.)/.test(node.host)) continue
       if (!best || node.added < best.added) best = node
     }
     if (best) lastRelayId = best.id
@@ -153,10 +189,13 @@ class MeshEngine extends EventEmitter {
   _createSwarm() {
     return new Hyperswarm({
       keyPair: this.noiseKeyPair,
-      relayThrough: (force, s) => {
-        if (!force && !s.dht.randomized) return null
-        return pickRelayNode(s.dht)
-      }
+      // Relay is always available as the fallback: hyperswarm tries the direct
+      // UDP holepunch first on every connection, and only uses the relay when
+      // direct fails (HOLEPUNCH_ABORTED / HOLEPUNCH_DOUBLE_RANDOMIZED_NATS /
+      // REMOTE_NOT_HOLEPUNCHABLE) — which is exactly when a relay is needed.
+      // Gating this on `dht.randomized` broke relaying entirely (that property
+      // is never set in hyperdht 6.x) and made cross-network pairing time out.
+      relayThrough: (force, s) => pickRelayNode(s.dht)
     })
   }
 
