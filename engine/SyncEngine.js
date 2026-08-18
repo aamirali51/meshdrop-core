@@ -14,6 +14,7 @@
 // 5. Memory-Safe: Chunks stream with backpressure, preventing OOM on 4K videos.
 
 const { EVENTS, MESSAGES } = require('../protocol.js')
+const { sha256 } = require('../crypto.js')
 
 const DEFAULT_SCAN_INTERVAL_MS = 5 * 60 * 1000 // 5min safety net — the watcher covers live changes; a 60s full-folder scan drained battery
 const MAX_LIBRARY_FILES = 50000
@@ -491,11 +492,38 @@ class SyncEngine {
       const watcher = this.fs.watch(lib.localPath, { recursive: true }, () => {
         this._onFolderChange(lib.id)
       })
-      watcher.on('error', () => this._stopWatching(lib.id))
+      watcher.on('error', () => {
+        // A watcher error (unmounted drive, ENOENT, fd exhaustion) must not
+        // permanently disable change detection. Close and re-arm with
+        // exponential backoff; the 5-min tick covers the gap meanwhile.
+        this._stopWatching(lib.id)
+        this._scheduleWatchRetry(lib.id)
+      })
       lib.watcher = watcher
     } catch {
       // In environments where recursive watch is unsupported, timer covers it
+      this._scheduleWatchRetry(lib.id)
     }
+  }
+
+  // Re-arm a watcher after an error with exponential backoff (5s → 10s → 20s
+  // → ... capped at 5min). The 5-min tick is peer-gated, so without this an
+  // unmounted-then-remounted drive silently misses all changes.
+  _scheduleWatchRetry(id) {
+    const lib = this.libraries.get(id)
+    if (!lib || lib.watcher || lib._watchRetryTimer) return
+    const delay = Math.min((lib._watchRetryCount || 0) * 5000 + 5000, 5 * 60 * 1000)
+    lib._watchRetryCount = (lib._watchRetryCount || 0) + 1
+    lib._watchRetryTimer = setTimeout(() => {
+      lib._watchRetryTimer = null
+      const l = this.libraries.get(id)
+      if (!l || l.watcher || l.paused) return
+      // Reset the backoff on a successful re-arm (the watcher constructor
+      // either throws synchronously or the error handler drives retries).
+      this._watchLibrary(id)
+      if (l.watcher) l._watchRetryCount = 0
+    }, delay)
+    if (lib._watchRetryTimer.unref) lib._watchRetryTimer.unref()
   }
 
   _stopWatching(id) {
@@ -504,6 +532,10 @@ class SyncEngine {
     if (lib.flushTimer) {
       clearTimeout(lib.flushTimer)
       lib.flushTimer = null
+    }
+    if (lib._watchRetryTimer) {
+      clearTimeout(lib._watchRetryTimer)
+      lib._watchRetryTimer = null
     }
     if (lib.watcher) {
       try { lib.watcher.close() } catch {}
@@ -765,11 +797,55 @@ class SyncEngine {
     return lib
   }
 
+  // Return a library's sync mode ('push' | 'two-way' | 'receive_only') for the
+  // given library id, or null if it doesn't exist. Used by TransferEngine to
+  // decide overwrite vs conflict-preserve on sync receive.
+  getLibraryMode(id) {
+    const lib = this.libraries.get(id)
+    return lib ? lib.mode || null : null
+  }
+
+  // Streaming content hash of a file, used ONLY for ambiguous same-size/
+  // same-mtime files in a verify round — never in the hot scan path. The hash
+  // is the SHA-256 of the concatenated 256 KiB chunk hashes (deterministic and
+  // comparable across peers; bounded memory regardless of file size).
+  async _hashFileFast(abs) {
+    try {
+      const fd = await this.fsp.open(abs, 'r')
+      try {
+        const chunkHashes = []
+        const buf = Buffer.alloc(256 * 1024)
+        let pos = 0
+        for (;;) {
+          const { bytesRead } = await fd.read(buf, 0, buf.length, pos)
+          if (bytesRead <= 0) break
+          chunkHashes.push(sha256(buf.subarray(0, bytesRead)))
+          pos += bytesRead
+        }
+        return Buffer.isBuffer(chunkHashes[0])
+          ? Buffer.concat(chunkHashes.map((h) => (Buffer.isBuffer(h) ? h : Buffer.from(h)))).toString('hex')
+          : ''
+      } finally {
+        await fd.close().catch(() => {})
+      }
+    } catch {
+      return ''
+    }
+  }
+
   // ─── Sync Execution & Diffing ─────────────────────────────────────────────
 
   async syncLibrary(id) {
     const lib = this.libraries.get(id)
-    if (!lib || lib.paused || this._syncingSet.has(id)) return null
+    if (!lib || lib.paused) return null
+    if (this._syncingSet.has(id)) {
+      // A scan is already in flight. Changes that landed mid-scan must not be
+      // dropped silently — mark a catch-up run so the moment the current scan
+      // finishes, we re-scan once more instead of waiting for the next event
+      // or the 5-minute tick.
+      lib._pendingRescan = true
+      return null
+    }
 
     this._syncingSet.add(id)
     lib.status = 'syncing'
@@ -782,6 +858,29 @@ class SyncEngine {
       await scanFolder(this.fsp, lib.localPath, lib.localPath, scanOut)
       const myPeerId = this.getPeerId ? this.getPeerId() : ''
 
+      // Missing-source guard: if the folder is gone/unmounted, scanFolder
+      // returns empty (read errors are swallowed). Tombstoning the whole index
+      // would, in two-way mode, propagate SYNC_DELETE for EVERY file and move
+      // the peer's copies to trash. Instead, pause the library and surface a
+      // sync:error so the user can restore the path — never silently delete.
+      const hadFiles = Object.values(lib.index || {}).some((e) => e && !e.deleted)
+      const folderExists = await this.fsp
+        .stat(lib.localPath)
+        .then((st) => st && st.isDirectory())
+        .catch(() => false)
+      if (hadFiles && scanOut.size === 0 && !folderExists) {
+        lib.paused = true
+        lib.status = 'error'
+        this._persist(lib).catch(() => {})
+        this.sendEvent(EVENTS.SYNC_ERROR, {
+          id: lib.id,
+          libraryId: lib.id,
+          message: `Sync folder is missing or unreachable: ${lib.localPath}. Sync paused.`
+        })
+        this.sendEvent(EVENTS.SYNC_PHASE, { id: lib.id, phase: 'error' })
+        return
+      }
+
       const nextIndex = {}
       for (const [rel, meta] of scanOut.entries()) {
         const prev = lib.index[rel]
@@ -793,7 +892,11 @@ class SyncEngine {
             mtimeMs: meta.mtimeMs,
             sig: meta.sig,
             authorKey: myPeerId,
-            deleted: false
+            deleted: false,
+            // Content hash for the divergence guard: populated lazily (only
+            // when the file is ambiguous in a verify round) so the stat-only
+            // scan stays cheap.
+            hash: prev && prev.sig === meta.sig ? prev.hash || '' : ''
           }
         }
       }
@@ -889,6 +992,13 @@ class SyncEngine {
     } finally {
       this._syncingSet.delete(id)
       if (lib.status === 'syncing') lib.status = 'idle'
+      // Catch-up: a syncLibrary call that arrived while this scan was in flight
+      // set _pendingRescan. Re-run once now (async, outside the lock) so
+      // mid-scan changes are never silently dropped.
+      if (lib._pendingRescan && !lib.paused) {
+        lib._pendingRescan = false
+        this.syncLibrary(id).catch(() => {})
+      }
     }
   }
 
@@ -943,7 +1053,7 @@ class SyncEngine {
     const verifyList = []
     for (const rel of toPush) {
       const e = lib.index[rel] || {}
-      verifyList.push({ rel, size: e.size || 0, mtimeMs: e.mtimeMs || 0 })
+      verifyList.push({ rel, size: e.size || 0, mtimeMs: e.mtimeMs || 0, hash: e.hash || '' })
     }
     const sentRels = Object.keys(baseline).filter((rel) => lib.index[rel] && !lib.index[rel].deleted)
     let sentSlice = sentRels
@@ -957,7 +1067,15 @@ class SyncEngine {
     }
     for (const rel of sentSlice) {
       const e = lib.index[rel]
-      verifyList.push({ rel, size: e.size || 0, mtimeMs: e.mtimeMs || 0 })
+      // Divergence guard: attach the sender's content hash so the receiver can
+      // detect same-size/same-mtime files whose CONTENT differs (local edit
+      // preserved size, or clock skew). Computed lazily — only for already-sent
+      // files in the verify slice, cached in the index entry.
+      if (e && !e.hash) {
+        const absPath = this.path.join(lib.localPath, ...rel.split('/'))
+        e.hash = await this._hashFileFast(absPath)
+      }
+      verifyList.push({ rel, size: e.size || 0, mtimeMs: e.mtimeMs || 0, hash: (e && e.hash) || '' })
     }
 
     let verified = null
@@ -1243,6 +1361,31 @@ class SyncEngine {
               const node = await bee.get(`delivered/${lib.id}/${rel}`).catch(() => null)
               const del = node && node.value
               if (del && Math.abs(Number(del.mtimeMs || 0) - Number(f.mtimeMs || 0)) < VERIFY_TOLERANCE_MS) {
+                // Divergence guard: the file matches the sender's size+mtime AND
+                // we delivered a version with that mtime — but was the local
+                // file MODIFIED after delivery while preserving size (or under
+                // clock skew)? If the current mtime drifted from the delivered
+                // mtime beyond tolerance, hash-compare before claiming "have".
+                // A content match → skip; a content mismatch → report missing so
+                // the owner re-pushes and the newer edit wins deterministically.
+                if (del.mtimeMs && Math.abs(Number(st.mtimeMs || 0) - Number(del.mtimeMs || 0)) > VERIFY_TOLERANCE_MS) {
+                  const localHash = await this._hashFileFast(abs)
+                  const remoteHash = f.hash || ''
+                  if (localHash && remoteHash && localHash !== remoteHash) {
+                    // Concurrent-edit divergence: local content differs from
+                    // what the sender believes is synced. Report as NOT-have so
+                    // the owner re-pushes, and surface a conflict event — the
+                    // losing local edit is preserved to trash (two-way) by
+                    // _finalizeReceive.
+                    this.sendEvent(EVENTS.SYNC_CONFLICT, {
+                      id: lib.id,
+                      libraryId: lib.id,
+                      rel,
+                      message: `Concurrent edit detected on ${rel} — the newer version will be kept, the local copy moved to trash.`
+                    })
+                    return null // content differs → do NOT report as have
+                  }
+                }
                 return rel
               }
             }

@@ -24,7 +24,9 @@ function createSignaling(ctx) {
       peerObj.signaling.send({
         type: MESSAGES.HANDSHAKE,
         protocolVersion: PROTOCOL_VERSION,
-        identity: { ...engine.deviceIdentity, noisePublicKey: peerId }
+        // The peer already knows our noise key from the transport (peerInfo /
+        // connection), so the identity carries only the stable device identity.
+        identity: { ...engine.deviceIdentity }
       })
     } catch (err) {
       console.error('[MeshEngine] Failed to send HANDSHAKE:', err.message)
@@ -162,6 +164,25 @@ function createSignaling(ctx) {
       handlePairingChallenge(peerId, msg)
     } else if (msg.type === MESSAGES.PAIRING_RESP) {
       handlePairingResponse(peerId, msg)
+    } else if (msg.type === MESSAGES.DEVICE_REMOVED) {
+      // The remote host deleted this device. React immediately so the UI can
+      // show "you were removed" and the local trust state is torn down —
+      // otherwise the peer only discovers the deletion on its next reconnect
+      // (revoked → refused auto-trust → must re-pair).
+      const peerObj = peers.get(peerId)
+      if (peerObj) {
+        try {
+          if (engine.trustManager) {
+            // The host's key is no longer trusted locally. The connection is
+            // destroyed so any in-flight transfers/sync abort and park.
+            engine.trustManager.removeTrustedKey(peerId)
+            engine.trustManager.revokeKey(peerId).catch(() => {})
+          }
+          peerObj.connection.destroy()
+        } catch {}
+      }
+      engine.emit(EVENTS.TRUST_REVOKED, { publicKey: peerId })
+      engine.emit(EVENTS.DEVICE_REMOVED, { peerId })
     } else if (msg.type === MESSAGES.TRANSFER_OFFER) {
       const peerObj = peers.get(peerId)
       // Only accept file offers from authenticated (trusted) peers. One-time

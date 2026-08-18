@@ -122,6 +122,10 @@ class MeshEngine extends EventEmitter {
     this.notificationStore = null
     this.connections = null
     this.expirationTimer = null
+    // Set when refreshNetwork() finds the DHT unreachable (dead network, no
+    // replacement yet). A self-scheduled retry re-runs the rebuild so the
+    // engine heals when connectivity silently returns without an OS event.
+    this._networkRetryTimer = null
 
     // EventEmitter throws on 'error' with no listener; the engine always has
     // a no-op handler so a stray error can never crash the process.
@@ -176,14 +180,30 @@ class MeshEngine extends EventEmitter {
       return this
     }
     this._refreshing = true
+    let ok = false
     try {
-      await this._rebuildSwarm()
+      ok = await this._rebuildSwarm()
     } finally {
       this._refreshing = false
     }
     if (this._refreshQueued) {
       this._refreshQueued = false
       await this.refreshNetwork()
+      return this
+    }
+    // If the DHT could not bootstrap (network dropped with no replacement yet),
+    // schedule a retry instead of going silent. The OS layer fires no event
+    // when connectivity silently returns, so the engine must probe on its own.
+    // A later successful refresh clears the timer via the ok path below.
+    if (!ok && !this._networkRetryTimer) {
+      this._networkRetryTimer = setTimeout(async () => {
+        this._networkRetryTimer = null
+        if (this.started) await this.refreshNetwork()
+      }, 15000)
+      if (this._networkRetryTimer.unref) this._networkRetryTimer.unref()
+    } else if (ok && this._networkRetryTimer) {
+      clearTimeout(this._networkRetryTimer)
+      this._networkRetryTimer = null
     }
     return this
   }
@@ -217,9 +237,15 @@ class MeshEngine extends EventEmitter {
     if (this.metricsCollector && typeof this.metricsCollector.rebind === 'function') {
       this.metricsCollector.rebind(this.swarm)
     }
-    await this.connections.initSwarm()
+    // initSwarm() returns whether the DHT bootstrapped on the new network.
+    // false means we are offline (or the DHT is unreachable) — refreshNetwork()
+    // uses that to schedule a self-retry.
+    const dhtOk = await this.connections.initSwarm()
     await this.connections.reconnectKnownPeers()
-    console.log('[MeshEngine] Swarm rebuilt on new network')
+    console.log(
+      `[MeshEngine] Swarm rebuilt on new network (dht=${dhtOk ? 'ready' : 'down'})`
+    )
+    return dhtOk
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -285,6 +311,8 @@ class MeshEngine extends EventEmitter {
       topicRegistry: this.topicRegistry,
       getPeers: () => this.peers,
       sendHandshake: (peerId) => this.connections.sendHandshake(peerId),
+      emit: (event, data) => this.emit(event, data),
+      isRefreshing: () => this._refreshing === true,
       onTrustGranted: (peerId, code) => {
         const peerObj = this.peers.get(peerId)
         if (peerObj && peerObj.pairing) peerObj.pairing.code = code
@@ -390,7 +418,15 @@ class MeshEngine extends EventEmitter {
       getDownloadDirectory: () => this.getDownloadDirectory(),
       getTransferMethod,
       fsp,
-      path
+      path,
+      // Lets TransferEngine preserve a conflicting local copy (two-way sync)
+      // instead of silently overwriting it. SyncEngine owns the mode.
+      getSyncMode: (syncLibraryId) =>
+        this.syncEngine && syncLibraryId
+          ? this.syncEngine.getLibraryMode(syncLibraryId)
+          : null,
+      // Base dir for the .p2p-staging partial sweep at init.
+      getStagingRoot: () => this.downloadsDir
     })
 
     this.syncEngine = new SyncEngine({
@@ -533,6 +569,10 @@ class MeshEngine extends EventEmitter {
       clearInterval(this.expirationTimer)
       this.expirationTimer = null
     }
+    if (this._networkRetryTimer) {
+      clearTimeout(this._networkRetryTimer)
+      this._networkRetryTimer = null
+    }
     if (this.metricsCollector) this.metricsCollector.stop()
     if (this.lanDiscovery) this.lanDiscovery.stop()
     if (this.syncEngine) await this.syncEngine.stop()
@@ -585,27 +625,73 @@ class MeshEngine extends EventEmitter {
     console.log(`[MeshEngine] Pairing with code: ${clean}`)
     return new Promise((resolve, reject) => {
       let settled = false
+      let gotPairingFailure = false
       const finish = (fn, value) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
         this.removeListener(EVENTS.TRUST_PAIRED, onPaired)
+        this.removeListener(EVENTS.PEER_DISCONNECTED, onDisconnected)
+        this.removeListener(EVENTS.TRUST_REVOKED, onRevoked)
+        this.removeListener(EVENTS.PAIRING_FAILED, onPairingFailed)
+        // A settled pairing (success OR failure) drops the joiner secret and
+        // leaves its topic. Without this a failed/abandoned pairing keeps the
+        // code registered for its full 15-min TTL and the DHT topic announced.
+        // The host code is unaffected — it is a different secret (role: 'host').
+        try {
+          this.trustManager.dropJoinerCode(clean)
+        } catch {}
         fn(value)
       }
       const onPaired = ({ peer, code: pairedCode }) => {
         if (pairedCode !== clean) return // a different pairing completed
         finish(resolve, peer)
       }
+      const onPairingFailed = ({ peerId }) => {
+        // A MAC/nonce mismatch on OUR challenge: the host answered with the
+        // wrong code (or a stale one after deletion). Record it so a
+        // disconnect/timeout surfaces the real error instead of a generic hang.
+        if (peerId) gotPairingFailure = true
+      }
+      const onDisconnected = ({ id, publicKey }) => {
+        // The connection we were challenging died before verification — either
+        // the host rejected our MAC (wrong code) or the transport dropped. If
+        // a pairing failure was already recorded, surface that instead of a
+        // generic timeout. Otherwise the engine's reconnect loop may re-attempt
+        // (devices.reconnectKnownPeers / topic re-join), so only settle if the
+        // failure is definitive.
+        if (gotPairingFailure) {
+          finish(
+            reject,
+            new Error(
+              'Pairing rejected by the host — the code may be wrong or the host deleted this device.'
+            )
+          )
+        }
+        void id
+        void publicKey
+      }
+      const onRevoked = ({ publicKey }) => {
+        // We were explicitly removed by the host mid-pairing. Fail fast so the
+        // UI shows a real error instead of a 30-60s hang.
+        finish(reject, new Error('The host removed this device. Pair again with the current code.'))
+        void publicKey
+      }
       const timer = setTimeout(() => {
         finish(
           reject,
           new Error(
-            `Pairing timed out after ${timeoutMs}ms — is the host online and is the code correct?`
+            gotPairingFailure
+              ? 'Pairing failed — the code was rejected by the host.'
+              : `Pairing timed out after ${timeoutMs}ms — is the host online and is the code correct?`
           )
         )
       }, timeoutMs)
       if (timer.unref) timer.unref()
       this.on(EVENTS.TRUST_PAIRED, onPaired)
+      this.on(EVENTS.PEER_DISCONNECTED, onDisconnected)
+      this.on(EVENTS.TRUST_REVOKED, onRevoked)
+      this.on(EVENTS.PAIRING_FAILED, onPairingFailed)
     })
   }
 
@@ -956,6 +1042,19 @@ class MeshEngine extends EventEmitter {
           peerObj.device &&
           (peerObj.device.id === id || peerObj.device.publicKey === device.publicKey || pId === device.publicKey)
         ) {
+          // Tell the deleted device it was removed BEFORE destroying the
+          // connection so its UI can react immediately and its local trust in
+          // us is revoked. Fire-and-forget: the message may not flush if the
+          // transport dies first, in which case the revoked-key set on its
+          // next reconnect still refuses auto-trust.
+          try {
+            if (peerObj.signaling) {
+              peerObj.signaling.send({
+                type: MESSAGES.DEVICE_REMOVED,
+                deviceId: id
+              })
+            }
+          } catch {}
           try {
             peerObj.connection.destroy()
           } catch {}

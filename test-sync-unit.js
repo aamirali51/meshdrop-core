@@ -415,6 +415,15 @@ async function main() {
       fs.copyFileSync(path.join(srcDir, 'b.txt'), path.join(dstDir, 'b.txt'))
 
       const lib = await owner.addLibrary({ path: srcDir, peerId: 'peer1', name: 'VerifyLib', mode: 'send-only' })
+      // Record a.txt/b.txt as delivered so the strict-verify gate (delivered/
+      // rows) counts them as "have" — a plain copy is not proof WE synced it.
+      const sa = fs.statSync(path.join(srcDir, 'a.txt'))
+      const sb = fs.statSync(path.join(srcDir, 'b.txt'))
+      const recvBee = receiverH.sync.getBee ? await receiverH.sync.getBee('sync') : null
+      if (recvBee) {
+        await recvBee.put(`delivered/${lib.id}/a.txt`, { size: sa.size, mtimeMs: sa.mtimeMs, sig: `${sa.size}-${sa.mtimeMs}` }).catch(() => {})
+        await recvBee.put(`delivered/${lib.id}/b.txt`, { size: sb.size, mtimeMs: sb.mtimeMs, sig: `${sb.size}-${sb.mtimeMs}` }).catch(() => {})
+      }
       await receiver.handleSyncInvite('peer1', { libraryId: lib.id, name: 'VerifyLib', mode: 'push' })
       await receiver.acceptSyncInvite({ id: lib.id, customPath: dstDir })
       // Accepting on the owner triggers the diff + verify + push round.
@@ -425,6 +434,13 @@ async function main() {
       ok('verify: verified files marked in sentIndex', !!(owner.libraries.get(lib.id).sentIndex['a.txt'] && owner.libraries.get(lib.id).sentIndex['b.txt']))
       // 2 verified marks + the optimistic mark for the real transfer (c.txt).
       ok('verify: verified marks persisted as rows', (await owner._iterRows('sent', lib.id)).length === 3)
+
+      // Record c.txt as delivered too (the harness stubs startSend, so the
+      // delivered/ row the real receiver writes on completion is absent).
+      const cst = fs.statSync(path.join(dstDir, 'c.txt'))
+      if (recvBee) {
+        await recvBee.put(`delivered/${lib.id}/c.txt`, { size: cst.size, mtimeMs: cst.mtimeMs, sig: `${cst.size}-${cst.mtimeMs}` }).catch(() => {})
+      }
 
       // Second round: everything is known — nothing pushed, no verify needed.
       ownerSends.length = 0
@@ -570,6 +586,17 @@ async function main() {
       await receiver.acceptSyncInvite({ id: lib.id, customPath: dstDir })
       await owner.handleSyncInviteAccept('peer1', { libraryId: lib.id })
       ok('heal: initial push delivered both files', ownerSends.length === 2, `sends=${ownerSends.length}`)
+
+      // Simulate the receiver's delivered/ ledger for the files that landed
+      // (the real system writes these on receive completion; the harness
+      // stubs startSend, so record them explicitly).
+      const healBee = receiverH.sync.getBee ? await receiverH.sync.getBee('sync') : null
+      if (healBee) {
+        for (const rel of ['a.txt', 'b.txt']) {
+          const st = fs.statSync(path.join(dstDir, rel))
+          await healBee.put(`delivered/${lib.id}/${rel}`, { size: st.size, mtimeMs: st.mtimeMs, sig: `${st.size}-${st.mtimeMs}` }).catch(() => {})
+        }
+      }
 
       // The receiver's copy of a.txt vanishes (user deleted it on the desktop).
       fs.rmSync(path.join(dstDir, 'a.txt'))

@@ -30,6 +30,8 @@ class TrustManager {
     topicRegistry,
     getPeers,
     sendHandshake,
+    emit,
+    isRefreshing,
     onTrustGranted
   }) {
     this.getBee = getBee
@@ -38,11 +40,18 @@ class TrustManager {
     this.topicRegistry = topicRegistry
     this.getPeers = getPeers // () => Map<peerId, peerObj>
     this.sendHandshake = sendHandshake // (peerId) => void
+    this.emit = emit || (() => {}) // (event, data) => void — engine EventEmitter
+    this.isRefreshing = isRefreshing || (() => false) // () => bool — swarm rebuild in flight
     this.onTrustGranted = onTrustGranted || (() => {}) // (peerId, code) => void
     this.pairingSecrets = new Map() // codeId -> { code, role, createdAt, expiresAt, codeId }
     this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
     this.revokedKeys = new Map() // hex noise public key -> revokedAt ms; refused until a fresh pairing
     this.pairingCodePromise = null // single-flight guard for concurrent code fetches
+    // Failed-MAC lockout: per-key consecutive bad-MAC counter. Repeated wrong
+    // answers (brute-force attempt, stale code) push the peer into an
+    // exponential backoff instead of letting it reconnect and retry forever.
+    // The counter resets on a successful verification (handleResponse).
+    this.failedPairings = new Map() // hex noise public key -> { count, lockedUntil }
   }
 
   // Hydrate the revoked-key set (deleted devices awaiting re-pairing). Must
@@ -271,6 +280,21 @@ class TrustManager {
     return code
   }
 
+  // Drop a joiner (ephemeral) pairing secret and leave its DHT topic. Called
+  // when pairWithCode settles (success or failure) so a failed/abandoned
+  // pairing never keeps the code registered for its full TTL or the topic
+  // announced. Never touches host secrets (role: 'host').
+  dropJoinerCode(code) {
+    if (!code) return
+    const cid = codeId(code)
+    const secret = this.pairingSecrets.get(cid)
+    if (!secret || secret.role !== 'joiner') return
+    this.pairingSecrets.delete(cid)
+    try {
+      if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
+    } catch {}
+  }
+
   // Register a code the user is pairing with (joiner side) and join its topic.
   // Returns the canonical code, or null if the format is invalid.
   registerJoinerCode(rawCode) {
@@ -356,6 +380,33 @@ class TrustManager {
     }
   }
 
+  // Record a failed MAC verification for a key and apply exponential backoff.
+  // Returns true when the peer is currently locked out (must not be sent a new
+  // challenge). A successful verification (handleResponse) clears the entry.
+  _recordPairingFailure(peerId) {
+    const entry = this.failedPairings.get(peerId) || { count: 0, lockedUntil: 0 }
+    entry.count += 1
+    // Backoff ladder: 1st fail → 5s, 2nd → 10s, 3rd → 20s, ... capped at 5min.
+    const backoffMs = Math.min(5000 * Math.pow(2, entry.count - 1), 5 * 60 * 1000)
+    entry.lockedUntil = Date.now() + backoffMs
+    this.failedPairings.set(peerId, entry)
+    return entry.lockedUntil > Date.now()
+  }
+
+  _isPairingLocked(peerId) {
+    const entry = this.failedPairings.get(peerId)
+    if (!entry) return false
+    if (entry.lockedUntil <= Date.now()) {
+      this.failedPairings.delete(peerId)
+      return false
+    }
+    return true
+  }
+
+  _clearPairingFailures(peerId) {
+    this.failedPairings.delete(peerId)
+  }
+
   // Arm (or re-arm) the pairing watchdog for a peer. The timer is tied to
   // challenge activity, not connection open, and only runs while the peer is
   // still in an unverified pairing state. On fire it destroys the connection
@@ -365,6 +416,12 @@ class TrustManager {
     if (!peerObj || !peerObj.pairing) return
     if (peerObj.pairing.trusted || peerObj.pairing.complete) return
     if (peerObj.pairing.timeout) clearTimeout(peerObj.pairing.timeout)
+    // Network-transition awareness: when the swarm is being rebuilt (Wi-Fi →
+    // cellular, router swap), the challenge/response legitimately takes longer
+    // than PAIRING_TIMEOUT — the connection is destroyed and re-established on
+    // the new interface. Extend the watchdog by the refresh window so a slow
+    // relay or rebuild never kills a legitimate in-flight pairing.
+    const graceMs = this.isRefreshing() ? PAIRING_TIMEOUT : 0
     peerObj.pairing.timeout = setTimeout(() => {
       peerObj.pairing.timeout = null
       const p = this.getPeers().get(peerId)
@@ -376,7 +433,7 @@ class TrustManager {
       try {
         p.connection.destroy()
       } catch {}
-    }, PAIRING_TIMEOUT)
+    }, PAIRING_TIMEOUT + graceMs)
     if (peerObj.pairing.timeout.unref) peerObj.pairing.timeout.unref()
   }
 
@@ -399,6 +456,9 @@ class TrustManager {
     const peerObj = this.getPeers().get(peerId)
     if (!peerObj || !peerObj.signaling || !peerObj.pairing) return
     if (peerObj.pairing.trusted && !this.isRevoked(peerId)) return
+    // A peer that just failed a MAC verification is in exponential backoff —
+    // do not re-challenge it until the lockout expires.
+    if (this._isPairingLocked(peerId)) return
     const sentCodeIds = new Set(peerObj.pairing.outstanding.map((o) => o.codeId))
     let sentAny = false
     for (const [, secret] of this.pairingSecrets.entries()) {
@@ -492,10 +552,12 @@ class TrustManager {
     if (idx === -1) {
       if (alreadyTrusted) return // stale/duplicate response — never kill a live peer
       console.warn(`[MeshEngine] Pairing response nonce mismatch from ${peerId}, disconnecting`)
+      this._recordPairingFailure(peerId)
       this._clearPairingTimeout(peerId)
       try {
         peerObj.connection.destroy()
       } catch {}
+      this.emit('pairing:failed', { peerId, reason: 'nonce_mismatch' })
       return
     }
     const outstanding = peerObj.pairing.outstanding[idx]
@@ -503,10 +565,12 @@ class TrustManager {
     if (msg.mac !== expected) {
       if (alreadyTrusted) return // probe mismatch — ignore rather than kill a live peer
       console.warn(`[MeshEngine] Pairing challenge FAILED from ${peerId}, disconnecting`)
+      this._recordPairingFailure(peerId)
       this._clearPairingTimeout(peerId)
       try {
         peerObj.connection.destroy()
       } catch {}
+      this.emit('pairing:failed', { peerId, reason: 'mac_mismatch', codeId: outstanding.codeId })
       return
     }
 
@@ -551,8 +615,10 @@ class TrustManager {
     peerObj.device.isTrusted = true
     peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
     // Challenge VERIFIED: drop the watchdog so the connection is never killed
-    // while the reciprocal HANDSHAKE is still in flight.
+    // while the reciprocal HANDSHAKE is still in flight, and reset the
+    // failed-MAC lockout for this key.
     this._clearPairingTimeout(peerId)
+    this._clearPairingFailures(peerId)
     console.log(`[MeshEngine] Pairing challenge VERIFIED for ${peerId} (${outstanding.code})`)
     this.getPeers().set(peerId, peerObj)
     this.onTrustGranted(peerId, outstanding.code)

@@ -55,6 +55,11 @@ const SYNC_HANDSHAKE_TIMEOUT = 60 * 1000
 const SYNC_FLOW_TIMEOUT = 60 * 1000 // sender: no ACK progress in this window → interrupt
 const SYNC_RECEIVE_IDLE_TIMEOUT = 90 * 1000 // receiver: no blocks after the manifest → interrupt
 
+// Staging-partial retention: a .part file older than this (interrupted transfer
+// never resumed) is swept at engine init. 7 days is generous for an active
+// transfer backlog while still bounding disk waste.
+const STAGING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
 // ─── ChunkScheduler ────────────────────────────────────────────────────────
 
 // Parallel, adaptive block fetcher (see transfer/scheduler.js).
@@ -70,7 +75,9 @@ class TransferEngine {
     getDownloadDirectory,
     getTransferMethod,
     fsp,
-    path
+    path,
+    getSyncMode,
+    getStagingRoot
   }) {
     this.getBee = getBee
     this.exchangeStore = exchangeStore
@@ -81,6 +88,8 @@ class TransferEngine {
     this.getTransferMethod = getTransferMethod
     this.fsp = fsp
     this.path = path
+    this.getSyncMode = getSyncMode || (() => null) // (syncLibraryId) => 'push'|'two-way'|'receive_only'|null
+    this.getStagingRoot = getStagingRoot || (() => null) // () => baseDir for .p2p-staging
 
     this.queue = new TransferQueue()
     this.runs = new Map() // transferId -> { direction, fd, core, flags, scheduler }
@@ -151,6 +160,37 @@ class TransferEngine {
     this._pruneTerminalTransfers().catch(() => {})
   }
 
+  // Sweep stale .p2p-staging partials at engine init. Interrupted transfers
+  // that were never resumed leave a .part on disk forever; this bounds the
+  // leak without touching partials that are still resumable (fresh ones).
+  async _sweepStagingPartials() {
+    try {
+      const root = this.getStagingRoot ? await this.getStagingRoot() : null
+      if (!root) return
+      const { fsp, path } = this
+      const stagingRoot = path.join(root, '.p2p-staging')
+      const entries = await fsp.readdir(stagingRoot, { withFileTypes: true }).catch(() => [])
+      const cutoff = Date.now() - STAGING_RETENTION_MS
+      let removed = 0
+      for (const ent of entries) {
+        if (!ent || ent.isFile()) continue
+        const dirPath = path.join(stagingRoot, ent.name)
+        try {
+          const st = await fsp.stat(dirPath)
+          if (st.mtimeMs < cutoff) {
+            await fsp.rm(dirPath, { recursive: true, force: true })
+            removed++
+          }
+        } catch {}
+      }
+      if (removed > 0) {
+        console.log(`[TransferEngine] swept ${removed} stale staging partial(s)`)
+      }
+    } catch (err) {
+      console.warn('[TransferEngine] staging sweep failed:', err.message)
+    }
+  }
+
   // Re-queue persisted transfers that were interrupted by a restart.
   async init() {
     try {
@@ -180,6 +220,9 @@ class TransferEngine {
       }
       console.log(`[TransferEngine] loaded ${queued.length} queued transfer(s)`)
       this._pruneTerminalTransfers().catch(() => {})
+      // Clean up abandoned .part files (interrupted transfers never resumed).
+      // Non-blocking: the engine must not wait on a disk sweep to come up.
+      this._sweepStagingPartials().catch(() => {})
     } catch (err) {
       console.warn('[TransferEngine] init failed:', err.message)
     }
@@ -1635,7 +1678,30 @@ class TransferEngine {
       } catch {}
     } else if (transfer.isSync) {
       await fsp.mkdir(path.dirname(destPath), { recursive: true })
-      await fsp.rm(destPath, { force: true }).catch(() => {})
+      // Sync overwrite policy:
+      //  - push / receive_only (single-owner backup): the owner's copy always
+      //    wins, the receiver is a pure sink — replace unconditionally.
+      //  - two-way (bidirectional mirror): a differing local file is a
+      //    concurrent-edit conflict. Preserve the local copy in .meshdrop-trash
+      //    BEFORE overwriting so the losing edit is never silently destroyed
+      //    (Last-Write-Wins by completion order, but recoverable).
+      const syncMode = transfer.syncLibraryId ? this.getSyncMode(transfer.syncLibraryId) : null
+      const existing = await fsp.stat(destPath).then(() => true).catch(() => false)
+      if (syncMode === 'two-way' && existing) {
+        try {
+          const trashDir = path.join(path.dirname(destPath), '.meshdrop-trash')
+          await fsp.mkdir(trashDir, { recursive: true })
+          const trashName = `${Date.now().toString(36)}_${path.basename(destPath)}`
+          await fsp.rename(destPath, path.join(trashDir, trashName))
+        } catch (err) {
+          // Trash move failed (locked file, cross-device) — fall back to the
+          // old overwrite rather than failing the whole transfer.
+          console.warn('[TransferEngine] two-way conflict trash failed, overwriting:', err.message)
+          await fsp.rm(destPath, { force: true }).catch(() => {})
+        }
+      } else {
+        await fsp.rm(destPath, { force: true }).catch(() => {})
+      }
       await fsp.rename(stagingPath, finalPath)
       await fsp.rmdir(path.dirname(stagingPath)).catch(() => {})
     } else {

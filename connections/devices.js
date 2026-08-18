@@ -177,7 +177,16 @@ function createDeviceRegistry(ctx) {
             // Join the peer DHT topic AND attempt direct connection to the peer key
             engine.topicRegistry.ensure(peerTopicLabel, { client: true, server: true })
             ctx.swarm.joinPeer(peerKey)
-            ctx.swarm.flush().catch(() => {})
+            // Never leave the flush unhandled: refreshNetwork() destroys the
+            // old swarm while reconnectKnownPeers may be mid-flight, and the
+            // flush rejects with ERR_SWARM_DESTROYED. An unhandled rejection
+            // in the Bare worklet is treated as fatal (unhandledRejection
+            // handler in src/engine/index.js), killing the engine.
+            ctx.swarm.flush().catch((err) => {
+              if (err && !/destroyed/i.test(String(err.message))) {
+                console.warn('[MeshEngine] flush during reconnect failed:', err.message)
+              }
+            })
           } catch (err) {
             console.error(`[MeshEngine] Failed to reconnect to peer ${dev.id}:`, err.message)
           }

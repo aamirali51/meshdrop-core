@@ -25,6 +25,11 @@ const MESSAGES = {
   HANDSHAKE: 'HANDSHAKE',
   PAIRING_CHALLENGE: 'PAIRING_CHALLENGE',
   PAIRING_RESP: 'PAIRING_RESP',
+  // Sent by a host to a peer it is deleting so the peer's UI can react
+  // immediately ("you were removed") instead of discovering it on next
+  // reconnect. The receiving side revokes the host's key and destroys the
+  // connection; re-admission requires a fresh pairing with the current code.
+  DEVICE_REMOVED: 'DEVICE_REMOVED',
   TRANSFER_OFFER: 'TRANSFER_OFFER',
   PING: 'PING',
   PONG: 'PONG',
@@ -51,6 +56,9 @@ const EVENTS = {
   PEER_CONNECTED: 'peer:connected',
   PEER_DISCONNECTED: 'peer:disconnected',
   TRUST_PAIRED: 'trust:paired',
+  TRUST_REVOKED: 'trust:revoked',
+  PAIRING_FAILED: 'pairing:failed',
+  DEVICE_REMOVED: 'device:removed',
   TRANSFER_OFFER: 'transfer:offer',
   TRANSFER_QUEUED: 'transfer:queued',
   TRANSFER_STARTED: 'transfer:started',

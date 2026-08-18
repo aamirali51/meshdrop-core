@@ -230,12 +230,60 @@ function createConnections(engine) {
     ctx.swarm = engine.swarm
     ctx.dhtReady = false
     ctx.swarm.on('connection', onConnection)
+    // hyperswarm surfaces transport-level failures on 'ban' (peer rejected,
+    // e.g. firewalled) and 'update' (peers added/removed/connected). There is
+    // no 'connection-error' event in hyperswarm 4.x — the per-connection
+    // 'error' is swallowed at onConnection. The ban guard below lets a failing
+    // DHT node self-heal instead of silently degrading.
+    ctx.swarm.on('ban', (peerInfo, err) => {
+      if (err && ctx.dhtReady && !ctx.stopped) {
+        console.warn(
+          `[MeshEngine] DHT banned peer (${err.message}) — scheduling swarm refresh`
+        )
+        scheduleRefresh()
+      }
+    })
+    // 'update' fires when the routing table changes. It is informational for
+    // the UI (exposed as network:status) but also a cheap trigger to re-run
+    // topic re-announce when the DHT recovers from a ban/rejection.
+    ctx.swarm.on('update', () => {
+      if (ctx.dhtReady && !ctx.stopped) {
+        engine.emit('network:update', {
+          // Plain counts only: the event may cross a JSON IPC boundary (mobile
+          // bridge serializes every event), so live Connection objects or a
+          // Set are out. hyperswarm 4.x has no swarm.knownPeers — the routing
+          // table length (TimeOrderedSet) is the meaningful "known DHT nodes"
+          // figure.
+          known: ctx.swarm.dht && ctx.swarm.dht.nodes ? ctx.swarm.dht.nodes.length : 0,
+          connecting: ctx.swarm.connecting || 0,
+          connected: ctx.swarm.connections ? ctx.swarm.connections.size : 0
+        })
+      }
+    })
 
     try {
       await ctx.swarm.dht.ready()
       ctx.dhtReady = true
+      // DHT bootstrapped — cancel any pending retry and reset the backoff.
+      if (ctx._dhtRetryTimer) {
+        clearTimeout(ctx._dhtRetryTimer)
+        ctx._dhtRetryTimer = null
+      }
+      ctx._dhtRetry = 0
     } catch (err) {
       console.error('DHT ready failed:', err.message)
+      // DHT bootstrap is a hard prerequisite for announcing/lookup; retry with
+      // backoff so a transient dead network (Wi-Fi dropped, no cell fallback
+      // yet) heals without an OS event. 15s * 8 backoff ≈ 2min of attempts.
+      if (ctx._dhtRetryTimer) clearTimeout(ctx._dhtRetryTimer)
+      ctx._dhtRetry = ctx._dhtRetry ? Math.min(ctx._dhtRetry * 2, 8) : 1
+      const delay = 15000 * ctx._dhtRetry
+      ctx._dhtRetryTimer = setTimeout(() => {
+        ctx._dhtRetryTimer = null
+        if (ctx.stopped) return
+        initSwarm()
+      }, delay)
+      if (ctx._dhtRetryTimer.unref) ctx._dhtRetryTimer.unref()
     }
 
     if (!engine.deviceIdentity) await engine.initIdentity()
@@ -266,6 +314,22 @@ function createConnections(engine) {
     // Automatically reconnect to all stored paired peers on startup and interval
     await devices.reconnectKnownPeers()
     startIntervals()
+    // Tells refreshNetwork()/start() whether the DHT actually bootstrapped.
+    // false means the engine is offline — the caller schedules a self-retry.
+    return ctx.dhtReady
+  }
+
+  // Debounced swarm-level self-heal. refreshNetwork() is serialized internally
+  // (_refreshing flag), so a raw call is safe — but only schedule from
+  // swarm-level events when the engine is healthy.
+  let banTimer = null
+  function scheduleRefresh() {
+    if (banTimer || ctx.stopped || !engine.started) return
+    banTimer = setTimeout(() => {
+      banTimer = null
+      if (!ctx.stopped && engine.started) engine.refreshNetwork()
+    }, 5000)
+    if (banTimer.unref) banTimer.unref()
   }
 
   // Maintenance intervals are started once per engine lifetime; initSwarm is
