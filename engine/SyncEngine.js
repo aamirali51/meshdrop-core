@@ -16,7 +16,11 @@
 const { EVENTS, MESSAGES } = require('../protocol.js')
 const { sha256 } = require('../crypto.js')
 
-const DEFAULT_SCAN_INTERVAL_MS = 5 * 60 * 1000 // 5min safety net — the watcher covers live changes; a 60s full-folder scan drained battery
+// Safety-net rescan interval. The watcher covers live changes; this bounds
+// the worst case when the watcher misses an event (Windows recursive fs.watch
+// is not 100% reliable) or the app was closed. 60s bounds two-way sync
+// latency to a minute instead of five when the watcher misses.
+const DEFAULT_SCAN_INTERVAL_MS = 60 * 1000
 const MAX_LIBRARY_FILES = 50000
 const CONFLICT_TOLERANCE_MS = 3000
 // How close a receiver's on-disk mtime must be to the sender's recorded mtime
@@ -1006,10 +1010,23 @@ class SyncEngine {
     if (!lib || lib.paused || !lib.accepted || lib.mode === 'receive_only') return
     // Re-entrancy guard: invite-accept and index-exchange can both trigger a
     // push round; without this, concurrent rounds push every file twice.
-    if (lib._pushing) return
+    if (lib._pushing) {
+      // A round was dropped because another is in flight — remember to re-run
+      // once it finishes so a remote's newly-announced file is never silently
+      // left un-pushed until the next 5-minute tick. This is the "hit or miss"
+      // two-way bug: both the remote index arrival and our own watcher can
+      // fire a push round, and the dropped one lost the remote's file.
+      lib._pushingRetry = true
+      return
+    }
     lib._pushing = true
     try {
       await this._doDiffAndPush(lib)
+      // Catch-up: if a round was dropped while we were pushing, run once more.
+      if (lib._pushingRetry && !lib.paused && lib.accepted) {
+        lib._pushingRetry = false
+        await this._doDiffAndPush(lib)
+      }
     } finally {
       lib._pushing = false
     }
@@ -1495,6 +1512,21 @@ class SyncEngine {
     // file, push ours.
     if (lib.accepted && !lib.paused) {
       this._diffAndPush(lib).catch(() => {})
+    }
+    // Convergence (two-way only): echo our own index back. The remote's push
+    // of ITS new files to us is triggered by it receiving OUR index (its
+    // handleSyncIndex -> its _diffAndPush). If our last scan happened while
+    // it looked offline, it never got our index and never pushed. Every index
+    // arrival therefore re-sends ours, so the exchange converges even if a
+    // scan was missed.
+    if (lib.mode === 'two-way' && lib.accepted && !lib.paused) {
+      this._sendToPeer(peerId, {
+        type: MESSAGES.SYNC_INDEX,
+        libraryId: lib.id,
+        name: lib.name,
+        mode: lib.mode,
+        entries: indexToArray(lib.index)
+      })
     }
   }
 
