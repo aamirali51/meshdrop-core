@@ -171,6 +171,59 @@ async function scanFolder(fsp, dir, baseDir, out, limit = MAX_LIBRARY_FILES) {
   await Promise.all(Array.from({ length: WALKERS }, () => worker()))
 }
 
+// True when rel is exactly a dirty path, or lives under a dirty directory.
+// Used by the incremental-scan tombstone loop: only dirty paths may be
+// tombstoned (a dirty dir means everything under it was touched).
+function isDirtyOrUnder(dirtySet, rel) {
+  if (!dirtySet) return true
+  if (dirtySet.has(rel)) return true
+  const parts = rel.split('/')
+  for (let i = 1; i < parts.length; i++) {
+    if (dirtySet.has(parts.slice(0, i).join('/'))) return true
+  }
+  return false
+}
+
+// Incremental scan: stat only the dirty rel paths (and walk any that are
+// directories), producing the same {rel -> {size,mtimeMs,sig,hash}} shape as
+// scanFolder. Paths that no longer exist are returned with deleted:true so the
+// caller can tombstone them. Used when the watcher told us exactly which files
+// changed — avoids a full folder walk on every single-file edit.
+async function statDirtyPaths(fsp, baseDir, dirtyPaths) {
+  const out = new Map()
+  let sawDir = false
+  const { path: p } = require('../compat.js')
+  for (const dirty of dirtyPaths) {
+    if (!dirty || out.size >= MAX_LIBRARY_FILES) continue
+    const abs = p.join(baseDir, ...dirty.split('/'))
+    let st = null
+    try {
+      st = await fsp.stat(abs)
+    } catch {
+      // Gone — caller tombstones it via deleted:true
+      out.set(dirty, { size: 0, mtimeMs: Date.now(), sig: '', hash: '', deleted: true })
+      continue
+    }
+    const isDir = typeof st.isDirectory === 'function' ? st.isDirectory() : false
+    if (isDir) {
+      // A dirty directory (new subfolder, rename target) is a subtree — the
+      // files inside can be mid-write during a transfer. Signal the caller to
+      // fall back to a full scan rather than racing the transfer.
+      sawDir = true
+      continue
+    }
+    const rel = safeRelPath(dirty)
+    if (!rel) continue
+    const rawMtime = st.mtimeMs || (st.mtime && typeof st.mtime.getTime === 'function' ? st.mtime.getTime() : st.mtime)
+    const mtimeMs = Number(rawMtime) || Date.now()
+    const size = Number(st.size) || 0
+    const sig = `${size}-${mtimeMs}`
+    out.set(rel, { size, mtimeMs, sig, hash: '' })
+  }
+  out._sawDir = sawDir
+  return out
+}
+
 // Convert index map to wire array
 function indexToArray(index) {
   const out = []
@@ -489,17 +542,19 @@ class SyncEngine {
   _watchLibrary(lib) {
     if (lib.watcher || !this.fs || typeof this.fs.watch !== 'function' || !lib.localPath) return
     try {
-      // No filename filtering: rename events can report the staging source
-      // path on some platforms, and skipping them would miss files landing in
-      // the folder. Rescans are cheap (stat-only) and harmless — receive-only
-      // sinks never answer indexes, so there is no ack-ping-pong to avoid.
-      const watcher = this.fs.watch(lib.localPath, { recursive: true }, () => {
-        this._onFolderChange(lib.id)
+      // Capture the filename when the platform provides it (fs.watch passes
+      // (eventType, filename)). Dirty-path tracking then lets syncLibrary do
+      // an INCREMENTAL stat of just the changed paths instead of a full
+      // folder walk — the "mark dirty, scan only that" model. On platforms
+      // where filename is null (some recursive watchers), the dirty set is
+      // empty and we fall back to a full scan.
+      const watcher = this.fs.watch(lib.localPath, { recursive: true }, (eventType, filename) => {
+        this._onFolderChange(lib.id, filename)
       })
       watcher.on('error', () => {
         // A watcher error (unmounted drive, ENOENT, fd exhaustion) must not
         // permanently disable change detection. Close and re-arm with
-        // exponential backoff; the 5-min tick covers the gap meanwhile.
+        // exponential backoff; the tick covers the gap meanwhile.
         this._stopWatching(lib.id)
         this._scheduleWatchRetry(lib.id)
       })
@@ -547,12 +602,29 @@ class SyncEngine {
     }
   }
 
-  _onFolderChange(id) {
+  _onFolderChange(id, filename) {
     const lib = this.libraries.get(id)
     if (!lib || lib.paused) return
+    // Record the dirty path (relative to the library root). A null filename
+    // (platform didn't report it) signals a full rescan is needed. The dirty
+    // set is capped: beyond the cap a full scan is cheaper.
+    if (typeof filename === 'string' && filename.length > 0) {
+      if (!lib._dirtyPaths) lib._dirtyPaths = new Set()
+      // Normalize: fs.watch filenames use the OS separator; convert to the
+      // same forward-slash rel keys the scan uses. Strip a leading separator.
+      let rel = filename.split(/[\\/]/).join('/').replace(/^\/+/, '')
+      if (rel && !isIgnored(rel.split('/').pop() || rel)) {
+        lib._dirtyPaths.add(rel)
+        if (lib._dirtyPaths.size > 200) lib._dirtyPaths = null // full scan
+      }
+    } else {
+      lib._dirtyPaths = null
+    }
     clearTimeout(lib.flushTimer)
     lib.flushTimer = setTimeout(() => {
-      this.syncLibrary(id).catch(() => {})
+      // Watcher-triggered scan: incremental (uses the dirty set). Explicit
+      // syncLibrary calls pass { full: true } and never trust the dirty set.
+      this.syncLibrary(id, { full: false }).catch(() => {})
     }, 1000)
     if (lib.flushTimer.unref) lib.flushTimer.unref()
   }
@@ -797,7 +869,7 @@ class SyncEngine {
     lib.status = 'idle'
     this._watchLibrary(lib)
     await this._persist(lib)
-    this.syncLibrary(id).catch(() => {})
+    this.syncLibrary(id, { full: true }).catch(() => {})
     return lib
   }
 
@@ -839,27 +911,59 @@ class SyncEngine {
 
   // ─── Sync Execution & Diffing ─────────────────────────────────────────────
 
-  async syncLibrary(id) {
+  // Single entry point for a sync round. Concurrent calls (watcher debounce +
+  // explicit UI/tick/PEER_CONNECTED triggers) are serialized per library via a
+  // promise chain, so nothing is ever dropped: a call that arrives while a
+  // scan is in flight awaits it, then runs its own scan. This is the
+  // deterministic "compare on demand" model — no _pendingRescan loss.
+  async syncLibrary(id, opts = {}) {
     const lib = this.libraries.get(id)
     if (!lib || lib.paused) return null
-    if (this._syncingSet.has(id)) {
-      // A scan is already in flight. Changes that landed mid-scan must not be
-      // dropped silently — mark a catch-up run so the moment the current scan
-      // finishes, we re-scan once more instead of waiting for the next event
-      // or the 5-minute tick.
-      lib._pendingRescan = true
-      return null
-    }
+    const prev = lib._scanChain || Promise.resolve()
+    const run = prev.then(() => this._runScan(lib, id, opts))
+    lib._scanChain = run.catch(() => {})
+    return run
+  }
 
+  async _runScan(lib, id, opts = {}) {
     this._syncingSet.add(id)
     lib.status = 'syncing'
     this.sendEvent(EVENTS.SYNC_SCAN, { id, status: 'syncing' })
     this._setPhase(lib, 'analyzing', { total: 0, done: 0 })
 
     try {
-      // 1. Fast stat pass to update local index
+      // 1. Fast stat pass to update local index. Incremental when the watcher
+      // told us exactly which paths changed (dirty-flag model): stat only
+      // those instead of walking the whole folder. Falls back to a full scan
+      // when the dirty set is null/empty (no filename from the watcher, a
+      // burst past the cap, or an explicit manual sync — an explicit call
+      // must never trust a possibly-stale dirty set).
       const scanOut = new Map()
-      await scanFolder(this.fsp, lib.localPath, lib.localPath, scanOut)
+      const dirty = lib._dirtyPaths
+      lib._dirtyPaths = null // consumed; a re-scan re-populates it
+      // Incremental ONLY for watcher-triggered scans (opts.full === false).
+      // Every other caller (explicit UI, tick, PEER_CONNECTED, accept, retry)
+      // does a full scan — a possibly-stale dirty set must never make an
+      // authoritative sync miss files.
+      const wantIncremental = opts.full === false && dirty && dirty.size > 0 && dirty.size <= 200
+      let wasIncremental = wantIncremental
+      if (wantIncremental) {
+        const res = await statDirtyPaths(this.fsp, lib.localPath, dirty)
+        for (const [rel, meta] of res.entries()) scanOut.set(rel, meta)
+        if (res._sawDir) {
+          // A dirty path was a directory (new subfolder, rename target) — the
+          // subtree may be mid-write during a transfer. Fall back to a full
+          // scan so no file is mis-read or tombstoned.
+          console.log('[SyncEngine] dirty path is a directory — falling back to full scan')
+          wasIncremental = false
+          scanOut.clear()
+          await scanFolder(this.fsp, lib.localPath, lib.localPath, scanOut)
+        } else if (scanOut.size > 0) {
+          console.log(`[SyncEngine] incremental scan: ${scanOut.size} dirty path(s)`)
+        }
+      } else {
+        await scanFolder(this.fsp, lib.localPath, lib.localPath, scanOut)
+      }
       const myPeerId = this.getPeerId ? this.getPeerId() : ''
 
       // Missing-source guard: if the folder is gone/unmounted, scanFolder
@@ -885,9 +989,25 @@ class SyncEngine {
         return
       }
 
-      const nextIndex = {}
+      // Incremental mode: seed nextIndex with the existing index so the
+      // non-dirty files survive (scanOut only holds the dirty paths). Full
+      // scans build nextIndex fresh.
+      const nextIndex = wasIncremental ? { ...(lib.index || {}) } : {}
       for (const [rel, meta] of scanOut.entries()) {
         const prev = lib.index[rel]
+        // Incremental scans can return deleted:true for a dirty path that
+        // vanished — carry the tombstone through instead of reviving it.
+        if (meta.deleted) {
+          nextIndex[rel] = {
+            size: meta.size || (prev && prev.size) || 0,
+            mtimeMs: Date.now(),
+            sig: (prev && prev.sig) || '',
+            authorKey: myPeerId,
+            deleted: true,
+            hash: (prev && prev.hash) || ''
+          }
+          continue
+        }
         if (prev && !prev.deleted && prev.sig === meta.sig) {
           nextIndex[rel] = prev
         } else {
@@ -905,9 +1025,15 @@ class SyncEngine {
         }
       }
 
-      // Mark vanished files as deleted (tombstones)
+      // Mark vanished files as deleted (tombstones). In incremental mode only
+      // dirty paths can have vanished — statDirtyPaths already returns them
+      // as deleted:true, so the loop must NOT tombstone untouched files (they
+      // are simply not in scanOut). The dirty set is the allowlist.
       for (const [rel, prev] of Object.entries(lib.index || {})) {
         if (prev && !prev.deleted && !scanOut.has(rel)) {
+          if (wasIncremental && !isDirtyOrUnder(dirty, rel)) {
+            continue // untouched in an incremental scan — keep as-is
+          }
           nextIndex[rel] = {
             size: prev.size,
             mtimeMs: Date.now(),
@@ -996,13 +1122,9 @@ class SyncEngine {
     } finally {
       this._syncingSet.delete(id)
       if (lib.status === 'syncing') lib.status = 'idle'
-      // Catch-up: a syncLibrary call that arrived while this scan was in flight
-      // set _pendingRescan. Re-run once now (async, outside the lock) so
-      // mid-scan changes are never silently dropped.
-      if (lib._pendingRescan && !lib.paused) {
-        lib._pendingRescan = false
-        this.syncLibrary(id).catch(() => {})
-      }
+      // NOTE: no _pendingRescan re-entry here. The syncLibrary chain already
+      // serializes concurrent calls — a caller that arrived during this scan
+      // is queued on lib._scanChain and runs right after this one finishes.
     }
   }
 
@@ -1582,7 +1704,7 @@ class SyncEngine {
     const lib = this.libraries.get(msg.libraryId)
     if (!lib) return
     await this._deleteLocal(lib, msg.rel)
-    await this.syncLibrary(lib.id).catch(() => {})
+    await this.syncLibrary(lib.id, { full: true }).catch(() => {})
   }
 
   // Periodic rescan tick across active libraries
@@ -1611,7 +1733,7 @@ class SyncEngine {
       }
 
       try {
-        await this.syncLibrary(lib.id)
+        await this.syncLibrary(lib.id, { full: true })
       } catch {}
     }
   }
@@ -1671,7 +1793,7 @@ class SyncEngine {
       })
     }
     // Scan our (possibly new) folder and exchange indexes so the sender starts pushing.
-    this.syncLibrary(lib.id).catch(() => {})
+    this.syncLibrary(lib.id, { full: true }).catch(() => {})
     return { success: true, id, path: localPath }
   }
 
@@ -1732,7 +1854,7 @@ class SyncEngine {
         clearTimeout(lib._failRetryTimer)
         lib._failRetryTimer = setTimeout(() => {
           lib._failRetries = Math.max(0, (lib._failRetries || 1) - 1)
-          this.syncLibrary(lib.id).catch(() => {})
+          this.syncLibrary(lib.id, { full: true }).catch(() => {})
         }, delay)
         if (lib._failRetryTimer.unref) lib._failRetryTimer.unref()
       }
