@@ -687,12 +687,17 @@ class SyncEngine {
     const baseline = useSent ? lib.sentIndex || {} : lib.remoteIndex || {}
 
     // Pure 3-way reconciliation
-    const { toPush, toDeleteRemote } = Reconciler.reconcile({
+    const { toPush, toDeleteLocal, toDeleteRemote } = Reconciler.reconcile({
       localIndex: lib.index || {},
       baseline,
       remoteIndex: lib.remoteIndex || {},
       mode: lib.mode
     })
+
+    // Apply remote-driven local deletes proactively (don't wait for next SYNC_INDEX)
+    for (const rel of toDeleteLocal) {
+      await this._deleteLocal(lib, rel).catch(() => {})
+    }
 
     const toPushSet = new Set(toPush)
     const have = new Set()
@@ -1125,7 +1130,10 @@ class SyncEngine {
 
     const peerId = invite ? invite.peerId : ''
     const libName = (invite && invite.name) || this.path.basename(localPath) || 'Sync'
-    const mode = invite && invite.mode === 'push' ? 'receive_only' : 'two-way'
+    const mode =
+      invite && invite.mode === 'push'         ? 'receive_only' :
+      invite && invite.mode === 'receive_only'  ? 'push'         :
+      'two-way'
 
     let lib = this.libraries.get(id)
     if (!lib) {

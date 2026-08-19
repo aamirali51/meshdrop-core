@@ -51,7 +51,7 @@ async function scanFolder(fsp, dir, baseDir, out, limit = MAX_LIBRARY_FILES) {
       const stats = await Promise.all(
         pendingStats.map((abs) =>
           fsp
-            .stat(abs)
+            .lstat(abs)
             .then((st) => ({ abs, st }))
             .catch(() => null)
         )
@@ -60,6 +60,8 @@ async function scanFolder(fsp, dir, baseDir, out, limit = MAX_LIBRARY_FILES) {
       for (const item of stats) {
         if (item && item.st && out.size < limit) {
           const isDir = typeof item.st.isDirectory === 'function' ? item.st.isDirectory() : false
+          const isSym = typeof item.st.isSymbolicLink === 'function' ? item.st.isSymbolicLink() : false
+          if (isSym) continue // Issue 5 fix: never follow symlinks — avoids infinite cycles
           if (isDir) {
             queue.push(item.abs)
           } else {
@@ -139,9 +141,12 @@ async function hashFileFast(fsp, abs) {
         chunkHashes.push(sha256(buf.subarray(0, bytesRead)))
         pos += bytesRead
       }
-      return Buffer.isBuffer(chunkHashes[0])
-        ? Buffer.concat(chunkHashes.map((h) => (Buffer.isBuffer(h) ? h : Buffer.from(h)))).toString('hex')
-        : ''
+      if (chunkHashes.length === 0) return ''
+      // Issue 6 fix: hash the concatenated chunk-hashes into a single digest
+      // so the result is the same regardless of how the file was chunked.
+      const combined = Buffer.concat(chunkHashes.map((h) => (Buffer.isBuffer(h) ? h : Buffer.from(h))))
+      const final = sha256(combined)
+      return Buffer.isBuffer(final) ? final.toString('hex') : ''
     } finally {
       await fd.close().catch(() => {})
     }

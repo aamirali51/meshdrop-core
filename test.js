@@ -324,19 +324,33 @@ function sha256File(filePath) {
 // `fromIndex` (the child's line buffer grows; pass a snapshot of
 // child.lines.length to ignore older messages). Resolves with the matching
 // messages; throws on timeout.
-async function waitForCount(child, test, count, timeoutMs, label, fromIndex = 0) {
+// `dedupKey`: optional function(msg) => string — when provided, messages with
+// the same key are treated as the SAME logical event (only the most recent
+// version is kept). Useful for sync completions where a retry for the same
+// file should not count as two distinct deliveries.
+async function waitForCount(child, test, count, timeoutMs, label, fromIndex = 0, dedupKey = null) {
   const start = Date.now()
-  const found = new Set()
   while (Date.now() - start < timeoutMs) {
-    for (let i = fromIndex; i < child.lines.length; i++) {
-      if (test(child.lines[i])) found.add(JSON.stringify(child.lines[i]))
+    const matching = child.lines.slice(fromIndex).filter((m) => test(m))
+    let effective
+    if (dedupKey) {
+      // Keep only the most recent completion per logical key (last write wins).
+      const byKey = new Map()
+      for (const m of matching) byKey.set(dedupKey(m), m)
+      effective = Array.from(byKey.values())
+    } else {
+      // Default: deduplicate by full JSON identity (original behaviour).
+      const seen = new Set()
+      effective = []
+      for (const m of matching) {
+        const k = JSON.stringify(m)
+        if (!seen.has(k)) { seen.add(k); effective.push(m) }
+      }
     }
-    if (found.size >= count) {
-      return child.lines.slice(fromIndex).filter((m) => test(m)).slice(0, count)
-    }
+    if (effective.length >= count) return effective.slice(0, count)
     await new Promise((r) => setTimeout(r, 250))
   }
-  throw new Error(`${child.name} timed out waiting for ${label} (got ${found.size}/${count})`)
+  throw new Error(`${child.name} timed out waiting for ${label}`)
 }
 
 async function main() {
@@ -705,7 +719,8 @@ async function main() {
       2,
       TRANSFER_TIMEOUT_MS,
       'host sync transfers',
-      hostBeforeSync
+      hostBeforeSync,
+      (m) => m.destPath  // deduplicate by destination file path — retries for the same file count once
     )
     ok('both sync files completed', syncCompletions.length === 2, `${syncCompletions.length}/2`)
 
