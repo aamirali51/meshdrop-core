@@ -1067,8 +1067,8 @@ class SyncEngine {
       // 2. Push/diff when the peer is connected and accepted. The index is only
       // announced for two-way libraries (desktop↔desktop): push owners track
       // their own sentIndex, and receive-only sinks never answer indexes.
-      const peersMap = this.getPeers()
-      const isPeerOnline = lib.peerId && (peersMap.has(lib.peerId) || Array.from(peersMap.values()).some((p) => p.device?.id === lib.peerId || p.device?.publicKey === lib.peerId)) && !(this._findPeer(lib.peerId)?.incompatible)
+      const peerObj = this._findPeer(lib.peerId)
+      const isPeerOnline = !!(peerObj && peerObj.connection && !peerObj.incompatible)
       
       if (isPeerOnline && lib.accepted) {
         if (lib.mode === 'two-way') {
@@ -1630,25 +1630,9 @@ class SyncEngine {
 
     // Receiver side (two-way): mirror peer tombstones to trash.
     await this._applyRemoteDeletes(lib)
-    // Sender side (two-way): if the peer's index is missing or older on a
-    // file, push ours.
+    // Sender side (two-way): if the peer's index is missing or older on a file, push ours.
     if (lib.accepted && !lib.paused) {
       this._diffAndPush(lib).catch(() => {})
-    }
-    // Convergence (two-way only): echo our own index back. The remote's push
-    // of ITS new files to us is triggered by it receiving OUR index (its
-    // handleSyncIndex -> its _diffAndPush). If our last scan happened while
-    // it looked offline, it never got our index and never pushed. Every index
-    // arrival therefore re-sends ours, so the exchange converges even if a
-    // scan was missed.
-    if (lib.mode === 'two-way' && lib.accepted && !lib.paused) {
-      this._sendToPeer(peerId, {
-        type: MESSAGES.SYNC_INDEX,
-        libraryId: lib.id,
-        name: lib.name,
-        mode: lib.mode,
-        entries: indexToArray(lib.index)
-      })
     }
   }
 
@@ -1709,14 +1693,10 @@ class SyncEngine {
 
   // Periodic rescan tick across active libraries
   async tick() {
-    const peersMap = this.getPeers()
     for (const lib of this.libraries.values()) {
       if (lib.paused) continue
-      const isOnline = lib.peerId && (peersMap.has(lib.peerId) || Array.from(peersMap.values()).some((p) => p.device?.id === lib.peerId || p.device?.publicKey === lib.peerId))
-      if (!isOnline) continue
-
       const peerObj = this._findPeer(lib.peerId)
-      if (peerObj && peerObj.incompatible) continue
+      if (!peerObj || !peerObj.connection || peerObj.incompatible) continue
 
       if (!lib.accepted) {
         // The peer is back but never accepted our invite (it was offline when
