@@ -2067,13 +2067,36 @@ class TransferEngine {
     return results
   }
 
-  async clear() {
+  async delete(transferId) {
+    if (!transferId) return false
+    try {
+      await this.cancel(transferId).catch(() => {})
+    } catch {}
+    const bee = await this.getBee('transfers')
+    await bee.del(transferId)
+    this._emit(EVENTS.TRANSFER_CANCELLED, { id: transferId, deleted: true })
+    return true
+  }
+
+  async clear(options = {}) {
+    const includePending = typeof options === 'boolean' ? options : Boolean(options && options.includePending)
+    const status = options && typeof options === 'object' ? options.status : null
     const bee = await this.getBee('transfers')
     const keys = []
     for await (const node of bee.createReadStream()) {
-      if (node.value && TERMINAL.has(node.value.status)) keys.push(node.key)
+      if (!node.value || !node.key) continue
+      if (status && node.value.status === status) {
+        keys.push(node.key)
+      } else if (includePending || TERMINAL.has(node.value.status)) {
+        keys.push(node.key)
+      }
     }
-    for (const k of keys) await bee.del(k)
+    for (const k of keys) {
+      try {
+        await this.cancel(k).catch(() => {})
+      } catch {}
+      await bee.del(k)
+    }
     return { success: true, count: keys.length }
   }
 

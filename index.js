@@ -894,9 +894,14 @@ class MeshEngine extends EventEmitter {
     return this.transferEngine.retry(transferId)
   }
 
-  /** Remove terminal (completed/failed/cancelled/interrupted) records. */
-  async clearTransfers() {
-    return this.transferEngine.clear()
+  /** Delete an individual transfer record (cancelling if active). */
+  async deleteTransfer(transferId) {
+    return this.transferEngine.delete(transferId)
+  }
+
+  /** Remove transfer records (terminal by default, or all including pending when includePending=true). */
+  async clearTransfers(options) {
+    return this.transferEngine.clear(options)
   }
 
   /** Engine storage overview: record counts + on-disk size (for the UI). */
