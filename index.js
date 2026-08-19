@@ -173,7 +173,7 @@ class MeshEngine extends EventEmitter {
     // as the relay for connections that can't holepunch directly (instead of
     // going straight to the public bootstrap nodes). Only paired, trusted
     // devices ever see this node's key, so the relay is private to the mesh.
-    this.preferOwnRelay = config.preferOwnRelay === true
+    this.preferOwnRelay = config.preferOwnRelay !== false
 
     this.started = false
 
