@@ -1,13 +1,12 @@
 'use strict'
 
-// Global Port 443 WebSocket Relay Client for @mesh/core.
+// Global Port 443 WebSocket + KV Relay Client for @mesh/core.
 //
-// Connects to the Cloudflare WSS relay (or custom HTTPS relay) to enable
-// instant pairing and signaling fallback across restrictive NATs (symmetric NAT,
-// pfSense, cellular CGNAT, university Wi-Fi, and firewalled networks) where
-// direct UDP holepunching fails.
+// Connects to Cloudflare edge relay to enable instant pairing and signaling
+// fallback across restrictive NATs (symmetric NAT, pfSense, cellular CGNAT,
+// university Wi-Fi, and firewalled networks) where direct UDP holepunching fails.
 
-const DEFAULT_RELAY_URL = 'wss://meshdrop-relay.aamirabdullah33.workers.dev'
+const DEFAULT_RELAY_URL = 'https://meshdrop-relay.aamirabdullah33.workers.dev'
 
 class RelayClient {
   /**
@@ -17,11 +16,13 @@ class RelayClient {
    * @param {function} [opts.onMessage]   (topic, msg, fromPeerId) => void
    */
   constructor(opts = {}) {
-    this.relayUrl = opts.relayUrl || DEFAULT_RELAY_URL
+    this.baseUrl = (opts.relayUrl || DEFAULT_RELAY_URL).replace(/\/+$/, '')
     this.localPeerId = opts.localPeerId || ''
     this.onMessage = opts.onMessage || (() => {})
     this.topics = new Set() // Set of active topic strings (e.g. 'p2p-pair-MD-XXXX...')
     this.sockets = new Map() // topic -> WebSocket instance
+    this.pollTimers = new Map() // topic -> interval timer
+    this.seenMessageIds = new Set()
     this.started = false
     this.reconnectTimers = new Map()
   }
@@ -34,6 +35,7 @@ class RelayClient {
     this.started = true
     for (const topic of this.topics) {
       this._connectTopic(topic)
+      this._startPolling(topic)
     }
   }
 
@@ -43,6 +45,10 @@ class RelayClient {
       clearTimeout(timer)
     }
     this.reconnectTimers.clear()
+    for (const [, timer] of this.pollTimers.entries()) {
+      clearInterval(timer)
+    }
+    this.pollTimers.clear()
     for (const [, ws] of this.sockets.entries()) {
       try {
         ws.close()
@@ -56,6 +62,7 @@ class RelayClient {
     this.topics.add(topic)
     if (this.started) {
       this._connectTopic(topic)
+      this._startPolling(topic)
     }
   }
 
@@ -65,6 +72,10 @@ class RelayClient {
     if (this.reconnectTimers.has(topic)) {
       clearTimeout(this.reconnectTimers.get(topic))
       this.reconnectTimers.delete(topic)
+    }
+    if (this.pollTimers.has(topic)) {
+      clearInterval(this.pollTimers.get(topic))
+      this.pollTimers.delete(topic)
     }
     const ws = this.sockets.get(topic)
     if (ws) {
@@ -77,22 +88,72 @@ class RelayClient {
 
   send(topic, payload) {
     if (!topic || !payload) return false
+    const msgId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const msg = {
+      id: msgId,
+      topic,
+      fromPeerId: this.localPeerId,
+      data: payload,
+      ts: Date.now()
+    }
+
+    this.seenMessageIds.add(msgId)
+
+    // 1. Send via WebSocket if open
     const ws = this.sockets.get(topic)
     if (ws && ws.readyState === 1 /* OPEN */) {
       try {
-        const msg = {
-          topic,
-          fromPeerId: this.localPeerId,
-          data: payload,
-          ts: Date.now()
-        }
         ws.send(JSON.stringify(msg))
-        return true
       } catch (err) {
-        console.warn('[RelayClient] Failed to send over WSS:', err.message)
+        console.warn('[RelayClient] WSS send error:', err.message)
       }
     }
-    return false
+
+    // 2. Publish to Cloudflare Global KV via HTTP POST
+    const httpUrl = `${this.baseUrl}/poll?topic=${encodeURIComponent(topic)}`
+    if (typeof fetch === 'function') {
+      fetch(httpUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(msg)
+      }).catch(() => {})
+    }
+
+    return true
+  }
+
+  _startPolling(topic) {
+    if (this.pollTimers.has(topic)) return
+    const poll = async () => {
+      if (!this.started || !this.topics.has(topic)) return
+      const httpUrl = `${this.baseUrl}/poll?topic=${encodeURIComponent(topic)}`
+      try {
+        if (typeof fetch !== 'function') return
+        const res = await fetch(httpUrl)
+        if (!res.ok) return
+        const body = await res.json()
+        if (body && Array.isArray(body.messages)) {
+          for (const m of body.messages) {
+            if (!m || !m.data) continue
+            if (m.fromPeerId && m.fromPeerId === this.localPeerId) continue
+            const mid = m.id || `${m.fromPeerId}_${m.ts}_${JSON.stringify(m.data).slice(0, 32)}`
+            if (this.seenMessageIds.has(mid)) continue
+            this.seenMessageIds.add(mid)
+            if (this.seenMessageIds.size > 500) {
+              const arr = Array.from(this.seenMessageIds)
+              this.seenMessageIds = new Set(arr.slice(-250))
+            }
+            this.onMessage(topic, m.data, m.fromPeerId)
+          }
+        }
+      } catch {}
+    }
+
+    // Run immediate poll, then every 1200ms
+    poll()
+    const timer = setInterval(poll, 1200)
+    if (timer.unref) timer.unref()
+    this.pollTimers.set(topic, timer)
   }
 
   _connectTopic(topic) {
@@ -108,14 +169,11 @@ class RelayClient {
       ? globalThis.WebSocket
       : null
 
-    if (!WS) {
-      console.warn('[RelayClient] globalThis.WebSocket unavailable in this environment')
-      return
-    }
+    if (!WS) return
 
     try {
-      const url = `${this.relayUrl}?topic=${encodeURIComponent(topic)}`
-      const ws = new WS(url)
+      const wssUrl = this.baseUrl.replace(/^http/, 'ws') + `/?topic=${encodeURIComponent(topic)}`
+      const ws = new WS(wssUrl)
       this.sockets.set(topic, ws)
 
       ws.onopen = () => {
@@ -129,6 +187,9 @@ class RelayClient {
           if (!parsed || (parsed.fromPeerId && parsed.fromPeerId === this.localPeerId)) {
             return
           }
+          const mid = parsed.id || `${parsed.fromPeerId}_${parsed.ts}`
+          if (this.seenMessageIds.has(mid)) return
+          this.seenMessageIds.add(mid)
           this.onMessage(topic, parsed.data, parsed.fromPeerId)
         } catch (err) {
           console.warn('[RelayClient] Error parsing incoming WSS message:', err.message)
@@ -142,13 +203,12 @@ class RelayClient {
         }
       }
 
-      ws.onerror = (err) => {
+      ws.onerror = () => {
         try {
           ws.close()
         } catch {}
       }
-    } catch (err) {
-      console.warn('[RelayClient] WebSocket init error:', err.message)
+    } catch {
       this._scheduleReconnect(topic)
     }
   }
