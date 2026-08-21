@@ -23,6 +23,7 @@ const LanDiscovery = require('./engine/LanDiscovery.js')
 const { loadOrCreateNoiseKeypair } = require('./noiseKeypair.js')
 const { createStorage } = require('./storage.js')
 const { createConnections, getTransferMethod } = require('./connections/index.js')
+const { RelayClient } = require('./connections/relayClient.js')
 
 const PAIR_WAIT_TIMEOUT = 60 * 1000 // max time pairWithCode waits for verification
 const EXPIRATION_INTERVAL_MS = 10 * 1000
@@ -193,6 +194,7 @@ class MeshEngine extends EventEmitter {
     this.lanDiscovery = null
     this.notificationStore = null
     this.connections = null
+    this.relayClient = new RelayClient({ relayUrl: config.relayUrl })
     this.expirationTimer = null
     // Set when refreshNetwork() finds the DHT unreachable (dead network, no
     // replacement yet). A self-scheduled retry re-runs the rebuild so the
@@ -386,10 +388,13 @@ class MeshEngine extends EventEmitter {
       computeTopicHash: this.storage.computeTopicHash,
       swarm: this.swarm,
       topicRegistry: this.topicRegistry,
+      relayClient: this.relayClient,
       getPeers: () => this.peers,
       sendHandshake: (peerId) => this.connections.sendHandshake(peerId),
       emit: (event, data) => this.emit(event, data),
       isRefreshing: () => this._refreshing === true,
+      getDeviceIdentity: () => this.storage.getDeviceIdentity(),
+      getPeerId: () => this.peerId,
       onTrustGranted: (peerId, code) => {
         const peerObj = this.peers.get(peerId)
         if (peerObj && peerObj.pairing) peerObj.pairing.code = code
@@ -630,6 +635,10 @@ class MeshEngine extends EventEmitter {
     if (this.expirationTimer.unref) this.expirationTimer.unref()
 
     this.started = true
+    if (this.relayClient) {
+      this.relayClient.setPeerId(this.peerId)
+      this.relayClient.start()
+    }
     console.log('[MeshEngine] ready')
     return this
   }
@@ -638,6 +647,7 @@ class MeshEngine extends EventEmitter {
     if (!this.started) return
     this.started = false
     console.log('[MeshEngine] stopping...')
+    if (this.relayClient) this.relayClient.stop()
     // Stop the unref'd maintenance intervals (reconnectKnownPeers, sendPings)
     // so they never touch the stores while we tear down below.
     if (this.connections && typeof this.connections.teardown === 'function') {

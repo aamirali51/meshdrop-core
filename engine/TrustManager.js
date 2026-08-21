@@ -28,30 +28,43 @@ class TrustManager {
     computeTopicHash,
     swarm,
     topicRegistry,
+    relayClient,
     getPeers,
     sendHandshake,
     emit,
     isRefreshing,
-    onTrustGranted
+    onTrustGranted,
+    getDeviceIdentity,
+    getPeerId
   }) {
     this.getBee = getBee
     this.computeTopicHash = computeTopicHash
     this.swarm = swarm
     this.topicRegistry = topicRegistry
+    this.relayClient = relayClient || null
     this.getPeers = getPeers // () => Map<peerId, peerObj>
     this.sendHandshake = sendHandshake // (peerId) => void
     this.emit = emit || (() => {}) // (event, data) => void — engine EventEmitter
     this.isRefreshing = isRefreshing || (() => false) // () => bool — swarm rebuild in flight
     this.onTrustGranted = onTrustGranted || (() => {}) // (peerId, code) => void
+    this.getDeviceIdentity = getDeviceIdentity || (() => ({}))
+    this.getPeerId = getPeerId || (() => '')
     this.pairingSecrets = new Map() // codeId -> { code, role, createdAt, expiresAt, codeId }
     this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
     this.revokedKeys = new Map() // hex noise public key -> revokedAt ms; refused until a fresh pairing
     this.pairingCodePromise = null // single-flight guard for concurrent code fetches
+    this.relayOutstanding = [] // { nonce, code, codeId, sentAt }
     // Failed-MAC lockout: per-key consecutive bad-MAC counter. Repeated wrong
     // answers (brute-force attempt, stale code) push the peer into an
     // exponential backoff instead of letting it reconnect and retry forever.
     // The counter resets on a successful verification (handleResponse).
     this.failedPairings = new Map() // hex noise public key -> { count, lockedUntil }
+
+    if (this.relayClient) {
+      this.relayClient.onMessage = (topic, msg, fromPeerId) => {
+        this.handleRelayMessage(topic, msg, fromPeerId)
+      }
+    }
   }
 
   // Hydrate the revoked-key set (deleted devices awaiting re-pairing). Must
@@ -290,7 +303,9 @@ class TrustManager {
     const secret = this.pairingSecrets.get(cid)
     if (!secret || secret.role !== 'joiner') return
     this.pairingSecrets.delete(cid)
+    this.relayOutstanding = this.relayOutstanding.filter((o) => o.codeId !== cid)
     try {
+      if (this.relayClient) this.relayClient.leave(`p2p-pair-${code}`)
       if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
     } catch {}
   }
@@ -301,12 +316,13 @@ class TrustManager {
     const cleanCode = normalizePairingCode(rawCode)
     if (!cleanCode) return null
     const now = Date.now()
-    this.pairingSecrets.set(codeId(cleanCode), {
+    const cid = codeId(cleanCode)
+    this.pairingSecrets.set(cid, {
       code: cleanCode,
       role: 'joiner',
       createdAt: now,
       expiresAt: now + PAIRING_TTL,
-      codeId: codeId(cleanCode)
+      codeId: cid
     })
     // Snapshot peers that were already trusted BEFORE this registration:
     // sendChallengesToAll may complete a fresh pairing for an untrusted peer (which
@@ -321,7 +337,37 @@ class TrustManager {
     // skipped there, but the code's host may already be connected and trusted
     // (LAN auto-trust, or a pairing completed before the code was entered) —
     // probe them so the host can identify itself without a fresh handshake.
-    this._probeTrustedPeers(cleanCode, codeId(cleanCode), trustedIds)
+    this._probeTrustedPeers(cleanCode, cid, trustedIds)
+
+    // Broadcast challenge via Cloudflare WSS Relay immediately for Port 443 fallback
+    const relayNonce = randomBytes(16)
+    this.relayOutstanding.push({ nonce: relayNonce, code: cleanCode, codeId: cid, sentAt: now })
+    if (this.relayClient) {
+      this.relayClient.send(`p2p-pair-${cleanCode}`, {
+        type: MESSAGES.PAIRING_CHALLENGE,
+        codeId: cid,
+        nonce: b4a.toString(relayNonce, 'hex'),
+        identity: {
+          ...(this.getDeviceIdentity ? this.getDeviceIdentity() : {}),
+          publicKey: this.getPeerId ? this.getPeerId() : ''
+        }
+      })
+      // Send again shortly in case the remote host's WebSocket connection just opened
+      setTimeout(() => {
+        if (this.pairingSecrets.has(cid) && this.relayClient) {
+          this.relayClient.send(`p2p-pair-${cleanCode}`, {
+            type: MESSAGES.PAIRING_CHALLENGE,
+            codeId: cid,
+            nonce: b4a.toString(relayNonce, 'hex'),
+            identity: {
+              ...(this.getDeviceIdentity ? this.getDeviceIdentity() : {}),
+              publicKey: this.getPeerId ? this.getPeerId() : ''
+            }
+          })
+        }
+      }, 600)
+    }
+
     return cleanCode
   }
 
@@ -372,11 +418,131 @@ class TrustManager {
 
   _joinPairingTopic(code) {
     const label = `p2p-pair-${code}`
+    if (this.relayClient) this.relayClient.join(label)
     if (this.topicRegistry) this.topicRegistry.ensure(label, { client: true, server: true })
     else {
       const topicHash = this.computeTopicHash(label)
       this.swarm.join(topicHash, { client: true, server: true })
       this.swarm.flush().catch(() => {})
+    }
+  }
+
+  // Handle messages received over the Cloudflare Port 443 WSS Relay
+  handleRelayMessage(topic, msg, fromPeerId) {
+    if (!msg || typeof msg !== 'object') return
+
+    // 1. Inbound Pairing Challenge from Joiner via WSS relay
+    if (msg.type === MESSAGES.PAIRING_CHALLENGE) {
+      if (typeof msg.codeId !== 'string' || typeof msg.nonce !== 'string') return
+      const secret = this.pairingSecrets.get(msg.codeId)
+      if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) return
+      
+      const nonceBuf = b4a.from(msg.nonce, 'hex')
+      if (nonceBuf.length !== 16) return
+      const signature = mac(secret.code, nonceBuf)
+      const myIdentity = this.getDeviceIdentity ? this.getDeviceIdentity() : {}
+
+      console.log(`[MeshEngine] Answering PAIRING_CHALLENGE via Cloudflare WSS Relay for topic: ${topic}`)
+      if (this.relayClient) {
+        this.relayClient.send(topic, {
+          type: MESSAGES.PAIRING_RESP,
+          nonce: msg.nonce,
+          mac: b4a.toString(signature, 'hex'),
+          identity: {
+            ...myIdentity,
+            publicKey: this.getPeerId ? this.getPeerId() : ''
+          }
+        })
+      }
+      return
+    }
+
+    // 2. Inbound Pairing Response from Host via WSS relay
+    if (msg.type === MESSAGES.PAIRING_RESP) {
+      if (typeof msg.nonce !== 'string' || typeof msg.mac !== 'string') return
+      const idx = this.relayOutstanding.findIndex((o) => b4a.toString(o.nonce, 'hex') === msg.nonce)
+      if (idx === -1) return
+      const outstanding = this.relayOutstanding[idx]
+      const expected = b4a.toString(mac(outstanding.code, outstanding.nonce), 'hex')
+      if (msg.mac !== expected) {
+        console.warn('[MeshEngine] Relay pairing challenge FAILED: MAC mismatch')
+        this.emit('pairing:failed', { peerId: fromPeerId || 'relay', reason: 'mac_mismatch', codeId: outstanding.codeId })
+        return
+      }
+
+      this.relayOutstanding.splice(idx, 1)
+      console.log(`[MeshEngine] Pairing challenge VERIFIED via Cloudflare WSS Relay (${outstanding.code})`)
+
+      const peerIdentity = msg.identity || {}
+      const targetPublicKey = peerIdentity.publicKey || fromPeerId || `relay-${Date.now()}`
+      const deviceId = peerIdentity.id || (targetPublicKey ? targetPublicKey.slice(0, 16) : 'remote-device')
+
+      const remoteDevice = {
+        id: deviceId,
+        publicKey: targetPublicKey,
+        name: peerIdentity.name || 'Remote Peer',
+        os: peerIdentity.os || 'Unknown',
+        osVersion: peerIdentity.osVersion || '',
+        avatar: peerIdentity.avatar || '',
+        isTrusted: true,
+        isEncrypted: true,
+        isOnline: true,
+        lastSeen: new Date().toISOString(),
+        transferMethod: 'relay',
+        relayed: true,
+        trustedAt: new Date().toISOString()
+      }
+
+      if (targetPublicKey && targetPublicKey.length === 64) {
+        this.addTrustedKey(targetPublicKey)
+        this.unrevokeKey(targetPublicKey)
+      }
+
+      // Persist in device bee
+      this.getBee('devices')
+        .then((bee) => bee.put(deviceId, remoteDevice))
+        .catch(() => {})
+
+      // Send reciprocal handshake info back via relay
+      if (this.relayClient) {
+        const myIdentity = this.getDeviceIdentity ? this.getDeviceIdentity() : {}
+        this.relayClient.send(topic, {
+          type: MESSAGES.HANDSHAKE,
+          identity: {
+            ...myIdentity,
+            publicKey: this.getPeerId ? this.getPeerId() : ''
+          }
+        })
+      }
+
+      this.onTrustGranted(targetPublicKey, outstanding.code)
+      this.emit(EVENTS.TRUST_PAIRED, { peer: remoteDevice, code: outstanding.code })
+      this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
+      return
+    }
+
+    // 3. Reciprocal Handshake via WSS relay
+    if (msg.type === MESSAGES.HANDSHAKE && msg.identity) {
+      const peerIdentity = msg.identity
+      const targetPublicKey = peerIdentity.publicKey || fromPeerId
+      if (targetPublicKey && this.isTrustedPublicKey(targetPublicKey)) {
+        const deviceId = peerIdentity.id || targetPublicKey.slice(0, 16)
+        const remoteDevice = {
+          id: deviceId,
+          publicKey: targetPublicKey,
+          name: peerIdentity.name || 'Remote Peer',
+          os: peerIdentity.os || 'Unknown',
+          isTrusted: true,
+          isOnline: true,
+          lastSeen: new Date().toISOString(),
+          transferMethod: 'relay',
+          relayed: true
+        }
+        this.getBee('devices')
+          .then((bee) => bee.put(deviceId, remoteDevice))
+          .catch(() => {})
+        this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
+      }
     }
   }
 
