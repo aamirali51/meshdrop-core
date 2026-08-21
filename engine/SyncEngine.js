@@ -55,6 +55,16 @@ class SyncEngine {
     this.removedLibraries = new Set() // ids the user removed — re-invites for these are ignored
     this.timer = null
     this._syncingSet = new Set() // library ids currently syncing
+    // Fix #6: memoize the bee instance so getBee('sync') is resolved only once
+    this._beeCache = new Map()
+  }
+
+  // Fix #6: single-resolve memoizer so every SnapshotStore call reuses the same bee instance
+  async _getBee(name) {
+    if (!this._beeCache.has(name)) {
+      this._beeCache.set(name, await this.getBee(name))
+    }
+    return this._beeCache.get(name)
   }
 
   async init() {
@@ -77,7 +87,7 @@ class SyncEngine {
 
   async loadLibraries() {
     try {
-      const bee = await this.getBee('sync')
+      const bee = await this._getBee('sync')
       for await (const node of bee.createReadStream({ gte: 'sync-', lte: 'sync-\uffff' })) {
         const cfg = node.value
         if (!cfg || !cfg.id || !cfg.localPath) continue
@@ -153,23 +163,23 @@ class SyncEngine {
   }
 
   async _persist(lib) {
-    await SnapshotStore.persistConfig(this.getBee, lib)
+    await SnapshotStore.persistConfig(this._getBee.bind(this), lib)
   }
 
   async _iterRows(kind, libId) {
-    return SnapshotStore.iterRows(this.getBee, kind, libId)
+    return SnapshotStore.iterRows(this._getBee.bind(this), kind, libId)
   }
 
   async _writeRows(kind, libId, entries) {
-    return SnapshotStore.writeRows(this.getBee, kind, libId, entries)
+    return SnapshotStore.writeRows(this._getBee.bind(this), kind, libId, entries)
   }
 
   async _delRows(kind, libId, rels) {
-    return SnapshotStore.delRows(this.getBee, kind, libId, rels)
+    return SnapshotStore.delRows(this._getBee.bind(this), kind, libId, rels)
   }
 
   async _remove(id) {
-    return SnapshotStore.removeLibrary(this.getBee, id)
+    return SnapshotStore.removeLibrary(this._getBee.bind(this), id)
   }
 
   _findPeer(peerId) {
@@ -319,7 +329,11 @@ class SyncEngine {
       let rel = filename.split(/[\\/]/).join('/').replace(/^\/+/, '')
       if (rel) {
         lib._dirtyPaths.add(rel)
-        if (lib._dirtyPaths.size > 200) lib._dirtyPaths = null
+        if (lib._dirtyPaths.size > 200) {
+          // Fix #7: log the overflow so operators can observe when rapid-fire changes force a full scan
+          console.log(`[SyncEngine] dirty-path set overflow for "${lib.name}" — falling back to full scan`)
+          lib._dirtyPaths = null
+        }
       }
     } else {
       lib._dirtyPaths = null
@@ -745,12 +759,26 @@ class SyncEngine {
     const baseline = useSent ? lib.sentIndex || {} : lib.remoteIndex || {}
 
     // Pure 3-way reconciliation
-    const { toPush, toDeleteLocal, toDeleteRemote } = Reconciler.reconcile({
+    const { toPush, toPull, toDeleteLocal, toDeleteRemote } = Reconciler.reconcile({
       localIndex: lib.index || {},
       baseline,
       remoteIndex: lib.remoteIndex || {},
       mode: lib.mode
     })
+
+    // Fix #1: if remote has files we've never seen, nudge the remote by sending our own index.
+    // The remote's handleSyncIndex → _diffAndPush will then push the missing files to us.
+    // This reuses the existing SYNC_INDEX wire message — zero protocol change.
+    if (toPull.length > 0 && lib.mode === 'two-way') {
+      console.log(`[SyncEngine] ${toPull.length} remote-only file(s) detected for "${lib.name}" — requesting remote push`)
+      this._sendToPeer(lib.peerId, {
+        type: MESSAGES.SYNC_INDEX,
+        libraryId: lib.id,
+        name: lib.name,
+        mode: lib.mode,
+        entries: indexToArray(lib.index)
+      })
+    }
 
     // Apply remote-driven local deletes proactively (don't wait for next SYNC_INDEX)
     for (const rel of toDeleteLocal) {
@@ -994,7 +1022,7 @@ class SyncEngine {
     if (!lib.paused) {
       let bee = null
       try {
-        bee = await this.getBee('sync')
+        bee = await this._getBee('sync')
       } catch {}
       const CHUNK = 32
       for (let i = 0; i < msg.files.length; i += CHUNK) {
@@ -1011,6 +1039,13 @@ class SyncEngine {
               Number(st.size) === Number(f.size) &&
               Math.abs(Number(st.mtimeMs || 0) - Number(f.mtimeMs || 0)) < VERIFY_TOLERANCE_MS
             ) {
+              // Fix #3: if the sender provided a content hash, verify it even when size+mtime agree.
+              // A hash mismatch here means same size/mtime but different bytes (race/overwrite) —
+              // report not-confirmed so the sender retransmits.
+              if (f.hash) {
+                const localHash = await hashFileFast(this.fsp, abs)
+                if (localHash && localHash !== f.hash) return null
+              }
               if (!bee) return null
               const node = await bee.get(`delivered/${lib.id}/${rel}`).catch(() => null)
               const del = node && node.value
@@ -1052,7 +1087,7 @@ class SyncEngine {
   }
 
   async isDeliveredVersion(libId, rel, mtimeMs) {
-    return SnapshotStore.isDelivered(this.getBee, libId, rel, mtimeMs)
+    return SnapshotStore.isDelivered(this._getBee.bind(this), libId, rel, mtimeMs)
   }
 
   async handleSyncInviteAccept(peerId, msg) {
@@ -1094,6 +1129,16 @@ class SyncEngine {
 
     const incoming = indexFromArray(msg.entries)
     const merged = { ...(lib.remoteIndex || {}), ...incoming }
+
+    // Fix #4: prune stale deleted entries the remote no longer advertises.
+    // If a key is deleted=true in the merged map but the remote's fresh index doesn't mention it
+    // at all, the remote has already GC'd it — remove it so we don't re-delete a local file.
+    for (const rel of Object.keys(merged)) {
+      if (merged[rel] && merged[rel].deleted && incoming[rel] === undefined) {
+        delete merged[rel]
+      }
+    }
+
     if (JSON.stringify(merged) !== JSON.stringify(lib.remoteIndex)) {
       lib.remoteIndex = merged
       await this._persist(lib)
@@ -1101,7 +1146,11 @@ class SyncEngine {
       lib.remoteIndex = merged
     }
 
-    await this._applyRemoteDeletes(lib)
+    // Fix #2: only run the delete pass when the incoming batch actually contains deleted entries —
+    // avoids redundant filesystem checks on every heartbeat index message.
+    const hasIncomingDeletes = Object.values(incoming).some((e) => e && e.deleted)
+    if (hasIncomingDeletes) await this._applyRemoteDeletes(lib)
+
     if (lib.accepted && !lib.paused) {
       this._diffAndPush(lib).catch(() => {})
     }
@@ -1126,7 +1175,7 @@ class SyncEngine {
     } catch {}
   }
 
-  async _deleteLocal(lib, rel) {
+  async _deleteLocal(lib, rel, { skipPersist = false } = {}) {
     if (!lib || !lib.localPath) return
     const safe = safeRelPath(rel)
     if (!safe) return
@@ -1160,20 +1209,28 @@ class SyncEngine {
         deleted: true,
         mtimeMs: Date.now()
       }
-      await this._persist(lib)
+      // Fix #9: write only the single changed index row; batch callers set skipPersist=true
+      // and call _persist themselves once after all deletes complete.
+      this._writeRows('index', lib.id, [[safe, lib.index[safe]]]).catch(() => {})
+      if (!skipPersist) await this._persist(lib)
       this.sendEvent(EVENTS.SYNC_DELETED, { id: lib.id, libraryId: lib.id, rel: safe })
     }
   }
 
   async _applyRemoteDeletes(lib) {
     const remote = lib.remoteIndex || {}
+    let anyDeleted = false
     for (const [rel, r] of Object.entries(remote)) {
       if (!r || !r.deleted) continue
       const local = lib.index && lib.index[rel]
       if (local && !local.deleted) {
-        await this._deleteLocal(lib, rel)
+        // Fix #9: pass skipPersist=true — we do a single _persist after the loop
+        await this._deleteLocal(lib, rel, { skipPersist: true })
+        anyDeleted = true
       }
     }
+    // Fix #9: one config persist for the whole batch instead of N
+    if (anyDeleted) await this._persist(lib)
   }
 
   async handleSyncDelete(peerId, msg) {
@@ -1203,6 +1260,14 @@ class SyncEngine {
       }
 
       try {
+        // Fix #5: skip the expensive fs walk when the index was scanned recently and no watcher
+        // events are pending. Still run _diffAndPush so in-flight transfers make progress.
+        const hasDirty = lib._dirtyPaths && lib._dirtyPaths.size > 0
+        const idleTooLong = Date.now() - (lib.lastScanAt || 0) > this.scanIntervalMs
+        if (!hasDirty && !idleTooLong) {
+          await this._diffAndPush(lib).catch(() => {})
+          continue
+        }
         await this.syncLibrary(lib.id, { full: true })
       } catch {}
     }
@@ -1235,6 +1300,7 @@ class SyncEngine {
         accepted: true,
         index: {},
         remoteIndex: {},
+        sentIndex: {}, // Fix #8: consistent with addLibrary
         lastScanAt: Date.now(),
         lastSyncAt: 0
       }
@@ -1340,7 +1406,7 @@ class SyncEngine {
           this._writeRows('remote', lib.id, [[rel, entry]]).catch(() => {})
         }
         
-        SnapshotStore.recordDelivered(this.getBee, lib.id, rel, size, mtimeMs).catch(() => {})
+        SnapshotStore.recordDelivered(this._getBee.bind(this), lib.id, rel, size, mtimeMs).catch(() => {})
       }
       lib._activeReceives = Math.max(0, (lib._activeReceives || 0) - 1)
       if (lib._activeReceives === 0 && lib._phase && lib._phase.phase === 'transferring') {

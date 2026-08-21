@@ -12,16 +12,17 @@ class Reconciler {
    * @param {Object} params.baseline - Map of rel -> { size, mtimeMs, sig, deleted, authorKey }
    * @param {Object} params.remoteIndex - Map of rel -> { size, mtimeMs, sig, deleted, authorKey }
    * @param {string} params.mode - 'push' | 'receive_only' | 'two-way'
-   * @returns {Object} { toPush: string[], toDeleteLocal: string[], toDeleteRemote: string[], conflicts: string[] }
+   * @returns {Object} { toPush: string[], toPull: string[], toDeleteLocal: string[], toDeleteRemote: string[], conflicts: string[] }
    */
   static reconcile({ localIndex = {}, baseline = {}, remoteIndex = {}, mode = 'two-way' }) {
     const toPush = []
+    const toPull = []      // Fix #1: remote-new files the local side has never seen
     const toDeleteLocal = []
     const toDeleteRemote = []
     const conflicts = []
 
     if (mode === 'receive_only') {
-      return { toPush, toDeleteLocal, toDeleteRemote, conflicts }
+      return { toPush, toPull, toDeleteLocal, toDeleteRemote, conflicts }
     }
 
     if (mode === 'push') {
@@ -35,7 +36,7 @@ class Reconciler {
           toPush.push(rel)
         }
       }
-      return { toPush, toDeleteLocal, toDeleteRemote, conflicts }
+      return { toPush, toPull, toDeleteLocal, toDeleteRemote, conflicts }
     }
 
     // Two-Way Sync (Desktop ↔ Desktop)
@@ -76,7 +77,17 @@ class Reconciler {
       }
     }
 
-    return { toPush, toDeleteLocal, toDeleteRemote, conflicts }
+    // Fix #1 — Second pass: find files that exist remotely but are completely absent
+    // from localIndex (never seen — not just locally deleted). These are genuine remote
+    // additions. Signal the caller to nudge the remote into pushing them.
+    for (const [rel, remoteEntry] of Object.entries(remoteIndex)) {
+      if (!remoteEntry || remoteEntry.deleted) continue
+      if (localIndex[rel] === undefined) {
+        toPull.push(rel)
+      }
+    }
+
+    return { toPush, toPull, toDeleteLocal, toDeleteRemote, conflicts }
   }
 }
 
