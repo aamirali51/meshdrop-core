@@ -1716,7 +1716,7 @@ class TransferEngine {
       const existing = await fsp.stat(destPath).then(() => true).catch(() => false)
       if (syncMode === 'two-way' && existing) {
         try {
-          const trashDir = path.join(path.dirname(destPath), '.meshdrop-trash')
+          const trashDir = path.join(transfer.baseDir || path.dirname(destPath), '.meshdrop-trash')
           await fsp.mkdir(trashDir, { recursive: true })
           const trashName = `${Date.now().toString(36)}_${path.basename(destPath)}`
           await fsp.rename(destPath, path.join(trashDir, trashName))

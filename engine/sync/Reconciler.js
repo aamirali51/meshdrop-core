@@ -59,11 +59,11 @@ class Reconciler {
           }
         } else if (remoteEntry.deleted) {
           // Remote marked deleted
-          if (baseEntry && baseEntry.sig === localEntry.sig) {
-            // Local was not modified since last baseline -> remote delete applies
+          if (remoteEntry.mtimeMs >= localEntry.mtimeMs - CONFLICT_TOLERANCE_MS || (baseEntry && baseEntry.sig === localEntry.sig)) {
+            // Remote deletion is current -> apply delete locally
             toDeleteLocal.push(rel)
           } else {
-            // Local modified file after deletion -> local edit wins
+            // Local was modified strictly after remote deletion -> local edit wins
             toPush.push(rel)
           }
         }

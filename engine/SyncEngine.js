@@ -206,19 +206,71 @@ class SyncEngine {
   // ─── File Watcher ──────────────────────────────────────────────────────────
 
   _watchLibrary(lib) {
-    if (lib.watcher || !this.fs || typeof this.fs.watch !== 'function' || !lib.localPath) return
-    try {
-      const watcher = this.fs.watch(lib.localPath, { recursive: true }, (eventType, filename) => {
-        this._onFolderChange(lib.id, filename)
-      })
-      watcher.on('error', () => {
-        this._stopWatching(lib.id)
-        this._scheduleWatchRetry(lib.id)
-      })
-      lib.watcher = watcher
-    } catch {
-      this._scheduleWatchRetry(lib.id)
+    if (lib.watcher || (lib.watchers && lib.watchers.length > 0) || !this.fs || typeof this.fs.watch !== 'function' || !lib.localPath) return
+    const isLinux = typeof process !== 'undefined' && process.platform === 'linux'
+
+    if (!isLinux) {
+      try {
+        const watcher = this.fs.watch(lib.localPath, { recursive: true }, (eventType, filename) => {
+          this._onFolderChange(lib.id, filename)
+        })
+        watcher.on('error', () => {
+          this._stopWatching(lib.id)
+          this._watchLinuxRecursive(lib)
+        })
+        lib.watcher = watcher
+        return
+      } catch {
+        // Fall back to linux multi-directory recursive watcher
+      }
     }
+
+    this._watchLinuxRecursive(lib)
+  }
+
+  _watchLinuxRecursive(lib) {
+    if (!this.fs || typeof this.fs.watch !== 'function' || !lib.localPath) return
+    lib.watchers = lib.watchers || []
+    
+    const attachWatch = (dirPath, relPrefix = '') => {
+      try {
+        const watcher = this.fs.watch(dirPath, (eventType, filename) => {
+          const rel = filename ? (relPrefix ? `${relPrefix}/${filename}` : filename) : ''
+          this._onFolderChange(lib.id, rel)
+          if (filename && eventType === 'rename') {
+            const sub = this.path.join(dirPath, filename)
+            this.fsp.stat(sub).then((st) => {
+              if (st && st.isDirectory()) {
+                attachWatch(sub, rel)
+              }
+            }).catch(() => {})
+          }
+        })
+        watcher.on('error', () => {})
+        lib.watchers.push(watcher)
+      } catch {}
+    }
+
+    attachWatch(lib.localPath, '')
+
+    const scanAndWatch = async (dir, rel) => {
+      try {
+        const entries = await this.fsp.readdir(dir, { withFileTypes: true }).catch(() => [])
+        for (const ent of entries) {
+          const name = typeof ent === 'string' ? ent : (ent && ent.name)
+          if (!name || name.startsWith('.') || name === 'node_modules') continue
+          const sub = this.path.join(dir, name)
+          const subRel = rel ? `${rel}/${name}` : name
+          const isDir = typeof ent.isDirectory === 'function' ? ent.isDirectory() : false
+          if (isDir) {
+            attachWatch(sub, subRel)
+            await scanAndWatch(sub, subRel)
+          }
+        }
+      } catch {}
+    }
+
+    scanAndWatch(lib.localPath, '').catch(() => {})
   }
 
   _scheduleWatchRetry(id) {
@@ -229,9 +281,9 @@ class SyncEngine {
     lib._watchRetryTimer = setTimeout(() => {
       lib._watchRetryTimer = null
       const l = this.libraries.get(id)
-      if (!l || l.watcher || l.paused) return
+      if (!l || l.watcher || (l.watchers && l.watchers.length > 0) || l.paused) return
       this._watchLibrary(l)
-      if (l.watcher) l._watchRetryCount = 0
+      if (l.watcher || (l.watchers && l.watchers.length > 0)) l._watchRetryCount = 0
     }, delay)
     if (lib._watchRetryTimer.unref) lib._watchRetryTimer.unref()
   }
@@ -250,6 +302,12 @@ class SyncEngine {
     if (lib.watcher) {
       try { lib.watcher.close() } catch {}
       lib.watcher = null
+    }
+    if (Array.isArray(lib.watchers)) {
+      for (const w of lib.watchers) {
+        try { w.close() } catch {}
+      }
+      lib.watchers = []
     }
   }
 
@@ -1049,6 +1107,25 @@ class SyncEngine {
     }
   }
 
+  async _pruneEmptyParents(baseDir, filePath) {
+    if (!baseDir || !filePath) return
+    try {
+      let current = this.path.dirname(filePath)
+      const normalizedBase = this.path.resolve ? this.path.resolve(baseDir) : baseDir
+      while (current) {
+        const normalizedCurrent = this.path.resolve ? this.path.resolve(current) : current
+        if (normalizedCurrent === normalizedBase || !normalizedCurrent.startsWith(normalizedBase)) break
+        const entries = await this.fsp.readdir(current).catch(() => null)
+        if (Array.isArray(entries) && entries.length === 0) {
+          await this.fsp.rmdir(current).catch(() => {})
+          current = this.path.dirname(current)
+        } else {
+          break
+        }
+      }
+    } catch {}
+  }
+
   async _deleteLocal(lib, rel) {
     if (!lib || !lib.localPath) return
     const safe = safeRelPath(rel)
@@ -1061,7 +1138,17 @@ class SyncEngine {
       if (exists) {
         await this.fsp.mkdir(trashDir, { recursive: true })
         const trashDest = this.path.join(trashDir, `${Date.now().toString(36)}_${this.path.basename(safe)}`)
-        await this.fsp.rename(targetFile, trashDest)
+        try {
+          await this.fsp.rename(targetFile, trashDest)
+        } catch (renameErr) {
+          try {
+            await this.fsp.copyFile(targetFile, trashDest)
+            await this.fsp.unlink(targetFile)
+          } catch {
+            await this.fsp.unlink(targetFile).catch(() => {})
+          }
+        }
+        await this._pruneEmptyParents(lib.localPath, targetFile)
       }
     } catch (err) {
       console.warn(`[SyncEngine] _deleteLocal error for ${safe}:`, err.message)
@@ -1240,6 +1327,19 @@ class SyncEngine {
       if (record.status === 'completed' && rel) {
         const size = Number(record.fileSize) || 0
         const mtimeMs = Number(record.syncMtimeMs) || 0
+        const sig = `${size}-${mtimeMs}`
+        const authorKey = record.peerId || ''
+        const entry = { size, mtimeMs, sig, authorKey, deleted: false }
+        
+        if (!lib.index) lib.index = {}
+        lib.index[rel] = entry
+        this._writeRows('index', lib.id, [[rel, entry]]).catch(() => {})
+        
+        if (lib.remoteIndex) {
+          lib.remoteIndex[rel] = entry
+          this._writeRows('remote', lib.id, [[rel, entry]]).catch(() => {})
+        }
+        
         SnapshotStore.recordDelivered(this.getBee, lib.id, rel, size, mtimeMs).catch(() => {})
       }
       lib._activeReceives = Math.max(0, (lib._activeReceives || 0) - 1)
