@@ -339,9 +339,28 @@ class SyncEngine {
       lib._dirtyPaths = null
     }
     clearTimeout(lib.flushTimer)
-    lib.flushTimer = setTimeout(() => {
+    lib.flushTimer = setTimeout(async () => {
+      if (lib._dirtyPaths && lib._dirtyPaths.size > 0 && lib.localPath) {
+        let stillWriting = false
+        for (const r of lib._dirtyPaths) {
+          const fp = this.path.join(lib.localPath, ...r.split('/'))
+          const st1 = await this.fsp.stat(fp).catch(() => null)
+          if (st1 && st1.size > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 250))
+            const st2 = await this.fsp.stat(fp).catch(() => null)
+            if (st2 && st2.size !== st1.size) {
+              stillWriting = true
+              break
+            }
+          }
+        }
+        if (stillWriting) {
+          this._onFolderChange(id, filename)
+          return
+        }
+      }
       this.syncLibrary(id, { full: false }).catch(() => {})
-    }, 1000)
+    }, 800)
     if (lib.flushTimer.unref) lib.flushTimer.unref()
   }
 

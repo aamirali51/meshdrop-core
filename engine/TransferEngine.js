@@ -491,6 +491,8 @@ class TransferEngine {
           await this._persist(id, { progress, speed, peakSpeed, eta, byteOffset: bytesWritten })
           this._emit(EVENTS.TRANSFER_PROGRESS, {
             id,
+            filename: transfer.filename,
+            direction: transfer.direction || 'send',
             progress,
             speed,
             peakSpeed,
@@ -951,6 +953,8 @@ class TransferEngine {
             await this._persist(id, { progress, speed, peakSpeed, eta, byteOffset: verifiedBytes })
             this._emit(EVENTS.TRANSFER_PROGRESS, {
               id,
+              filename: transfer.filename,
+              direction: transfer.direction || 'receive',
               progress,
               speed,
               peakSpeed,
@@ -1302,6 +1306,8 @@ class TransferEngine {
           await this._persist(id, { progress, speed, peakSpeed, eta, byteOffset: bytesSent })
           this._emit(EVENTS.TRANSFER_PROGRESS, {
             id,
+            filename: transfer.filename,
+            direction: transfer.direction || 'send',
             progress,
             speed,
             peakSpeed,
@@ -1514,6 +1520,8 @@ class TransferEngine {
         await this._persist(id, { progress, speed, peakSpeed, eta, byteOffset: info.verifiedBytes })
         this._emit(EVENTS.TRANSFER_PROGRESS, {
           id,
+          filename: transfer.filename,
+          direction: transfer.direction || 'receive',
           progress,
           speed,
           peakSpeed,
@@ -1684,6 +1692,10 @@ class TransferEngine {
     const id = transfer.id
 
     if (info.flags.cancelled) throw new Error('interrupted')
+    if (info.fd) {
+      await info.fd.close().catch(() => {})
+      info.fd = null
+    }
     if (verifiedBytes < manifest.fileSize) {
       throw new Error(`Incomplete file: ${verifiedBytes}/${manifest.fileSize} bytes`)
     }

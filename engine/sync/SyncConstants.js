@@ -2,7 +2,7 @@
 
 // SyncConstants — Shared constants, ignore lists, path normalizers for SyncEngine
 
-const DEFAULT_SCAN_INTERVAL_MS = 60 * 1000
+const DEFAULT_SCAN_INTERVAL_MS = 15 * 1000
 const MAX_LIBRARY_FILES = 50000
 const CONFLICT_TOLERANCE_MS = 3000
 const VERIFY_TOLERANCE_MS = 1500
