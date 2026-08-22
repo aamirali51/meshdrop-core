@@ -181,6 +181,8 @@ class MeshEngine extends EventEmitter {
     // Mutable engine state (mirrors the old worker's shared `ctx`)
     this.peers = new Map() // peerId (noise pubkey hex) -> { connection, device, signaling, transferMethod, pairing }
     this.activeClaims = new Set() // drop codes currently being claimed
+    this.activeClaimOptions = new Map() // drop code -> options ({ interactive: true })
+    this.interactiveClaims = config.interactiveClaims === true
     this.connectionCount = 0
 
     // Engines, wired in start()
@@ -1511,13 +1513,16 @@ class MeshEngine extends EventEmitter {
   // host already advertising there. The download starts when the host answers
   // CLAIM_FILE_RES (which opens per-core replication, see connections.js).
   // MD- pairing codes are app-level and rejected here.
-  async claimDropCode(rawCode) {
+  async claimDropCode(rawCode, options = null) {
     if (!this.started || !this.topicRegistry) throw new Error('Engine not ready')
     const code = normalizeDropCode(rawCode)
     if (!code) throw new Error('Invalid DROP code — expected DROP-XXXX-XXXX')
 
     console.log(`[MeshEngine] Claiming one-time file code: ${code}`)
     this.activeClaims.add(code)
+    if (options) {
+      this.activeClaimOptions.set(code, options)
+    }
     this.topicRegistry.join(`p2p-file-${code}`, { client: true, server: true })
 
     // Send the claim request to any peers already connected on the topic.
@@ -1535,6 +1540,20 @@ class MeshEngine extends EventEmitter {
       })
     }
     return { success: true, code }
+  }
+
+  async confirmClaimDownload(params) {
+    if (!this.connections || !this.connections.confirmClaimDownload) {
+      throw new Error('Connections not ready')
+    }
+    return this.connections.confirmClaimDownload(params)
+  }
+
+  async cancelClaimDownload(params) {
+    if (!this.connections || !this.connections.cancelClaimDownload) {
+      throw new Error('Connections not ready')
+    }
+    return this.connections.cancelClaimDownload(params)
   }
 
   // Host-side listing: active one-time sends on THIS device (expiring stale

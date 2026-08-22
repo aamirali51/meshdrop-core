@@ -129,11 +129,14 @@ function createClaims(ctx) {
     })
   }
 
-  async function handleClaimFileRes(peerId, msg) {
-    const code = (msg.code || '').trim().toUpperCase()
-    console.log(`[MeshEngine] Received CLAIM_FILE_RES for ${code}: success=${msg.success}`)
+  const pendingClaimOffers = new Map()
 
-    if (msg.success && msg.offer) {
+  // Helper to start the actual download for chosen files
+  async function startClaimDownload(peerId, offer, offerFiles, code) {
+    const peerObj = peers.get(peerId)
+    if (!peerObj) throw new Error('Sender is no longer connected')
+
+    if (code) {
       activeClaims.delete(code)
       try {
         engine.topicRegistry.leave(dropTopic(code))
@@ -143,15 +146,87 @@ function createClaims(ctx) {
       if (engine.transferEngine) {
         await engine.transferEngine.clearWaitingClaims({ code }).catch(() => {})
       }
+    }
 
-      // A claim connection never verifies a pairing challenge: drop the
-      // watchdog so long downloads are not killed mid-transfer.
-      const peerObj = peers.get(peerId)
-      if (peerObj && peerObj.pairing && peerObj.pairing.timeout) {
-        clearTimeout(peerObj.pairing.timeout)
-        peerObj.pairing.timeout = null
+    // A claim connection never verifies a pairing challenge: drop the
+    // watchdog so long downloads are not killed mid-transfer.
+    if (peerObj.pairing && peerObj.pairing.timeout) {
+      clearTimeout(peerObj.pairing.timeout)
+      peerObj.pairing.timeout = null
+    }
+
+    // Open per-core replication for every claimed file — the same keys as
+    // the host's file-drop-* cores — so block fetch works WITHOUT opening
+    // the whole exchange store. Claims never have pairing trust, so the
+    // store-wide ReplicationScope gate would (correctly) refuse them.
+    peerObj.dropStreams = peerObj.dropStreams || []
+    for (const f of offerFiles) {
+      if (typeof f.coreKey !== 'string' || f.coreKey.length !== 64) continue
+      try {
+        const core = engine.storage.exchangeStore.get(Buffer.from(f.coreKey, 'hex'))
+        await core.ready()
+        const stream = core.replicate(peerObj.connection, { live: true })
+        stream.on('error', () => {})
+        peerObj.dropStreams.push(stream)
+        console.log(`[MeshEngine] Claimed drop core opened for ${f.filename}`)
+      } catch (err) {
+        console.error('[MeshEngine] Failed to open claimed drop core:', err.message)
       }
+    }
 
+    // Auto-accept and start one transfer per file. When every transfer of
+    // this claim bundle reaches a terminal state, tell the host ONCE so it
+    // can tear the share down (cap reached) or keep it live (multi-download).
+    const records = []
+    for (let i = 0; i < offerFiles.length; i++) {
+      const f = offerFiles[i]
+      if (typeof f.fileSize !== 'number' || f.fileSize <= 0) continue
+      const record = await engine.transferEngine.receiveOffer(
+        {
+          ...f,
+          transferId: `claim-${offer.shareId}-${i}-${Date.now().toString(36)}`,
+          transferMethod: 'internet',
+          isClaim: true,
+          peerKey: peerId,
+          shareId: offer.shareId
+        },
+        { autoAccept: true, isClaim: true }
+      )
+      if (record) records.push(record.id)
+    }
+
+    if (records.length > 0) {
+      const pending = new Set(records)
+      const cleanup = () => {
+        engine.removeListener(EVENTS.TRANSFER_COMPLETED, onTerminal)
+        engine.removeListener(EVENTS.TRANSFER_FAILED, onTerminal)
+        engine.removeListener(EVENTS.TRANSFER_CANCELLED, onTerminal)
+      }
+      const onTerminal = (rec) => {
+        if (!rec || !pending.has(rec.id)) return
+        pending.delete(rec.id)
+        if (pending.size === 0) {
+          cleanup()
+          const p = peers.get(peerId)
+          if (p && p.signaling) {
+            p.signaling.send({ type: MESSAGES.CLAIM_FILE_DONE, shareId: offer.shareId })
+          }
+        }
+      }
+      peerObj.claimCleanups = peerObj.claimCleanups || []
+      peerObj.claimCleanups.push(cleanup)
+      engine.on(EVENTS.TRANSFER_COMPLETED, onTerminal)
+      engine.on(EVENTS.TRANSFER_FAILED, onTerminal)
+      engine.on(EVENTS.TRANSFER_CANCELLED, onTerminal)
+    }
+    return records
+  }
+
+  async function handleClaimFileRes(peerId, msg) {
+    const code = (msg.code || '').trim().toUpperCase()
+    console.log(`[MeshEngine] Received CLAIM_FILE_RES for ${code}: success=${msg.success}`)
+
+    if (msg.success && msg.offer) {
       // Normalize to a file list (single-file offers carry the fields at the
       // top level; multi-file offers carry files[]).
       const offerFiles =
@@ -168,69 +243,36 @@ function createClaims(ctx) {
               }
             ]
 
-      // Open per-core replication for every claimed file — the same keys as
-      // the host's file-drop-* cores — so block fetch works WITHOUT opening
-      // the whole exchange store. Claims never have pairing trust, so the
-      // store-wide ReplicationScope gate would (correctly) refuse them.
-      peerObj.dropStreams = peerObj.dropStreams || []
-      for (const f of offerFiles) {
-        if (typeof f.coreKey !== 'string' || f.coreKey.length !== 64) continue
-        try {
-          const core = engine.storage.exchangeStore.get(Buffer.from(f.coreKey, 'hex'))
-          await core.ready()
-          const stream = core.replicate(peerObj.connection, { live: true })
-          stream.on('error', () => {})
-          peerObj.dropStreams.push(stream)
-          console.log(`[MeshEngine] Claimed drop core opened for ${f.filename}`)
-        } catch (err) {
-          console.error('[MeshEngine] Failed to open claimed drop core:', err.message)
-        }
+      const claimOpts = (engine.activeClaimOptions && engine.activeClaimOptions.get(code)) || {}
+      const isInteractive = claimOpts.interactive === true || engine.interactiveClaims === true
+      const isFolderOrMulti = offerFiles.length > 1 || !!msg.offer.folderName
+
+      if (isInteractive && isFolderOrMulti) {
+        console.log(`[MeshEngine] Emitting CLAIM_PREVIEW for ${code} (${offerFiles.length} files)`)
+        pendingClaimOffers.set(msg.offer.shareId, {
+          peerId,
+          code,
+          offer: msg.offer,
+          offerFiles,
+          createdAt: Date.now()
+        })
+        engine.emit(EVENTS.CLAIM_PREVIEW, {
+          code,
+          shareId: msg.offer.shareId,
+          folderName: msg.offer.folderName || (offerFiles.length > 1 ? msg.offer.filename : null),
+          totalSize: msg.offer.fileSize,
+          totalFiles: offerFiles.length,
+          files: offerFiles.map((f, i) => ({
+            index: i,
+            filename: f.filename,
+            fileSize: f.fileSize,
+            fileType: f.fileType || ''
+          }))
+        })
+        return
       }
 
-      // Auto-accept and start one transfer per file. When every transfer of
-      // this claim bundle reaches a terminal state, tell the host ONCE so it
-      // can tear the share down (cap reached) or keep it live (multi-download).
-      const records = []
-      for (let i = 0; i < offerFiles.length; i++) {
-        const f = offerFiles[i]
-        if (typeof f.fileSize !== 'number' || f.fileSize <= 0) continue
-        const record = await engine.transferEngine.receiveOffer(
-          {
-            ...f,
-            transferId: `claim-${msg.offer.shareId}-${i}-${Date.now().toString(36)}`,
-            transferMethod: 'internet',
-            isClaim: true,
-            peerKey: peerId,
-            shareId: msg.offer.shareId
-          },
-          { autoAccept: true, isClaim: true }
-        )
-        if (record) records.push(record.id)
-      }
-      if (records.length > 0) {
-        const pending = new Set(records)
-        const cleanup = () => {
-          engine.removeListener(EVENTS.TRANSFER_COMPLETED, onTerminal)
-          engine.removeListener(EVENTS.TRANSFER_FAILED, onTerminal)
-          engine.removeListener(EVENTS.TRANSFER_CANCELLED, onTerminal)
-        }
-        const onTerminal = (rec) => {
-          if (!rec || !pending.has(rec.id)) return
-          pending.delete(rec.id)
-          if (pending.size === 0) {
-            cleanup()
-            const p = peers.get(peerId)
-            if (p && p.signaling) {
-              p.signaling.send({ type: MESSAGES.CLAIM_FILE_DONE, shareId: msg.offer.shareId })
-            }
-          }
-        }
-        peerObj.claimCleanups = peerObj.claimCleanups || []
-        peerObj.claimCleanups.push(cleanup)
-        engine.on(EVENTS.TRANSFER_COMPLETED, onTerminal)
-        engine.on(EVENTS.TRANSFER_FAILED, onTerminal)
-        engine.on(EVENTS.TRANSFER_CANCELLED, onTerminal)
-      }
+      await startClaimDownload(peerId, msg.offer, offerFiles, code)
     } else {
       // The host rejected the claim (expired / already used): stop advertising
       // the code so it is not re-sent on every future connection, and drop the
@@ -247,6 +289,46 @@ function createClaims(ctx) {
         error: msg.error || 'Share expired or invalid code'
       })
     }
+  }
+
+  async function confirmClaimDownload({ shareId, selectedIndices }) {
+    if (!shareId) throw new Error('Missing shareId')
+    const pending = pendingClaimOffers.get(shareId)
+    if (!pending) throw new Error('No pending claim offer found for ' + shareId)
+
+    let chosenFiles = pending.offerFiles
+    if (Array.isArray(selectedIndices) && selectedIndices.length > 0) {
+      const set = new Set(selectedIndices)
+      chosenFiles = pending.offerFiles.filter((_, idx) => set.has(idx))
+    }
+    if (chosenFiles.length === 0) throw new Error('No files selected for download')
+
+    pendingClaimOffers.delete(shareId)
+    const records = await startClaimDownload(pending.peerId, pending.offer, chosenFiles, pending.code)
+    return { success: true, count: records.length }
+  }
+
+  async function cancelClaimDownload({ shareId, code }) {
+    const pending = shareId ? pendingClaimOffers.get(shareId) : null
+    const c = code || (pending && pending.code)
+    if (shareId) pendingClaimOffers.delete(shareId)
+
+    if (c) {
+      activeClaims.delete(c)
+      try {
+        engine.topicRegistry.leave(dropTopic(c))
+      } catch {}
+      if (engine.transferEngine) {
+        await engine.transferEngine.clearWaitingClaims({ code: c }).catch(() => {})
+      }
+    }
+    if (pending && pending.peerId) {
+      const p = peers.get(pending.peerId)
+      if (p && p.signaling) {
+        p.signaling.send({ type: MESSAGES.CLAIM_FILE_DONE, shareId: pending.offer.shareId })
+      }
+    }
+    return { success: true }
   }
 
   // The claimer finished (or abandoned) a one-time download. With multi-
@@ -266,7 +348,7 @@ function createClaims(ctx) {
     }
   }
 
-  return { handleClaimFileReq, handleClaimFileRes, handleClaimDone }
+  return { handleClaimFileReq, handleClaimFileRes, handleClaimDone, confirmClaimDownload, cancelClaimDownload }
 }
 
 module.exports = { createClaims }

@@ -410,6 +410,8 @@ function createConnections(engine) {
     flushPendingHandshake: devices.flushPendingHandshake,
     rebroadcastPeerCompletion: devices.rebroadcastPeerCompletion,
     maybeAutoTrustLanPeer: devices.maybeAutoTrustLanPeer,
+    confirmClaimDownload: claims.confirmClaimDownload,
+    cancelClaimDownload: claims.cancelClaimDownload,
     // Flip the maintenance intervals off; called from engine.stop().
     teardown: () => {
       ctx.stopped = true;

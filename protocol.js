@@ -80,6 +80,7 @@ const EVENTS = {
   // Sync run phase: 'analyzing' | 'transferring' | 'synced' with counters —
   // lets the UI separate file comparison from actual payload transfer.
   SYNC_PHASE: 'sync:phase',
+  CLAIM_PREVIEW: 'claim:preview',
   NOTIFICATION_RECEIVED: 'notification:received',
   ERROR: 'error'
 }

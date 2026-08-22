@@ -12,37 +12,62 @@ const { path, fsp, isBare } = require('./compat.js')
 // fd-lock's tryLock returns false and hypercore-storage throws
 // "File descriptor could not be locked" on every core open. The flock is a
 // single-process safety (two processes sharing a corestore); the engine is
-// single-process, so on Bare/Android we patch device-file to skip the native
-// lock entirely. Desktop keeps the lock.
-//
-// MUST run before `require('corestore')` — corestore pulls in hypercore-storage
-// → device-file at require time, and the patch replaces the module export in
-// the require cache.
+// single-process, so on Bare/Android we patch fd-lock and fs-native-extensions directly
+// to skip the native lock entirely. Desktop keeps the lock.
 try {
-  if (isBare) {
-    const DeviceFile = require('device-file')
-    if (typeof DeviceFile === 'function') {
-      // module.exports = DeviceFile (the class itself). Subclass it and force
-      // `lock: false` so no FDLock (flock) is ever created on Bare.
-      class NoLockDeviceFile extends DeviceFile {
-        constructor(filename, opts = {}) {
-          super(filename, { ...opts, lock: false })
+  if (isBare || (typeof process !== 'undefined' && process.platform === 'android')) {
+    try {
+      const fsx = require('fs-native-extensions')
+      if (fsx) {
+        fsx.tryLock = function tryLock() { return true }
+        fsx.waitForLock = async function waitForLock() { return true }
+        fsx.waitForLockSync = function waitForLockSync() { return true }
+        fsx.tryDowngradeLock = function tryDowngradeLock() { return true }
+        fsx.waitForDowngradeLock = async function waitForDowngradeLock() { return true }
+        fsx.waitForDowngradeLockSync = function waitForDowngradeLockSync() { return true }
+        fsx.tryUpgradeLock = function tryUpgradeLock() { return true }
+        fsx.waitForUpgradeLock = async function waitForUpgradeLock() { return true }
+        fsx.waitForUpgradeLockSync = function waitForUpgradeLockSync() { return true }
+        fsx.unlock = function unlock() {}
+      }
+    } catch {}
+
+    try {
+      const FDLock = require('fd-lock')
+      if (FDLock && FDLock.prototype) {
+        FDLock.prototype._resume = async function _resume() {
+          this._locked = true
+        }
+        FDLock.prototype._suspend = async function _suspend() {
+          this._locked = false
         }
       }
-      // Preserve the static helpers (validate etc.) on the subclass.
-      for (const k of Object.keys(DeviceFile)) {
-        if (typeof DeviceFile[k] === 'function') NoLockDeviceFile[k] = DeviceFile[k]
+    } catch {}
+
+    try {
+      const DeviceFile = require('device-file')
+      if (typeof DeviceFile === 'function') {
+        class NoLockDeviceFile extends DeviceFile {
+          constructor(filename, opts = {}) {
+            super(filename, { ...opts, lock: false })
+          }
+        }
+        for (const k of Object.keys(DeviceFile)) {
+          if (typeof DeviceFile[k] === 'function') NoLockDeviceFile[k] = DeviceFile[k]
+        }
+        if (typeof require.cache !== 'undefined' && require.resolve) {
+          delete require.cache[require.resolve('device-file')]
+          require.cache[require.resolve('device-file')] = {
+            id: require.resolve('device-file'),
+            filename: require.resolve('device-file'),
+            loaded: true,
+            exports: NoLockDeviceFile
+          }
+        }
       }
-      // Re-assign the module export so hypercore-storage's require picks it up.
-      delete require.cache[require.resolve('device-file')]
-      require.cache[require.resolve('device-file')] = {
-        id: require.resolve('device-file'),
-        filename: require.resolve('device-file'),
-        loaded: true,
-        exports: NoLockDeviceFile
-      }
-      console.log('[Storage] Bare platform: device-file flock disabled (Android FUSE)')
-    }
+    } catch {}
+
+    console.log('[Storage] Bare/Android platform: flock disabled (bypassing Android FUSE lock error)')
   }
 } catch (err) {
   console.warn('[Storage] device-file lock patch skipped:', err.message)
@@ -86,7 +111,11 @@ function createStorage({ storageDir, downloadsDir, deviceName }) {
     try {
       await core.ready()
     } catch (err) {
-      if (err?.code === 'DEVICE_FILE' || err?.message?.includes('device file')) {
+      if (
+        err?.code === 'DEVICE_FILE' ||
+        err?.message?.includes('device file') ||
+        err?.message?.includes('could not be locked')
+      ) {
         await _healCorestore(path.join(storageDir, 'corestore'), false)
         core = store.get({ name })
         await core.ready()
@@ -128,7 +157,11 @@ function createStorage({ storageDir, downloadsDir, deviceName }) {
     try {
       await identityCore.ready()
     } catch (err) {
-      if (err?.code === 'DEVICE_FILE' || err?.message?.includes('device file')) {
+      if (
+        err?.code === 'DEVICE_FILE' ||
+        err?.message?.includes('device file') ||
+        err?.message?.includes('could not be locked')
+      ) {
         await _healCorestore(path.join(storageDir, 'corestore'), false)
         identityCore = store.get({ name: 'identity' })
         await identityCore.ready()
