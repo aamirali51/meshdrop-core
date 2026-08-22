@@ -12,11 +12,13 @@ class RelayClient {
   /**
    * @param {object} [opts]
    * @param {string} [opts.relayUrl]
+   * @param {string} [opts.mode]         'auto' | 'relay-primary' | 'direct-only'
    * @param {string} [opts.localPeerId]  Hex noise public key of this device
    * @param {function} [opts.onMessage]   (topic, msg, fromPeerId) => void
    */
   constructor(opts = {}) {
     this.baseUrl = (opts.relayUrl || DEFAULT_RELAY_URL).replace(/\/+$/, '')
+    this.mode = opts.mode || 'auto' // 'auto' | 'relay-primary' | 'direct-only'
     this.localPeerId = opts.localPeerId || ''
     this.onMessage = opts.onMessage || (() => {})
     this.topics = new Set() // Set of active topic strings (e.g. 'p2p-pair-MD-XXXX...')
@@ -31,7 +33,31 @@ class RelayClient {
     this.localPeerId = peerId
   }
 
+  setMode(mode) {
+    if (!mode || this.mode === mode) return
+    this.mode = mode
+    if (this.mode === 'direct-only') {
+      this.stop()
+    } else if (this.started) {
+      this.start()
+    }
+  }
+
+  setRelayUrl(url) {
+    if (!url || typeof url !== 'string') {
+      this.baseUrl = DEFAULT_RELAY_URL
+    } else {
+      this.baseUrl = url.trim().replace(/\/+$/, '')
+    }
+    // Reconnect existing topics with new URL if active
+    if (this.started && this.mode !== 'direct-only') {
+      this.stop()
+      this.start()
+    }
+  }
+
   start() {
+    if (this.mode === 'direct-only') return
     this.started = true
     for (const topic of this.topics) {
       this._connectTopic(topic)
@@ -60,7 +86,7 @@ class RelayClient {
   join(topic) {
     if (!topic) return
     this.topics.add(topic)
-    if (this.started) {
+    if (this.started && this.mode !== 'direct-only') {
       this._connectTopic(topic)
       this._startPolling(topic)
     }
@@ -87,7 +113,7 @@ class RelayClient {
   }
 
   send(topic, payload) {
-    if (!topic || !payload) return false
+    if (!topic || !payload || this.mode === 'direct-only') return false
     const msgId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const msg = {
       id: msgId,

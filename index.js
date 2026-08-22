@@ -196,7 +196,12 @@ class MeshEngine extends EventEmitter {
     this.lanDiscovery = null
     this.notificationStore = null
     this.connections = null
-    this.relayClient = new RelayClient({ relayUrl: config.relayUrl })
+    this.relayMode = config.relayMode || 'auto' // 'auto' | 'relay-primary' | 'direct-only'
+    this.customRelayUrl = config.customRelayUrl || config.relayUrl || ''
+    this.relayClient = new RelayClient({
+      relayUrl: this.customRelayUrl,
+      mode: this.relayMode
+    })
     this.expirationTimer = null
     // Set when refreshNetwork() finds the DHT unreachable (dead network, no
     // replacement yet). A self-scheduled retry re-runs the rebuild so the
@@ -611,6 +616,14 @@ class MeshEngine extends EventEmitter {
       if (s && typeof s.autoTrustLAN === 'boolean') this.autoTrustLAN = s.autoTrustLAN
       if (s && typeof s.autoAcceptOffers === 'boolean') this.autoAcceptOffers = s.autoAcceptOffers
       if (s && typeof s.preferOwnRelay === 'boolean') this.preferOwnRelay = s.preferOwnRelay
+      if (s && typeof s.relayMode === 'string') {
+        this.relayMode = s.relayMode
+        if (this.relayClient) this.relayClient.setMode(s.relayMode)
+      }
+      if (s && typeof s.customRelayUrl === 'string') {
+        this.customRelayUrl = s.customRelayUrl
+        if (this.relayClient) this.relayClient.setRelayUrl(s.customRelayUrl)
+      }
     } catch {}
 
     await this.replicationScope.init()
@@ -1173,13 +1186,17 @@ class MeshEngine extends EventEmitter {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
         preferOwnRelay: this.preferOwnRelay,
+        relayMode: this.relayMode,
+        customRelayUrl: this.customRelayUrl,
         ...(entry?.value || {})
       }
     } catch {
       return {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
-        preferOwnRelay: this.preferOwnRelay
+        preferOwnRelay: this.preferOwnRelay,
+        relayMode: this.relayMode,
+        customRelayUrl: this.customRelayUrl
       }
     }
   }
@@ -1230,6 +1247,45 @@ class MeshEngine extends EventEmitter {
       console.warn('[MeshEngine] setPreferOwnRelay persist failed:', err.message)
     }
     return this.preferOwnRelay
+  }
+
+  /**
+   * Set relay transport strategy: 'auto' | 'relay-primary' | 'direct-only' (persisted).
+   */
+  async setRelayMode(mode) {
+    if (!['auto', 'relay-primary', 'direct-only'].includes(mode)) {
+      mode = 'auto'
+    }
+    this.relayMode = mode
+    if (this.relayClient) {
+      this.relayClient.setMode(mode)
+    }
+    try {
+      const bee = await this.getBee('settings')
+      const entry = await bee.get('settings')
+      await bee.put('settings', { ...(entry?.value || {}), relayMode: this.relayMode })
+    } catch (err) {
+      console.warn('[MeshEngine] setRelayMode persist failed:', err.message)
+    }
+    return this.relayMode
+  }
+
+  /**
+   * Set custom Cloudflare / WSS relay worker URL (persisted).
+   */
+  async setCustomRelayUrl(url) {
+    this.customRelayUrl = typeof url === 'string' ? url.trim() : ''
+    if (this.relayClient) {
+      this.relayClient.setRelayUrl(this.customRelayUrl)
+    }
+    try {
+      const bee = await this.getBee('settings')
+      const entry = await bee.get('settings')
+      await bee.put('settings', { ...(entry?.value || {}), customRelayUrl: this.customRelayUrl })
+    } catch (err) {
+      console.warn('[MeshEngine] setCustomRelayUrl persist failed:', err.message)
+    }
+    return this.customRelayUrl
   }
 
   getStatus() {
