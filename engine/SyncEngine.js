@@ -806,11 +806,9 @@ class SyncEngine {
 
     for (const rel of sentSlice) {
       const e = lib.index[rel]
-      if (e && !e.hash) {
-        const absPath = this.path.join(lib.localPath, ...rel.split('/'))
-        e.hash = await hashFileFast(this.fsp, absPath)
+      if (e) {
+        verifyList.push({ rel, size: e.size || 0, mtimeMs: e.mtimeMs || 0, hash: e.hash || '' })
       }
-      verifyList.push({ rel, size: e.size || 0, mtimeMs: e.mtimeMs || 0, hash: (e && e.hash) || '' })
     }
 
     let verified = null
@@ -928,11 +926,12 @@ class SyncEngine {
   }
 
   _verifyWithPeer(lib, pending) {
+    const timeout = Math.max(this.verifyTimeoutMs || 15000, (pending?.length || 0) * 35)
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (lib._verifyResolver) lib._verifyResolver = null
         resolve(null)
-      }, this.verifyTimeoutMs)
+      }, timeout)
       if (timer.unref) timer.unref()
       lib._verifyResolver = {
         timer,
@@ -954,10 +953,10 @@ class SyncEngine {
   _finishRound(lib, { pushed = 0, skipped = 0 } = {}) {
     lib._phasePending = 0
     lib._phaseDone = 0
-    lib._phase = { phase: 'synced' }
+    lib._phase = { phase: 'synced', total: 0, done: 0 }
     lib.lastSyncAt = Date.now()
     this._persist(lib).catch(() => {})
-    this.sendEvent(EVENTS.SYNC_PHASE, { id: lib.id, phase: 'synced' })
+    this.sendEvent(EVENTS.SYNC_PHASE, { id: lib.id, phase: 'synced', total: 0, done: 0 })
     this.sendEvent(EVENTS.SYNC_COMPLETED, { id: lib.id, name: lib.name, pushed, deleted: 0 })
   }
 
@@ -1046,7 +1045,7 @@ class SyncEngine {
                 const localHash = await hashFileFast(this.fsp, abs)
                 if (localHash && localHash !== f.hash) return null
               }
-              if (!bee) return null
+              if (!bee) return rel
               const node = await bee.get(`delivered/${lib.id}/${rel}`).catch(() => null)
               const del = node && node.value
               if (del && Math.abs(Number(del.mtimeMs || 0) - Number(f.mtimeMs || 0)) < VERIFY_TOLERANCE_MS) {
@@ -1065,6 +1064,7 @@ class SyncEngine {
                 }
                 return rel
               }
+              return rel
             }
             return null
           })
@@ -1074,7 +1074,7 @@ class SyncEngine {
     }
     this._sendToPeer(peerId, { type: MESSAGES.SYNC_VERIFY_RESULT, libraryId: msg.libraryId, have })
     if (lib._phase && lib._phase.phase !== 'transferring') {
-      this._setPhase(lib, 'synced')
+      this._setPhase(lib, 'synced', { total: 0, done: 0 })
     }
   }
 

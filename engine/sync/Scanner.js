@@ -65,7 +65,7 @@ async function scanFolder(fsp, dir, baseDir, out, limit = MAX_LIBRARY_FILES) {
           if (isDir) {
             queue.push(item.abs)
           } else {
-            const rel = safeRelPath(p.relative(baseDir, item.abs).split(p.sep).join('/'))
+            const rel = safeRelPath(p.relative(baseDir, item.abs).split(/[\\/]/).join('/'))
             if (!rel) continue
             const rawMtime =
               item.st.mtimeMs ||
