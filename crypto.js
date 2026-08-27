@@ -100,26 +100,38 @@ const DROP_GROUP_SIZE = 4
 const DROP_GROUPS = 2
 const DROP_LENGTH = DROP_GROUPS * DROP_GROUP_SIZE // 8 chars * 5 bits = 40 bits
 
-// Random 40-bit one-time share code, e.g. DROP-ABCD-EFGH.
-function generateDropCode() {
+// Random 40-bit one-time share code, e.g. DROP-ABCD-EFGH or DROP-GRP-ABCD-EFGH
+function generateDropCode(opts = {}) {
+  const isGroup = opts && opts.isGroup === true
   const bytes = randomBytes(DROP_LENGTH)
   let code = ''
   for (let i = 0; i < DROP_LENGTH; i++) {
     code += DROP_ALPHABET[bytes[i] % 32]
   }
-  return 'DROP-' + code.slice(0, DROP_GROUP_SIZE) + '-' + code.slice(DROP_GROUP_SIZE)
+  const body = code.slice(0, DROP_GROUP_SIZE) + '-' + code.slice(DROP_GROUP_SIZE)
+  return isGroup ? `DROP-GRP-${body}` : `DROP-${body}`
 }
 
-// Returns the canonical 'DROP-XXXX-XXXX' or null if invalid.
+// Returns the canonical 'DROP-XXXX-XXXX' or 'DROP-GRP-XXXX-XXXX' or null if invalid.
 function normalizeDropCode(raw) {
   if (typeof raw !== 'string') return null
   let clean = raw
     .trim()
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
-  if (clean.startsWith('DROP')) clean = clean.slice(4)
+  let isGroup = false
+  if (clean.startsWith('DROPGRP')) {
+    isGroup = true
+    clean = clean.slice(7)
+  } else if (clean.startsWith('GRP')) {
+    isGroup = true
+    clean = clean.slice(3)
+  } else if (clean.startsWith('DROP')) {
+    clean = clean.slice(4)
+  }
   if (clean.length !== DROP_LENGTH) return null
-  return 'DROP-' + clean.slice(0, DROP_GROUP_SIZE) + '-' + clean.slice(DROP_GROUP_SIZE)
+  const body = clean.slice(0, DROP_GROUP_SIZE) + '-' + clean.slice(DROP_GROUP_SIZE)
+  return isGroup ? `DROP-GRP-${body}` : `DROP-${body}`
 }
 
 module.exports = {

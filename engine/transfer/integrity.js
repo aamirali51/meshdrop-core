@@ -60,12 +60,12 @@ async function buildManifest({ filePath, fsp, filename, fileSize, fileType, tran
       offset += bytesRead
       // Yield periodically so the single worklet thread can still answer IPC
       // while hashing large files (a 4K video would otherwise block the UI).
-      if (++chunkCount % 64 === 0) {
+      if (++chunkCount % 256 === 0) {
         // A pause/delete during the hash must abort immediately instead of
         // waiting for the whole file to be hashed (that was the multi-second
         // pause delay on big videos).
         if (shouldCancel && shouldCancel()) throw new Error('interrupted')
-        await sleep(1)
+        await new Promise((resolve) => setImmediate(resolve))
       }
     }
   } finally {

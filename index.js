@@ -323,6 +323,12 @@ class MeshEngine extends EventEmitter {
     if (this.metricsCollector && typeof this.metricsCollector.rebind === 'function') {
       this.metricsCollector.rebind(this.swarm)
     }
+    if (this.lanDiscovery) {
+      this.lanDiscovery.swarm = this.swarm
+      if (typeof this.lanDiscovery.refresh === 'function') {
+        this.lanDiscovery.refresh()
+      }
+    }
     // initSwarm() returns whether the DHT bootstrapped on the new network.
     // false means we are offline (or the DHT is unreachable) — refreshNetwork()
     // uses that to schedule a self-retry.
@@ -1431,7 +1437,10 @@ class MeshEngine extends EventEmitter {
     files,
     folderPath,
     expirationPreset = '30m',
-    maxDownloads = 0 // 0 = unlimited downloads until expiry
+    maxDownloads = 0, // 0 = unlimited downloads until expiry
+    isGroup = false,
+    isWatchParty = false,
+    roomTitle = ''
   }) {
     if (!this.transferEngine || !this.topicRegistry) throw new Error('Engine not ready')
 
@@ -1469,7 +1478,7 @@ class MeshEngine extends EventEmitter {
       console.warn(`[MeshEngine] Skipped ${before - list.length} empty file(s) in drop share`)
     }
 
-    const code = generateDropCode()
+    const code = generateDropCode({ isGroup: isGroup || isWatchParty })
     const shareId = `drop-${Date.now().toString(36)}`
     const folderName = folderPath ? path.basename(folderPath) : null
 
@@ -1554,7 +1563,10 @@ class MeshEngine extends EventEmitter {
       maxDownloads: typeof maxDownloads === 'number' && maxDownloads > 0 ? maxDownloads : 0,
       downloadCount: 0,
       status: 'waiting',
-      isHost: true
+      isHost: true,
+      isGroupDrop: isGroup || isWatchParty,
+      isWatchParty,
+      roomTitle: roomTitle || folderName || staged[0].filename
     }
 
     const bee = await this.storage.getBee('pendingShares')
@@ -1678,6 +1690,42 @@ class MeshEngine extends EventEmitter {
     } catch (err) {
       console.warn('[MeshEngine] Expiration check failed:', err.message)
     }
+  }
+
+  /**
+   * Broadcast watch party playback state (play/pause/seek) to connected peers in the swarm.
+   * @param {{ roomCode?: string, action: 'play'|'pause'|'seek', positionSec: number }} params
+   */
+  broadcastWatchState(params = {}) {
+    if (!this.started) return false
+    const msg = {
+      type: MESSAGES.WATCH_STATE_SYNC,
+      action: params.action || 'play',
+      positionSec: typeof params.positionSec === 'number' ? params.positionSec : 0,
+      timestampMs: Date.now(),
+      senderDevice: this.deviceIdentity ? { id: this.deviceIdentity.id, name: this.deviceIdentity.name } : null,
+      roomCode: params.roomCode || null
+    }
+    let sent = 0
+    for (const [, peerObj] of this.peers.entries()) {
+      if (peerObj && peerObj.signaling && typeof peerObj.signaling.send === 'function') {
+        try {
+          peerObj.signaling.send(msg)
+          sent++
+        } catch {}
+      }
+    }
+    return { success: true, peersNotified: sent }
+  }
+
+  /**
+   * Dynamically prioritize chunk downloads near a video playhead byte offset.
+   */
+  setPlayheadByte(transferId, byteOffset) {
+    if (this.transferEngine && typeof this.transferEngine.setPlayheadByte === 'function') {
+      return this.transferEngine.setPlayheadByte(transferId, byteOffset)
+    }
+    return false
   }
 }
 

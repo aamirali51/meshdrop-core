@@ -346,13 +346,23 @@ class TransferEngine {
       byteOffset = appended * CHUNK_SIZE
       bytesWritten = byteOffset
       const buf = Buffer.alloc(CHUNK_SIZE)
+      const batchSize = 128 // Batch append 8MB at a time for high disk throughput
+      let batch = []
       while (bytesWritten < fileSize) {
         const readRes = await fd.read(buf, 0, CHUNK_SIZE, bytesWritten)
         const bytesRead = typeof readRes === 'number' ? readRes : (readRes?.bytesRead || 0)
         if (bytesRead === 0) break
         const block = Buffer.from(buf.subarray(0, bytesRead))
-        await core.append(block)
+        batch.push(block)
         bytesWritten += bytesRead
+        if (batch.length >= batchSize) {
+          await core.append(batch)
+          batch = []
+        }
+      }
+      if (batch.length > 0) {
+        await core.append(batch)
+        batch = []
       }
     } finally {
       await fd.close()
@@ -926,6 +936,7 @@ class TransferEngine {
         lastDataBlock,
         blocks: manifest.blocks.slice(resumeBlockIndex),
         blockSize,
+        isStreaming: !!transfer.isStreaming,
         onBlock: async (coreIndex, block) => {
           const fileOffset = (coreIndex - firstDataBlock) * blockSize
           await info.fd.write(block, 0, block.length, fileOffset)
@@ -2077,6 +2088,26 @@ class TransferEngine {
     }
     results.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     return results
+  }
+
+  setPlayhead(transferId, blockIndex) {
+    const info = this.runs.get(transferId)
+    if (info && info.scheduler && typeof info.scheduler.setPlayhead === 'function') {
+      info.scheduler.setPlayhead(blockIndex)
+      return true
+    }
+    return false
+  }
+
+  setPlayheadByte(transferId, byteOffset) {
+    const info = this.runs.get(transferId)
+    if (info && info.scheduler && typeof info.scheduler.setPlayhead === 'function') {
+      const blockSize = info.blockSize || CHUNK_SIZE
+      const blockIndex = Math.floor(byteOffset / blockSize) + 1
+      info.scheduler.setPlayhead(blockIndex)
+      return true
+    }
+    return false
   }
 
   async delete(transferId) {

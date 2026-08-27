@@ -136,11 +136,15 @@ function createClaims(ctx) {
     const peerObj = peers.get(peerId)
     if (!peerObj) throw new Error('Sender is no longer connected')
 
+    const isGroup = offer.isGroupDrop === true || (code && code.includes('GRP'))
+
     if (code) {
       activeClaims.delete(code)
-      try {
-        engine.topicRegistry.leave(dropTopic(code))
-      } catch {}
+      if (!isGroup) {
+        try {
+          engine.topicRegistry.leave(dropTopic(code))
+        } catch {}
+      }
       // The host answered: the placeholder "waiting for sender" row (if any)
       // is superseded by the real offer(s) below.
       if (engine.transferEngine) {

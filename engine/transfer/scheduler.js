@@ -11,7 +11,7 @@ const { sha256 } = require('../../crypto.js')
 const { MIN_WINDOW, MAX_WINDOW, sleep } = require('./constants.js')
 
 class ChunkScheduler {
-  constructor({ core, firstDataBlock, lastDataBlock, blocks, blockSize, onBlock }) {
+  constructor({ core, firstDataBlock, lastDataBlock, blocks, blockSize, onBlock, isStreaming = false }) {
     this.core = core
     this.first = firstDataBlock
     this.last = lastDataBlock
@@ -21,6 +21,12 @@ class ChunkScheduler {
     this.window = MIN_WINDOW
     this.cancelled = false
     this.paused = false
+    this.isStreaming = isStreaming
+    this.playhead = firstDataBlock
+    this.streamWindow = 64 // ~4MB lookahead at 64KB chunks
+    this.completed = new Set()
+    this.inflight = new Map() // coreIndex -> settled promise
+    this._queueDirty = false
   }
 
   cancel() {
@@ -33,6 +39,18 @@ class ChunkScheduler {
 
   resume() {
     this.paused = false
+  }
+
+  /**
+   * Dynamically reprioritize chunk download to focus on the user's current playback position.
+   * @param {number} coreIndex  The target block index to jump to
+   */
+  setPlayhead(coreIndex) {
+    const clamped = Math.max(this.first, Math.min(this.last, coreIndex))
+    if (this.playhead !== clamped) {
+      this.playhead = clamped
+      this._queueDirty = true
+    }
   }
 
   async fetchBlock(coreIndex) {
@@ -54,16 +72,35 @@ class ChunkScheduler {
     }
   }
 
-  async run() {
-    let next = this.first
-    let failures = 0
-    const inflight = new Map() // coreIndex -> settled promise
+  _getNextBlockIndex() {
+    // 1. If in streaming mode or playhead is active, check priority stream window first
+    if (this.isStreaming || this.playhead > this.first) {
+      const windowEnd = Math.min(this.last, this.playhead + this.streamWindow)
+      for (let i = this.playhead; i <= windowEnd; i++) {
+        if (!this.completed.has(i) && !this.inflight.has(i)) {
+          return i
+        }
+      }
+    }
 
-    while (next <= this.last || inflight.size > 0) {
-      while (this.inflightFree(inflight) && next <= this.last) {
-        if (this.cancelled) break
-        const coreIndex = next++
-        inflight.set(
+    // 2. Normal sequential sweep across the entire range
+    for (let i = this.first; i <= this.last; i++) {
+      if (!this.completed.has(i) && !this.inflight.has(i)) {
+        return i
+      }
+    }
+    return null
+  }
+
+  async run() {
+    let failures = 0
+
+    while (this.completed.size < (this.last - this.first + 1) || this.inflight.size > 0) {
+      while (this.inflightFree(this.inflight) && !this.cancelled) {
+        const coreIndex = this._getNextBlockIndex()
+        if (coreIndex === null) break // all remaining blocks are already inflight
+
+        this.inflight.set(
           coreIndex,
           this.fetchBlock(coreIndex).then(
             (block) => ({ coreIndex, block, err: null }),
@@ -72,14 +109,20 @@ class ChunkScheduler {
         )
       }
 
-      const settled = await Promise.race(Array.from(inflight.values()))
-      inflight.delete(settled.coreIndex)
+      if (this.inflight.size === 0) {
+        if (this.completed.size >= (this.last - this.first + 1)) break
+        if (this.cancelled) break
+        await sleep(50)
+        continue
+      }
+
+      const settled = await Promise.race(Array.from(this.inflight.values()))
+      this.inflight.delete(settled.coreIndex)
 
       if (settled.err) {
         if (this.cancelled) break
         failures++
         this.window = Math.max(MIN_WINDOW, Math.floor(this.window / 2))
-        if (next > settled.coreIndex) next = settled.coreIndex // re-queue this block
         continue
       }
       if (this.cancelled) break
@@ -95,6 +138,7 @@ class ChunkScheduler {
       }
       try {
         await this.onBlock(settled.coreIndex, settled.block)
+        this.completed.add(settled.coreIndex)
       } catch (err) {
         throw err
       }

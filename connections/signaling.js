@@ -8,7 +8,7 @@
 
 const Protomux = require('protomux')
 const c = require('compact-encoding')
-const { MESSAGES, PROTOCOL_VERSION } = require('../protocol.js')
+const { MESSAGES, EVENTS, PROTOCOL_VERSION } = require('../protocol.js')
 const { getTransferMethod } = require('./util.js')
 
 function createSignaling(ctx) {
@@ -272,6 +272,22 @@ function createSignaling(ctx) {
           console.warn('[MeshEngine] handleSyncVerifyResult failed:', err?.message)
         })
       }
+    } else if (msg.type === MESSAGES.WATCH_STATE_SYNC) {
+      engine.emit(EVENTS.WATCH_STATE_UPDATED, {
+        peerId,
+        action: msg.action,
+        positionSec: msg.positionSec,
+        timestampMs: msg.timestampMs,
+        senderDevice: msg.senderDevice || null,
+        roomCode: msg.roomCode
+      })
+    } else if (msg.type === MESSAGES.WATCH_PEER_STATUS) {
+      engine.emit(EVENTS.WATCH_STATE_UPDATED, {
+        peerId,
+        buffering: msg.buffering,
+        positionSec: msg.positionSec,
+        roomCode: msg.roomCode
+      })
     }
   }
 

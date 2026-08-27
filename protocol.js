@@ -47,7 +47,10 @@ const MESSAGES = {
   // transfer records (additive — old peers simply never answer, and the owner
   // falls back to the per-file skip handshake).
   SYNC_VERIFY: 'SYNC_VERIFY',
-  SYNC_VERIFY_RESULT: 'SYNC_VERIFY_RESULT'
+  SYNC_VERIFY_RESULT: 'SYNC_VERIFY_RESULT',
+  // Watch Party synchronized playback & group swarm state
+  WATCH_STATE_SYNC: 'WATCH_STATE_SYNC',
+  WATCH_PEER_STATUS: 'WATCH_PEER_STATUS'
 }
 
 // ─── Engine events (what MeshEngine emits) ──────────────────────────────────
@@ -81,6 +84,7 @@ const EVENTS = {
   // lets the UI separate file comparison from actual payload transfer.
   SYNC_PHASE: 'sync:phase',
   CLAIM_PREVIEW: 'claim:preview',
+  WATCH_STATE_UPDATED: 'watch:state:updated',
   NOTIFICATION_RECEIVED: 'notification:received',
   ERROR: 'error'
 }
