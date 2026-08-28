@@ -1,8 +1,6 @@
 'use strict'
 
-const EventEmitter = require('bare-events')
-const path = require('bare-path')
-const fsp = require('bare-fs/promises')
+const { path, fsp, EventEmitter } = require('../compat.js')
 const { generateDropCode } = require('../crypto')
 const { MESSAGES } = require('../connections/signaling')
 
