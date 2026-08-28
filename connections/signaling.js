@@ -272,22 +272,27 @@ function createSignaling(ctx) {
           console.warn('[MeshEngine] handleSyncVerifyResult failed:', err?.message)
         })
       }
-    } else if (msg.type === MESSAGES.WATCH_STATE_SYNC) {
-      engine.emit(EVENTS.WATCH_STATE_UPDATED, {
-        peerId,
-        action: msg.action,
-        positionSec: msg.positionSec,
-        timestampMs: msg.timestampMs,
-        senderDevice: msg.senderDevice || null,
-        roomCode: msg.roomCode
-      })
-    } else if (msg.type === MESSAGES.WATCH_PEER_STATUS) {
-      engine.emit(EVENTS.WATCH_STATE_UPDATED, {
-        peerId,
-        buffering: msg.buffering,
-        positionSec: msg.positionSec,
-        roomCode: msg.roomCode
-      })
+    } else if (msg.type?.startsWith?.('WATCH_')) {
+      if (ctx.refs.handleWatchMessage) {
+        ctx.refs.handleWatchMessage(peerId, msg)
+      }
+      if (msg.type === MESSAGES.WATCH_STATE_SYNC) {
+        engine.emit(EVENTS.WATCH_STATE_UPDATED, {
+          peerId,
+          action: msg.action,
+          positionSec: msg.positionSec,
+          timestampMs: msg.timestampMs,
+          senderDevice: msg.senderDevice || null,
+          roomCode: msg.roomCode
+        })
+      } else if (msg.type === MESSAGES.WATCH_PEER_STATUS) {
+        engine.emit(EVENTS.WATCH_STATE_UPDATED, {
+          peerId,
+          buffering: msg.buffering,
+          positionSec: msg.positionSec,
+          roomCode: msg.roomCode
+        })
+      }
     }
   }
 

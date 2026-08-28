@@ -15,6 +15,7 @@ const { generateDropCode, normalizeDropCode } = require('./crypto.js')
 const { TrustManager } = require('./engine/TrustManager.js')
 const { TransferEngine } = require('./engine/TransferEngine.js')
 const { SyncEngine } = require('./engine/SyncEngine.js')
+const { WatchPartyManager, PARTY_EVENTS } = require('./engine/WatchPartyManager.js')
 const MetricsCollector = require('./engine/MetricsCollector.js')
 const TopicRegistry = require('./engine/TopicRegistry.js')
 const NotificationStore = require('./engine/NotificationStore.js')
@@ -583,7 +584,13 @@ class MeshEngine extends EventEmitter {
       this.connections.refs.handleSyncRemove = (peerId, msg) => this.syncEngine.handleSyncRemove(peerId, msg)
       this.connections.refs.handleSyncVerify = (peerId, msg) => this.syncEngine.handleSyncVerify(peerId, msg)
       this.connections.refs.handleSyncVerifyResult = (peerId, msg) => this.syncEngine.handleSyncVerifyResult(peerId, msg)
+      this.connections.refs.handleWatchMessage = (peerId, msg) => this.watchParty && this.watchParty.handleMessage(peerId, msg)
     }
+
+    this.watchParty = new WatchPartyManager({ engine: this })
+    Object.values(PARTY_EVENTS).forEach((evt) => {
+      this.watchParty.on(evt, (data) => this.emit(evt, data))
+    })
 
     this.lanDiscovery = this.lanDiscoveryEnabled
       ? new LanDiscovery({
@@ -1719,6 +1726,40 @@ class MeshEngine extends EventEmitter {
   }
 
   /**
+   * Watch Party Room Management
+   */
+  async createPartyRoom(params) {
+    if (!this.watchParty) throw new Error('WatchPartyManager not initialized')
+    return this.watchParty.createRoom(params)
+  }
+
+  async joinPartyRoom(params) {
+    if (!this.watchParty) throw new Error('WatchPartyManager not initialized')
+    return this.watchParty.joinRoom(params)
+  }
+
+  async leavePartyRoom() {
+    if (!this.watchParty) return null
+    return this.watchParty.leaveRoom()
+  }
+
+  getPartyRoom() {
+    return this.watchParty ? this.watchParty.getRoomInfo() : null
+  }
+
+  listPartyRooms() {
+    return this.watchParty ? this.watchParty.listDiscoveredRooms() : []
+  }
+
+  sendPartyReaction(emoji) {
+    return this.watchParty ? this.watchParty.sendReaction(emoji) : false
+  }
+
+  broadcastPartyStatus(params) {
+    return this.watchParty ? this.watchParty.broadcastPeerStatus(params) : false
+  }
+
+  /**
    * Dynamically prioritize chunk downloads near a video playhead byte offset.
    */
   setPlayheadByte(transferId, byteOffset) {
@@ -1729,4 +1770,4 @@ class MeshEngine extends EventEmitter {
   }
 }
 
-module.exports = { MeshEngine, EVENTS, pairingTopic, getDurationMs }
+module.exports = { MeshEngine, EVENTS, PARTY_EVENTS, pairingTopic, getDurationMs }
