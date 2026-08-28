@@ -62,7 +62,7 @@ class WatchPartyManager extends EventEmitter {
       filename,
       filePath,
       fileSize,
-      coreKey,
+      coreKey: null,
       isHost: true,
       controlsMode,
       hostPeerId: hostIdentity.id || 'host',
