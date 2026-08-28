@@ -3,7 +3,7 @@
 const EventEmitter = require('bare-events')
 const path = require('bare-path')
 const fsp = require('bare-fs/promises')
-const { generateDropCode } = require('../connections/claims')
+const { generateDropCode } = require('../crypto')
 const { MESSAGES } = require('../connections/signaling')
 
 const PARTY_EVENTS = {
