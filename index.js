@@ -1330,13 +1330,16 @@ class MeshEngine extends EventEmitter {
     // connections/getConnectionStatus(). Do NOT recompute from peer count alone
     // here: that made a healthy, zero-peer app report "Mesh Connecting…".
     const { connected } = this.connections.getConnectionStatus()
-    return this.metricsCollector.snapshot({
+    const diag = this.metricsCollector.snapshot({
       peerCount: count,
       connected,
       relayStatus: 'Enabled',
       avgLatencyMs: this.connections.getPeerLatency(),
       packetLossPercent: this.connections.getPacketLoss()
     })
+    // Watch Party telemetry: null when no room is active (honest = not measured).
+    diag.watchParty = this.watchParty ? this.watchParty.getMetrics() : null
+    return diag
   }
 
   // ─── Internals ────────────────────────────────────────────────────────────
@@ -1755,8 +1758,25 @@ class MeshEngine extends EventEmitter {
     return this.watchParty ? this.watchParty.sendReaction(emoji) : false
   }
 
+  sendPartyChat(text) {
+    return this.watchParty ? this.watchParty.sendChat(text) : false
+  }
+
   broadcastPartyStatus(params) {
     return this.watchParty ? this.watchParty.broadcastPeerStatus(params) : false
+  }
+
+  /**
+   * Attach the host's ffprobe-derived codec metadata to the active room, so
+   * joiners can decide how (or whether) they can play the file. Accepts the
+   * canonical shape from engine/watchCapabilities.js probeFile():
+   *   { videoCodec, audioCodec, container }
+   */
+  setPartyFileCodecs(codecs) {
+    if (!this.watchParty || !this.watchParty.activeRoom) return false
+    if (!codecs || typeof codecs !== 'object') return false
+    this.watchParty.activeRoom.fileCodecs = codecs
+    return true
   }
 
   /**
@@ -1770,4 +1790,11 @@ class MeshEngine extends EventEmitter {
   }
 }
 
-module.exports = { MeshEngine, EVENTS, PARTY_EVENTS, pairingTopic, getDurationMs }
+module.exports = {
+  MeshEngine,
+  EVENTS,
+  PARTY_EVENTS,
+  pairingTopic,
+  getDurationMs,
+  watchCapabilities: require('./engine/watchCapabilities.js')
+}
