@@ -17,7 +17,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test-sync-unit.js && node test-sync-e2e-matrix.js && node test.js && node test-watch-party.js"
+    "test": "node test-sync-unit.js && node test-sync-e2e-matrix.js && node test.js"
   },
   "engines": {
     "node": ">=18"

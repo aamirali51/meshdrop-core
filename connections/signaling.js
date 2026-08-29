@@ -281,11 +281,9 @@ function createSignaling(ctx) {
           peerId,
           action: msg.action,
           positionSec: msg.positionSec,
-          playbackRate: msg.playbackRate,
           timestampMs: msg.timestampMs,
-          senderDevice: msg.senderDevice || msg.sender || null,
-          roomCode: msg.roomCode,
-          roomMeta: msg.roomMeta || null
+          senderDevice: msg.senderDevice || null,
+          roomCode: msg.roomCode
         })
       } else if (msg.type === MESSAGES.WATCH_PEER_STATUS) {
         engine.emit(EVENTS.WATCH_STATE_UPDATED, {

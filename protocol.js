@@ -50,24 +50,7 @@ const MESSAGES = {
   SYNC_VERIFY_RESULT: 'SYNC_VERIFY_RESULT',
   // Watch Party synchronized playback & group swarm state
   WATCH_STATE_SYNC: 'WATCH_STATE_SYNC',
-  WATCH_PEER_STATUS: 'WATCH_PEER_STATUS',
-  // Room lifecycle + group interaction (raw WATCH_* strings in older builds;
-  // new peers carry them here so signaling can route on constants).
-  WATCH_ROOM_ANNOUNCE: 'WATCH_ROOM_ANNOUNCE',
-  WATCH_ROOM_JOIN: 'WATCH_ROOM_JOIN',
-  WATCH_ROOM_LEAVE: 'WATCH_ROOM_LEAVE',
-  WATCH_ROOM_HANDOFF: 'WATCH_ROOM_HANDOFF',
-  WATCH_REACTION: 'WATCH_REACTION',
-  WATCH_CHAT: 'WATCH_CHAT',
-  WATCH_PING: 'WATCH_PING',
-  WATCH_PONG: 'WATCH_PONG',
-  // Capability negotiation (direct -> remux -> refuse). The joiner's
-  // capabilities ride in WATCH_ROOM_JOIN.peer; these two let a host that joins
-  // a running room ask for the file's codecs when it needs to decide how (or
-  // whether) a peer can play. Additive — old peers never answer and the host
-  // falls back to filename-only metadata.
-  WATCH_CAPABILITIES_REQUEST: 'WATCH_CAPABILITIES_REQUEST',
-  WATCH_CAPABILITIES_RESPONSE: 'WATCH_CAPABILITIES_RESPONSE'
+  WATCH_PEER_STATUS: 'WATCH_PEER_STATUS'
 }
 
 // ─── Engine events (what MeshEngine emits) ──────────────────────────────────
