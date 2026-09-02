@@ -59,6 +59,13 @@ class TrustManager {
     // exponential backoff instead of letting it reconnect and retry forever.
     // The counter resets on a successful verification (handleResponse).
     this.failedPairings = new Map() // hex noise public key -> { count, lockedUntil }
+    // Unanswered-pairing backoff: peers that repeatedly let OUR challenge time
+    // out (the recurring 'challenge never verified' connect/destroy loop) stop
+    // receiving automatic challenges — nobody is pairing, so retrying on every
+    // reconnect only burns battery and spams logs. Suppression clears on any
+    // user intent (a code entered) or incoming challenge we can actually
+    // answer, so explicit pairing is never blocked.
+    this.unansweredPairings = new Map() // hex noise public key -> { count, suppressUntil }
 
     if (this.relayClient) {
       this.relayClient.onMessage = (topic, msg, fromPeerId) => {
@@ -331,8 +338,11 @@ class TrustManager {
     for (const [pId, peerObj] of this.getPeers().entries()) {
       if (peerObj.pairing && peerObj.pairing.trusted && !this.isRevoked(pId)) trustedIds.add(pId)
     }
+    // The user just entered a code: explicit pairing intent. Give every peer a
+    // fresh chance regardless of any unanswered-pairing backoff.
+    this.unansweredPairings.clear()
     this._joinPairingTopic(cleanCode)
-    this.sendChallengesToAll()
+    this.sendChallengesToAll({ force: true })
     // Untrusted peers were just challenged by sendChallengesToAll. Trusted peers are
     // skipped there, but the code's host may already be connected and trusted
     // (LAN auto-trust, or a pairing completed before the code was entered) —
@@ -375,7 +385,7 @@ class TrustManager {
    * Broadcast pairing challenges to all connected peers that require verification,
    * and answer any pending challenges that arrived before the secret was registered.
    */
-  sendChallengesToAll() {
+  sendChallengesToAll({ force = false } = {}) {
     for (const [peerId, peerObj] of this.getPeers().entries()) {
       if (!peerObj || !peerObj.signaling || !peerObj.pairing) continue
       // Flush any pending challenges that arrived before we registered a matching code
@@ -387,7 +397,7 @@ class TrustManager {
         }
       }
       if (!peerObj.pairing.trusted || this.isRevoked(peerId)) {
-        this.sendChallenges(peerId)
+        this.sendChallenges(peerId, { force })
       }
     }
   }
@@ -596,11 +606,39 @@ class TrustManager {
       console.warn(
         `[MeshEngine] Pairing timed out for ${peerId.slice(0, 12)}... (challenge never verified)`
       )
+      // Nobody is pairing: remember the unanswered cycle so automatic
+      // challenges to this peer back off instead of looping forever.
+      this._recordUnansweredPairing(peerId)
       try {
         p.connection.destroy()
       } catch {}
     }, PAIRING_TIMEOUT + graceMs)
     if (peerObj.pairing.timeout.unref) peerObj.pairing.timeout.unref()
+  }
+
+  // Record a 'challenge never verified' cycle for a peer and apply an
+  // exponential suppression window to AUTOMATIC challenges. Deliberate pairing
+  // (a code entered on either side) is never affected: forced challenges and
+  // any incoming challenge we can answer reset the suppression.
+  _recordUnansweredPairing(peerId) {
+    const entry = this.unansweredPairings.get(peerId) || { count: 0, suppressUntil: 0 }
+    entry.count += 1
+    const backoffMs = Math.min(60 * 1000 * Math.pow(2, entry.count - 1), 30 * 60 * 1000)
+    entry.suppressUntil = Date.now() + backoffMs
+    this.unansweredPairings.set(peerId, entry)
+    console.log(
+      `[MeshEngine] No pairing response from ${peerId.slice(0, 12)}... after ${entry.count} attempt(s) — automatic challenges paused for ${Math.round(backoffMs / 60000)} min (enter a code to pair immediately)`
+    )
+  }
+
+  _isPairingSuppressed(peerId) {
+    const entry = this.unansweredPairings.get(peerId)
+    if (!entry) return false
+    if (entry.suppressUntil <= Date.now()) {
+      this.unansweredPairings.delete(peerId)
+      return false
+    }
+    return true
   }
 
   // Clear the watchdog for a peer (called on successful verification and on
@@ -618,13 +656,20 @@ class TrustManager {
   // challenge per (peer, secret) so MACs tie to a single nonce. Revoked peers
   // are challenged too: they can only answer with a CURRENT code (the old ones
   // were rotated away on deletion), which is exactly what a fresh pairing needs.
-  sendChallenges(peerId) {
+  sendChallenges(peerId, { force = false } = {}) {
     const peerObj = this.getPeers().get(peerId)
     if (!peerObj || !peerObj.signaling || !peerObj.pairing) return
     if (peerObj.pairing.trusted && !this.isRevoked(peerId)) return
     // A peer that just failed a MAC verification is in exponential backoff —
     // do not re-challenge it until the lockout expires.
     if (this._isPairingLocked(peerId)) return
+    // Nobody has ever answered our challenges for this peer and no user intent
+    // is in play: leave them alone instead of looping connect/challenge/destroy.
+    if (!force) {
+      if (this._isPairingSuppressed(peerId)) return
+    } else {
+      this.unansweredPairings.delete(peerId)
+    }
     const sentCodeIds = new Set(peerObj.pairing.outstanding.map((o) => o.codeId))
     let sentAny = false
     for (const [, secret] of this.pairingSecrets.entries()) {
@@ -667,12 +712,24 @@ class TrustManager {
     }
     if (typeof msg.codeId !== 'string' || typeof msg.nonce !== 'string') return
 
+    const secret = this.pairingSecrets.get(msg.codeId)
+    const secretUsable = secret && (secret.expiresAt === 0 || Date.now() < secret.expiresAt)
+
     // Receiving a challenge means pairing activity is underway: start (or
     // reset) the watchdog now, not at connection open. No-op for trusted peers
     // (the watchdog guard below) and harmless for direct-mode ones.
-    this._armPairingTimeout(peerId)
+    // A challenge we CAN answer proves the other side is actively pairing with
+    // a code we hold: clear any suppression and reciprocate below so trust
+    // completes on BOTH sides. A challenge we cannot answer (neither side
+    // knows the other's code) keeps its suppression — answering is impossible
+    // and re-arming would only continue the connect/destroy loop.
+    if (secretUsable) {
+      this.unansweredPairings.delete(peerId)
+      this._armPairingTimeout(peerId)
+    } else if (!this._isPairingSuppressed(peerId)) {
+      this._armPairingTimeout(peerId)
+    }
 
-    const secret = this.pairingSecrets.get(msg.codeId)
     if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) {
       // We don't know this code (yet). Remember it so we can answer once a
       // matching secret is registered (e.g. code entered after connection).
@@ -698,6 +755,16 @@ class TrustManager {
       })
     } catch (err) {
       console.error('[MeshEngine] Failed to send PAIRING_RESP:', err.message)
+    }
+
+    // Reciprocate so trust becomes MUTUAL: our answer alone only completes the
+    // CHALLENGER's side. If we were not already challenging them (no outstanding
+    // nonce), challenge them back with the code we hold — they can only answer
+    // it if they genuinely know it. Guarded by hadOutstanding so two actively
+    // pairing peers cannot ping-pong challenges forever.
+    const hadOutstanding = peerObj.pairing.outstanding.length > 0
+    if (!hadOutstanding && !peerObj.pairing.trusted) {
+      this.sendChallenges(peerId, { force: true })
     }
   }
 
@@ -782,9 +849,10 @@ class TrustManager {
     peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
     // Challenge VERIFIED: drop the watchdog so the connection is never killed
     // while the reciprocal HANDSHAKE is still in flight, and reset the
-    // failed-MAC lockout for this key.
+    // failed-MAC lockout and the unanswered-pairing backoff for this key.
     this._clearPairingTimeout(peerId)
     this._clearPairingFailures(peerId)
+    this.unansweredPairings.delete(peerId)
     console.log(`[MeshEngine] Pairing challenge VERIFIED for ${peerId} (${outstanding.code})`)
     this.getPeers().set(peerId, peerObj)
     this.onTrustGranted(peerId, outstanding.code)
