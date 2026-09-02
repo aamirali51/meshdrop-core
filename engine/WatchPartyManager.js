@@ -2,7 +2,9 @@
 
 const { path, fsp, EventEmitter } = require('../compat.js')
 const { generateDropCode } = require('../crypto')
+const { EVENTS } = require('../protocol.js')
 const { MESSAGES } = require('../connections/signaling')
+const { STATUS } = require('./transfer/constants.js')
 
 const PARTY_EVENTS = {
   ROOM_CREATED: 'party:room:created',
@@ -14,16 +16,69 @@ const PARTY_EVENTS = {
   PEER_STATUS: 'party:peer:status',
   STATE_SYNC: 'party:state:sync',
   REACTION: 'party:reaction',
-  DISCOVERED_ROOMS: 'party:rooms:discovered'
+  DISCOVERED_ROOMS: 'party:rooms:discovered',
+  MEDIA_OFFER: 'party:media:offer',
+  MEDIA_READY: 'party:media:ready',
+  MEDIA_ERROR: 'party:media:error'
 }
 
 class WatchPartyManager extends EventEmitter {
   constructor(options = {}) {
     super()
     this.engine = options.engine
-    this.activeRoom = null // { roomCode, title, filePath, isHost, controlsMode, coreKey, participants: Map }
+    this.activeRoom = null // { roomCode, shareId, title, filePath, isHost, controlsMode, coreKey, participants: Map }
     this.discoveredRooms = new Map() // roomCode -> { roomCode, title, hostName, hostPeerId, duration, timestamp }
     this.reactionListeners = new Set()
+    // peerId -> replication streams serving this room's media core (torn down
+    // on leaveRoom; per-peer disconnect cleanup also happens in connections).
+    this._mediaStreams = new Map()
+    this._mediaReadyNotified = false
+
+    // Guest-side media state: surface an explicit source-ready / source-error
+    // signal for the party transfer so UIs never have to poll the staging dir.
+    if (this.engine && typeof this.engine.on === 'function') {
+      this._onTransferProgress = (t) => {
+        const room = this.activeRoom
+        if (!room || room.isHost || !room.shareId) return
+        if (!t || t.id !== room.shareId) return
+        if (this._mediaReadyNotified) return
+        this._mediaReadyNotified = true
+        this.emit(PARTY_EVENTS.MEDIA_READY, {
+          roomCode: room.roomCode,
+          shareId: room.shareId,
+          filename: t.filename,
+          fileSize: room.fileSize
+        })
+      }
+      this._onTransferCompleted = (t) => {
+        const room = this.activeRoom
+        if (!room || room.isHost || !room.shareId) return
+        if (!t || t.id !== room.shareId) return
+        this._mediaReadyNotified = true
+        this.emit(PARTY_EVENTS.MEDIA_READY, {
+          roomCode: room.roomCode,
+          shareId: room.shareId,
+          filename: t.filename,
+          fileSize: room.fileSize,
+          destPath: t.destPath || null
+        })
+      }
+      const onError = (t) => {
+        const room = this.activeRoom
+        if (!room || room.isHost || !room.shareId) return
+        if (!t || t.id !== room.shareId) return
+        this.emit(PARTY_EVENTS.MEDIA_ERROR, {
+          roomCode: room.roomCode,
+          shareId: room.shareId,
+          status: t.status,
+          error: t.error || 'party media transfer failed'
+        })
+      }
+      this.engine.on(EVENTS.TRANSFER_PROGRESS, this._onTransferProgress)
+      this.engine.on(EVENTS.TRANSFER_COMPLETED, this._onTransferCompleted)
+      this.engine.on(EVENTS.TRANSFER_FAILED, onError)
+      this.engine.on(EVENTS.TRANSFER_CANCELLED, onError)
+    }
   }
 
   /**
@@ -53,20 +108,50 @@ class WatchPartyManager extends EventEmitter {
     }
 
     const hostIdentity = this.engine.storage?.getDeviceIdentity?.() || { name: 'Host Device' }
+    const transferEngine = this.engine && this.engine.transferEngine
+    const fileType = transferEngine && typeof transferEngine.getFileType === 'function'
+      ? transferEngine.getFileType(filename)
+      : ''
 
     this.activeRoom = {
       roomCode,
+      shareId,
       title: title || filename,
       filename,
       filePath,
       fileSize,
+      fileType,
       coreKey: null,
+      manifestHash: '',
+      checksum: '',
       isHost: true,
       controlsMode,
       hostPeerId: hostIdentity.id || 'host',
       hostName: hostIdentity.name || 'Host',
       participants: new Map(),
       createdAt: Date.now()
+    }
+
+    // Stage the party media under the room's DETERMINISTIC id. Guests resolve
+    // media by this id (desktop: /stream/transfer?id=<shareId>, mobile:
+    // .p2p-staging/<shareId>), so the staging pass must exist before the room
+    // is announced — the announcement implies a playable source.
+    if (transferEngine && typeof transferEngine.stageDrop === 'function') {
+      try {
+        const staged = await transferEngine.stageDrop({
+          transferId: shareId,
+          coreName: shareId,
+          filePath,
+          filename,
+          fileSize,
+          fileType
+        })
+        this.activeRoom.coreKey = staged.coreKey
+        this.activeRoom.manifestHash = staged.manifestHash
+        this.activeRoom.checksum = staged.checksum
+      } catch (err) {
+        console.warn('[WatchPartyManager] party media staging failed:', err.message)
+      }
     }
 
     // Broadcast room announcement to all connected peers
@@ -94,12 +179,14 @@ class WatchPartyManager extends EventEmitter {
 
     this.activeRoom = {
       roomCode: cleanCode,
+      shareId: `watch-${cleanCode.toLowerCase()}`,
       title: cleanCode,
       isHost: false,
       controlsMode: 'host',
       participants: new Map(),
       joinedAt: Date.now()
     }
+    this._mediaReadyNotified = false
 
     // Send join message to the swarm
     this._broadcastRoomMessage({
@@ -141,6 +228,17 @@ class WatchPartyManager extends EventEmitter {
         this.engine.topicRegistry.leave(topic)
       } catch {}
     }
+
+    // Tear down the per-peer media replication streams this room opened.
+    for (const [, streams] of this._mediaStreams) {
+      for (const s of streams) {
+        try {
+          s.destroy()
+        } catch {}
+      }
+    }
+    this._mediaStreams.clear()
+    this._mediaReadyNotified = false
 
     this.activeRoom = null
     this.emit(PARTY_EVENTS.ROOM_LEFT, { roomCode: room.roomCode })
@@ -240,6 +338,7 @@ class WatchPartyManager extends EventEmitter {
     if (!this.activeRoom) return null
     return {
       roomCode: this.activeRoom.roomCode,
+      shareId: this.activeRoom.shareId || null,
       title: this.activeRoom.title,
       filename: this.activeRoom.filename,
       filePath: this.activeRoom.filePath,
@@ -284,7 +383,15 @@ class WatchPartyManager extends EventEmitter {
           roomCode: msg.roomCode,
           peer: { id: peerId, name: msg.peer?.name || 'Peer' }
         })
+        // Authorized by room membership: this peer just proved knowledge of the
+        // room code. Hand it the staged media descriptor + per-core replication
+        // so its data plane comes up alongside the control plane it joined for.
+        if (this.activeRoom.isHost) {
+          this._serveMediaToPeer(peerId).catch(() => {})
+        }
       }
+    } else if (msg.type === 'WATCH_MEDIA_OFFER') {
+      this._handleMediaOffer(peerId, msg).catch(() => {})
     } else if (msg.type === 'WATCH_ROOM_LEAVE') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
         this.activeRoom.participants.delete(peerId)
@@ -308,6 +415,183 @@ class WatchPartyManager extends EventEmitter {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
         this.emit(PARTY_EVENTS.REACTION, msg)
       }
+    }
+  }
+
+  /**
+   * Host: serve the staged party media to a joining peer. Opens a per-core
+   * replication stream (the exchange store is never exposed) and sends the
+   * media descriptor to that peer ONLY — room membership is the authorization.
+   */
+  async _serveMediaToPeer(peerId) {
+    const room = this.activeRoom
+    if (!room || !room.isHost || !room.coreKey || !room.shareId) return
+
+    const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(peerId) : null
+    const exchangeStore = this.engine.storage && this.engine.storage.exchangeStore
+    if (!peerObj || !peerObj.connection || !exchangeStore) return
+
+    try {
+      const core = exchangeStore.get({ name: room.shareId })
+      await core.ready()
+      // One live replication stream per peer per connection: a rejoining guest
+      // reuses the same mesh connection, and a second noise-wrapped replicate
+      // over it would corrupt the wire.
+      let stream = peerObj.partyMediaStream
+      if (!stream || stream.destroyed) {
+        stream = core.replicate(peerObj.connection, { live: true })
+        peerObj.partyMediaStream = stream
+        peerObj.dropStreams = peerObj.dropStreams || []
+        peerObj.dropStreams.push(stream)
+        this._trackMediaStream(peerId, stream)
+      }
+      console.log(
+        `[WatchPartyManager] serving party media to ${peerId.slice(0, 12)}... (${room.filename})`
+      )
+    } catch (err) {
+      console.warn('[WatchPartyManager] party media replication failed:', err.message)
+      return
+    }
+
+    if (peerObj.signaling && typeof peerObj.signaling.send === 'function') {
+      peerObj.signaling.send({
+        type: 'WATCH_MEDIA_OFFER',
+        roomCode: room.roomCode,
+        shareId: room.shareId,
+        transferId: room.shareId,
+        filename: room.filename,
+        fileSize: room.fileSize,
+        fileType: room.fileType || '',
+        coreKey: room.coreKey,
+        manifestHash: room.manifestHash || '',
+        checksum: room.checksum || '',
+        sender: { id: room.hostPeerId, name: room.hostName }
+      })
+    }
+  }
+
+  /**
+   * Guest: accept a party media descriptor from the host. Opens the receive
+   * side of the per-core replication and starts the transfer under the room's
+   * deterministic id so the UIs' existing resolution paths work unchanged.
+   */
+  async _handleMediaOffer(peerId, msg) {
+    const room = this.activeRoom
+    if (!room || room.isHost) return
+    if (!msg || msg.roomCode !== room.roomCode) return
+
+    const shareId = `watch-${room.roomCode.toLowerCase()}`
+    const transferId = typeof msg.transferId === 'string' && msg.transferId ? msg.transferId : ''
+    // Only the room's own deterministic id is this party's media.
+    if (transferId && transferId !== shareId) return
+
+    const { filename, fileSize, coreKey } = msg
+    if (typeof coreKey !== 'string' || coreKey.length !== 64) return
+    if (typeof fileSize !== 'number' || fileSize < 0) return
+    if (typeof filename !== 'string' || filename.length === 0 || filename.length > 500) return
+
+    room.shareId = shareId
+    room.filename = filename
+    room.fileSize = fileSize
+
+    const transferEngine = this.engine && this.engine.transferEngine
+    if (!transferEngine) return
+
+    // Already hold the finished media (rejoin / app restart): nothing to
+    // transfer — report the source we have on disk.
+    const existing = await this._getTransferRecord(shareId)
+    if (existing && existing.status === STATUS.COMPLETED) {
+      this._mediaReadyNotified = true
+      this.emit(PARTY_EVENTS.MEDIA_READY, {
+        roomCode: room.roomCode,
+        shareId,
+        filename: existing.filename,
+        fileSize: existing.fileSize,
+        destPath: existing.destPath || null
+      })
+      return
+    }
+
+    // Receive side of the per-core replication (pairs with the host's open).
+    // One stream per peer per connection — a rejoin must reuse it.
+    try {
+      const peerObj = this.engine.peers ? this.engine.peers.get(peerId) : null
+      const exchangeStore = this.engine.storage && this.engine.storage.exchangeStore
+      if (peerObj && peerObj.connection && exchangeStore) {
+        const core = exchangeStore.get(Buffer.from(coreKey, 'hex'))
+        await core.ready()
+        let stream = peerObj.partyMediaStream
+        if (!stream || stream.destroyed) {
+          stream = core.replicate(peerObj.connection, { live: true })
+          peerObj.partyMediaStream = stream
+          peerObj.dropStreams = peerObj.dropStreams || []
+          peerObj.dropStreams.push(stream)
+          this._trackMediaStream(peerId, stream)
+        }
+      }
+    } catch (err) {
+      console.warn('[WatchPartyManager] party media receive stream failed:', err.message)
+    }
+
+    try {
+      const record = await transferEngine.receiveOffer(
+        {
+          transferId: shareId,
+          filename,
+          fileSize,
+          fileType: msg.fileType || (typeof transferEngine.getFileType === 'function' ? transferEngine.getFileType(filename) : ''),
+          coreKey,
+          manifestHash: msg.manifestHash || '',
+          checksum: msg.checksum || '',
+          senderIdentity: msg.sender || { id: peerId, name: 'Host' },
+          peerKey: peerId,
+          shareId,
+          source: 'watch'
+        },
+        { autoAccept: true }
+      )
+
+      if (!record) {
+        // Duplicate offer: resume a parked receive if it can still deliver.
+        if (
+          existing &&
+          [STATUS.PENDING_APPROVAL, STATUS.INTERRUPTED, STATUS.FAILED, STATUS.WAITING_PEER].indexOf(existing.status) !== -1 &&
+          typeof transferEngine.approve === 'function'
+        ) {
+          await transferEngine.approve(shareId)
+        }
+        return
+      }
+
+      this.emit(PARTY_EVENTS.MEDIA_OFFER, {
+        roomCode: room.roomCode,
+        shareId,
+        filename,
+        fileSize
+      })
+    } catch (err) {
+      console.warn('[WatchPartyManager] party media accept failed:', err.message)
+      this.emit(PARTY_EVENTS.MEDIA_ERROR, {
+        roomCode: room.roomCode,
+        shareId,
+        error: err.message
+      })
+    }
+  }
+
+  _trackMediaStream(peerId, stream) {
+    const list = this._mediaStreams.get(peerId) || []
+    list.push(stream)
+    this._mediaStreams.set(peerId, list)
+  }
+
+  async _getTransferRecord(id) {
+    try {
+      const bee = await this.engine.getBee('transfers')
+      const entry = await bee.get(id)
+      return entry && entry.value
+    } catch {
+      return null
     }
   }
 
