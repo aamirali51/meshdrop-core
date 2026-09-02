@@ -92,6 +92,10 @@ await engine.offerFile(peer.publicKey, '/absolute/path/to/file.bin')
   dir and are atomically renamed after checksum verification. Resume and
   cancellation are supported (same core, stored byte offset).
 
+📖 **[Internals deep-dive](docs/INTERNALS.md)** — how pairing, the relay
+fallback, the three transfer paths, and watch party media actually work,
+with an honest security-model section.
+
 ## Test (no Electron required)
 
 ```sh
