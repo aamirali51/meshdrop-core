@@ -222,8 +222,17 @@ async function runChild(role, config) {
     const peer = await engine.pairWithCode(config.code, { timeoutMs: PAIR_TIMEOUT_MS })
     hostPeerKey = peer.publicKey
     send({ type: 'paired', peer })
-    const record = await engine.offerFile(peer.publicKey, config.sourcePath)
-    send({ type: 'offered', transferId: record.id, filename: record.filename })
+    try {
+      const record = await engine.offerFile(peer.publicKey, config.sourcePath)
+      send({ type: 'offered', transferId: record.id, filename: record.filename })
+    } catch (err) {
+      send({
+        type: 'offerError',
+        message: String((err && err.message) || err),
+        peerConnected: engine.peers.has(peer.publicKey),
+        peerCount: engine.peers.size
+      })
+    }
   }
 
   // Keep the process alive until the orchestrator says stop.
@@ -460,7 +469,16 @@ async function main() {
     // ── 3. Joiner offers a file to the host ──────────────────────────────
     if (hostSawJoiner && joinerSawHost) {
       console.log('[test] offering file from joiner -> host...')
-      const offered = await joiner.waitFor((m) => m.type === 'offered', 30 * 1000, 'joiner offerFile')
+      const offered = await joiner.waitFor(
+        (m) => m.type === 'offered' || m.type === 'offerError',
+        30 * 1000,
+        'joiner offerFile'
+      )
+      if (offered.type === 'offerError') {
+        throw new Error(
+          `offerFile failed: ${offered.message} | peerConnected=${offered.peerConnected} peerCount=${offered.peerCount}`
+        )
+      }
       const offerReceived = await host.waitFor(
         (m) => m.type === 'offer',
         TRANSFER_TIMEOUT_MS,

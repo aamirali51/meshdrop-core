@@ -15,12 +15,19 @@ class RelayClient {
    * @param {string} [opts.mode]         'auto' | 'relay-primary' | 'direct-only'
    * @param {string} [opts.localPeerId]  Hex noise public key of this device
    * @param {function} [opts.onMessage]   (topic, msg, fromPeerId) => void
+   * @param {object} [opts.http]         Injected HTTP transport { post(url, bodyObj), get(url) }
+   *                                     for runtimes without global fetch/WebSocket
+   *                                     (the Android Bare worklet proxies through
+   *                                     the React Native bridge). When provided it
+   *                                     is the ONLY path used — polling covers all
+   *                                     inbound delivery.
    */
   constructor(opts = {}) {
     this.baseUrl = (opts.relayUrl || DEFAULT_RELAY_URL).replace(/\/+$/, '')
     this.mode = opts.mode || 'auto' // 'auto' | 'relay-primary' | 'direct-only'
     this.localPeerId = opts.localPeerId || ''
     this.onMessage = opts.onMessage || (() => {})
+    this.http = opts.http || null
     this.topics = new Set() // Set of active topic strings (e.g. 'p2p-pair-MD-XXXX...')
     this.sockets = new Map() // topic -> WebSocket instance
     this.pollTimers = new Map() // topic -> interval timer
@@ -131,6 +138,15 @@ class RelayClient {
 
     this.seenMessageIds.add(msgId)
 
+    // Injected HTTP transport (Android Bare worklet): the bridge performs the
+    // request on the RN thread. Polling is the inbound path, so this alone is
+    // fully functional — no WebSocket needed.
+    if (this.http) {
+      const httpUrl = `${this.baseUrl}/poll?topic=${encodeURIComponent(topic)}`
+      Promise.resolve(this.http.post(httpUrl, msg)).catch(() => {})
+      return true
+    }
+
     // 1. Send via WebSocket if open. While the socket is still CONNECTING
     //    (lazy start), buffer instead — a pairing challenge fires immediately
     //    after start() and must not be lost to the handshake window.
@@ -167,10 +183,16 @@ class RelayClient {
       if (!this.started || !this.topics.has(topic)) return
       const httpUrl = `${this.baseUrl}/poll?topic=${encodeURIComponent(topic)}`
       try {
-        if (typeof fetch !== 'function') return
-        const res = await fetch(httpUrl)
-        if (!res.ok) return
-        const body = await res.json()
+        let body = null
+        if (this.http) {
+          // Injected transport (Android Bare worklet — no global fetch).
+          body = await Promise.resolve(this.http.get(httpUrl))
+        } else {
+          if (typeof fetch !== 'function') return
+          const res = await fetch(httpUrl)
+          if (!res.ok) return
+          body = await res.json()
+        }
         if (body && Array.isArray(body.messages)) {
           for (const m of body.messages) {
             if (!m || !m.data) continue

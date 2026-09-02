@@ -162,7 +162,76 @@ async function runAllTests() {
   console.log('======================================================\n')
 
   if (failed > 0) process.exit(1)
-  process.exit(0)
+  runRelayHttpTests()
+}
+
+// ── Relay HTTP transport (Android Bare worklet path) ───────────────────────
+// The worklet has no global fetch/WebSocket; RelayClient must work through an
+// injected { post, get } transport. This is what makes cellular pairing work.
+function runRelayHttpTests() {
+  console.log('\n======================================================')
+  console.log('         RELAY HTTP TRANSPORT TESTS                  ')
+  console.log('======================================================\n')
+
+  const { RelayClient } = require('./connections/relayClient.js')
+
+  const posted = []
+  let getResponse = { messages: [] }
+  let getPicked = null
+  const delivered = []
+  const client = new RelayClient({
+    mode: 'auto',
+    localPeerId: 'self-key',
+    http: {
+      post: async (url, body) => {
+        posted.push({ url, body })
+        return { ok: true }
+      },
+      get: async (url) => {
+        getPicked = url
+        return getResponse
+      }
+    }
+  })
+  client.onMessage = (topic, data, fromPeerId) => delivered.push({ topic, data, fromPeerId })
+  client.setPeerId('self-key')
+
+  // Seed an inbound message BEFORE joining: the immediate first poll must
+  // deliver it through the injected transport.
+  getResponse = {
+    messages: [
+      {
+        id: 'in1',
+        topic: 'p2p-pair-MD-TEST-TEST-TEST-TEST',
+        fromPeerId: 'other-key',
+        data: { type: 'PAIRING_RESP', nonce: 'n', mac: 'm' },
+        ts: 1
+      }
+    ]
+  }
+
+  client.start()
+  client.join('p2p-pair-MD-TEST-TEST-TEST-TEST')
+  client.send('p2p-pair-MD-TEST-TEST-TEST-TEST', {
+    type: 'PAIRING_CHALLENGE',
+    codeId: 'cid',
+    nonce: randomBytes(16).toString('hex')
+  })
+
+  setTimeout(() => {
+    assert(
+      'send() goes through the injected http.post',
+      posted.length === 1 && /p2p-pair-MD-TEST/.test(posted[0].url) && posted[0].body.data.type === 'PAIRING_CHALLENGE'
+    )
+    assert('poll() goes through the injected http.get', !!getPicked && /p2p-pair-MD-TEST/.test(getPicked))
+    assert(
+      'Inbound message delivered via injected transport',
+      delivered.length === 1 && delivered[0].data.type === 'PAIRING_RESP' && delivered[0].fromPeerId === 'other-key'
+    )
+
+    console.log('  RELAY HTTP TRANSPORT: 3 checks')
+    process.exit(0)
+  }, 300)
 }
 
 runAllTests().catch((err) => {

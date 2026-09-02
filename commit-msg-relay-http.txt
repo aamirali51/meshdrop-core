@@ -1,0 +1,27 @@
+Relay HTTP transport injection + pairing drive + poll backoff
+
+The Bare worklet (Android) has no global fetch/WebSocket, so the relay
+client was inert there — pairing over cellular (CGNAT) could never
+work: challenges never left the phone and DHT direct cannot punch
+cellular-CGNAT to home-NAT.
+
+- RelayClient accepts an injected { post, get } HTTP transport; when
+  present it is the only delivery path (KV polling covers all inbound).
+- MeshEngine passes config.relayHttp through (the mobile worklet
+  proxies relay HTTP through the React Native bridge, which has real
+  fetch).
+- pairWithCode drives pairing every 5s until settled: forced challenge
+  re-announce + reconnectKnownPeers, so a missed DHT connect or a
+  suppressed first challenge cannot stall pairing (verified: the
+  re-pair-after-deletion e2e flake).
+- Relay poll cadence: 1.2s during the first 90s of a topic, then 5s —
+  an unpaced 1.2s poll on the permanent host-code topic exhausted the
+  KV free daily read quota (the deployed relay's GET /poll returning
+  empty).
+- test.js: the joiner's offerFile failure now reports the actual error
+  + peer state instead of a bare timeout.
+
+Tests: relay HTTP transport checks (send/poll/inbound via the injected
+transport) added to the pairing suite; full suite green.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>

@@ -203,7 +203,11 @@ class MeshEngine extends EventEmitter {
     this.customRelayUrl = config.customRelayUrl || config.relayUrl || ''
     this.relayClient = new RelayClient({
       relayUrl: this.customRelayUrl,
-      mode: this.relayMode
+      mode: this.relayMode,
+      // Injected HTTP transport for runtimes without global fetch/WebSocket
+      // (the Android Bare worklet proxies relay requests through the RN
+      // bridge). Null on desktop — the global fetch/WS path is used.
+      http: config.relayHttp || null
     })
     this.expirationTimer = null
     // Set when refreshNetwork() finds the DHT unreachable (dead network, no
