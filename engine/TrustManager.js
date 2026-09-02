@@ -349,18 +349,20 @@ class TrustManager {
     // probe them so the host can identify itself without a fresh handshake.
     this._probeTrustedPeers(cleanCode, cid, trustedIds)
 
-    // Broadcast challenge via Cloudflare WSS Relay immediately for Port 443 fallback
+    // Broadcast challenge via Cloudflare WSS Relay immediately for Port 443 fallback.
+    // Joiner intent: the user just entered a code — bring the relay up right
+    // away so the challenge reaches the host even in lazy-'auto' mode.
     const relayNonce = randomBytes(16)
     this.relayOutstanding.push({ nonce: relayNonce, code: cleanCode, codeId: cid, sentAt: now })
     if (this.relayClient) {
+      this.relayClient.start()
+      // NOTE: no device identity here on purpose — the relay is metadata
+      // untrusted. The host answers with its identity only after proving it
+      // holds the code, and the code topic itself is the capability.
       this.relayClient.send(`p2p-pair-${cleanCode}`, {
         type: MESSAGES.PAIRING_CHALLENGE,
         codeId: cid,
-        nonce: b4a.toString(relayNonce, 'hex'),
-        identity: {
-          ...(this.getDeviceIdentity ? this.getDeviceIdentity() : {}),
-          publicKey: this.getPeerId ? this.getPeerId() : ''
-        }
+        nonce: b4a.toString(relayNonce, 'hex')
       })
       // Send again shortly in case the remote host's WebSocket connection just opened
       setTimeout(() => {
@@ -368,11 +370,7 @@ class TrustManager {
           this.relayClient.send(`p2p-pair-${cleanCode}`, {
             type: MESSAGES.PAIRING_CHALLENGE,
             codeId: cid,
-            nonce: b4a.toString(relayNonce, 'hex'),
-            identity: {
-              ...(this.getDeviceIdentity ? this.getDeviceIdentity() : {}),
-              publicKey: this.getPeerId ? this.getPeerId() : ''
-            }
+            nonce: b4a.toString(relayNonce, 'hex')
           })
         }
       }, 600)
@@ -446,7 +444,7 @@ class TrustManager {
       if (typeof msg.codeId !== 'string' || typeof msg.nonce !== 'string') return
       const secret = this.pairingSecrets.get(msg.codeId)
       if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) return
-      
+
       const nonceBuf = b4a.from(msg.nonce, 'hex')
       if (nonceBuf.length !== 16) return
       const signature = mac(secret.code, nonceBuf)
@@ -463,6 +461,30 @@ class TrustManager {
             publicKey: this.getPeerId ? this.getPeerId() : ''
           }
         })
+
+        // Reciprocate over the relay so trust completes on BOTH sides: our
+        // answer alone only satisfies the challenger. The peer here proved
+        // knowledge of the code topic — clear any unanswered-pairing
+        // suppression (this is pairing activity we can complete) and challenge
+        // them back; only a peer that genuinely holds the code can answer.
+        // Skipped once the peer is already trusted (no ping-pong).
+        const peerPubKey =
+          typeof fromPeerId === 'string' && fromPeerId.length === 64 ? fromPeerId : ''
+        this.unansweredPairings.delete(peerPubKey)
+        if (peerPubKey && !this.isTrustedPublicKey(peerPubKey)) {
+          const myNonce = randomBytes(16)
+          this.relayOutstanding.push({
+            nonce: myNonce,
+            code: secret.code,
+            codeId: secret.codeId,
+            sentAt: Date.now()
+          })
+          this.relayClient.send(topic, {
+            type: MESSAGES.PAIRING_CHALLENGE,
+            codeId: secret.codeId,
+            nonce: b4a.toString(myNonce, 'hex')
+          })
+        }
       }
       return
     }
@@ -623,11 +645,14 @@ class TrustManager {
   _recordUnansweredPairing(peerId) {
     const entry = this.unansweredPairings.get(peerId) || { count: 0, suppressUntil: 0 }
     entry.count += 1
-    const backoffMs = Math.min(60 * 1000 * Math.pow(2, entry.count - 1), 30 * 60 * 1000)
+    // First window is short (15s): a peer that registers a code mid-backoff
+    // (the re-pair race) must recover within a normal pairing timeout. The
+    // ladder still decays to a 30min cap, which is what breaks the loop.
+    const backoffMs = Math.min(15 * 1000 * Math.pow(2, entry.count - 1), 30 * 60 * 1000)
     entry.suppressUntil = Date.now() + backoffMs
     this.unansweredPairings.set(peerId, entry)
     console.log(
-      `[MeshEngine] No pairing response from ${peerId.slice(0, 12)}... after ${entry.count} attempt(s) — automatic challenges paused for ${Math.round(backoffMs / 60000)} min (enter a code to pair immediately)`
+      `[MeshEngine] No pairing response from ${peerId.slice(0, 12)}... after ${entry.count} attempt(s) — automatic challenges paused for ${Math.round(backoffMs / 1000)}s (enter a code to pair immediately)`
     )
   }
 

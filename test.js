@@ -211,6 +211,10 @@ async function runChild(role, config) {
   })
 
   await engine.start()
+  // Pairing intent: in the app this fires when the pairing screen opens —
+  // the relay fallback engages immediately (lazy 'auto' mode) instead of
+  // waiting out the 30s zero-peer window, so pairing timing matches the UX.
+  engine.setPairingIntent(true)
   send({ type: 'ready', identity: engine.getIdentity() })
 
   if (role === 'joiner') {

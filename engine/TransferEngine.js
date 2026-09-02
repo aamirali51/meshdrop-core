@@ -296,10 +296,11 @@ class TransferEngine {
       createdAt: new Date().toISOString()
     }
 
-    // Sync-tagged transfers (SyncEngine): keep the source on the record so the
-    // offer carries it and the UI can distinguish sync traffic from one-shots.
+    // Sync/stream-tagged transfers keep the source on the record so the offer
+    // carries it and the UI can distinguish them from one-shot core staging.
     if (params.source) transfer.source = params.source
     transfer.isSync = !!(params.isSync || params.source === 'sync')
+    if (params.source === 'stream') transfer.isStream = true
     if (params.syncLibraryId) transfer.syncLibraryId = params.syncLibraryId
     if (params.syncLibraryName) transfer.syncLibraryName = params.syncLibraryName
     if (params.syncRelPath) transfer.syncRelPath = params.syncRelPath
@@ -384,8 +385,10 @@ class TransferEngine {
     const filePath = transfer.filePath
     const fileSize = transfer.fileSize
 
-    // Sync transfers stream from the source file — no exchange-store clone.
-    if (transfer.source === 'sync' || transfer.isSync) {
+    // Sync and stream transfers read the source file directly over a dedicated
+    // protomux channel — no exchange-store clone on the sender, no core
+    // replication on the receiver.
+    if (transfer.source === 'sync' || transfer.isSync || transfer.isStream) {
       return this._runSendSync(transfer)
     }
 
@@ -594,6 +597,11 @@ class TransferEngine {
       offer.syncMtimeMs = transfer.syncMtimeMs
       offer.syncAuthorKey = transfer.syncAuthorKey
     }
+    // Stream offers (1:1 sends): the payload arrives over the stream channel,
+    // so the receiver must know to expect blocks instead of core blocks.
+    if (transfer.source === 'stream') {
+      offer.source = 'stream'
+    }
 
     let sent = 0
     const sendTo = (peerId, peerObj) => {
@@ -621,10 +629,14 @@ class TransferEngine {
     const { transferId, filename, fileSize, fileType, coreKey, senderIdentity, transferMethod } =
       offer
 
-    // Sync-stream offers carry no coreKey — the blocks arrive over the stream
+    // Sync/stream offers carry no coreKey — the blocks arrive over the stream
     // channel, not from a replicated core.
     const isSyncOffer = offer.source === 'sync'
-    if (!transferId || (typeof coreKey !== 'string' || coreKey.length !== 64) && !isSyncOffer) {
+    const isStreamOffer = offer.source === 'stream'
+    if (
+      !transferId ||
+      (typeof coreKey !== 'string' || coreKey.length !== 64) && !isSyncOffer && !isStreamOffer
+    ) {
       console.warn('[TransferEngine] Rejecting malformed TRANSFER_OFFER (bad coreKey/transferId)')
       return null
     }
@@ -643,7 +655,7 @@ class TransferEngine {
     // attached when the transfer starts (see _runReceiveSync). If the offer is
     // rejected below, the channel is closed again.
     let syncChan = null
-    if (isSyncOffer && offer.senderPeerId) {
+    if ((isSyncOffer || isStreamOffer) && offer.senderPeerId) {
       const peerObj = this.getPeers().get(offer.senderPeerId)
       if (peerObj && peerObj.connection) {
         const reg = { control: null, manifest: null, block: null, ack: null, close: null, error: null }
@@ -722,7 +734,7 @@ class TransferEngine {
       isEncrypted: true,
       isClaim: !!isClaim,
       isSync,
-      source: isSync ? 'sync' : undefined,
+      source: isSync ? 'sync' : isStreamOffer ? 'stream' : undefined,
       syncLibraryId: offer.syncLibraryId || '',
       syncRelPath: offer.syncRelPath || '',
       // The sender's recorded mtime for this file. Without it the receiver's
@@ -867,8 +879,8 @@ class TransferEngine {
     const { fsp, path } = this
     const id = transfer.id
 
-    // Sync transfers receive over the stream channel — no replicated core.
-    if (transfer.source === 'sync' || transfer.isSync) {
+    // Sync and stream transfers receive over the stream channel — no replicated core.
+    if (transfer.source === 'sync' || transfer.isSync || transfer.source === 'stream') {
       return this._runReceiveSync(transfer)
     }
 
@@ -1324,7 +1336,7 @@ class TransferEngine {
             peakSpeed,
             eta,
             source: transfer.source,
-            isSync: true,
+            isSync: !!(transfer.isSync || transfer.source === 'sync'),
             syncLibraryId: transfer.syncLibraryId
           })
         }
@@ -1538,7 +1550,7 @@ class TransferEngine {
           peakSpeed,
           eta,
           source: transfer.source,
-          isSync: true,
+          isSync: !!(transfer.isSync || transfer.source === 'sync'),
           syncLibraryId: transfer.syncLibraryId
         })
       }

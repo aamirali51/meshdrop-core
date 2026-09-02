@@ -27,6 +27,10 @@ class RelayClient {
     this.seenMessageIds = new Set()
     this.started = false
     this.reconnectTimers = new Map()
+    // topic -> [{ msg, ts }]: sends that fired while the WebSocket was still
+    // CONNECTING (lazy start: a pairing challenge fires right after start()).
+    // Flushed on open; dropped after RELAY_SEND_TTL.
+    this.pendingSends = new Map()
   }
 
   setPeerId(peerId) {
@@ -75,6 +79,7 @@ class RelayClient {
       clearInterval(timer)
     }
     this.pollTimers.clear()
+    this.pendingSends.clear()
     for (const [, ws] of this.sockets.entries()) {
       try {
         ws.close()
@@ -95,6 +100,7 @@ class RelayClient {
   leave(topic) {
     if (!topic) return
     this.topics.delete(topic)
+    this.pendingSends.delete(topic)
     if (this.reconnectTimers.has(topic)) {
       clearTimeout(this.reconnectTimers.get(topic))
       this.reconnectTimers.delete(topic)
@@ -125,7 +131,9 @@ class RelayClient {
 
     this.seenMessageIds.add(msgId)
 
-    // 1. Send via WebSocket if open
+    // 1. Send via WebSocket if open. While the socket is still CONNECTING
+    //    (lazy start), buffer instead — a pairing challenge fires immediately
+    //    after start() and must not be lost to the handshake window.
     const ws = this.sockets.get(topic)
     if (ws && ws.readyState === 1 /* OPEN */) {
       try {
@@ -133,6 +141,11 @@ class RelayClient {
       } catch (err) {
         console.warn('[RelayClient] WSS send error:', err.message)
       }
+    } else if (ws && ws.readyState === 0 /* CONNECTING */) {
+      const q = this.pendingSends.get(topic) || []
+      q.push({ msg, ts: Date.now() })
+      if (q.length > 32) q.shift()
+      this.pendingSends.set(topic, q)
     }
 
     // 2. Publish to Cloudflare Global KV via HTTP POST
@@ -204,6 +217,17 @@ class RelayClient {
 
       ws.onopen = () => {
         console.log(`[RelayClient] Connected to Cloudflare WSS relay for topic: ${topic}`)
+        // Flush sends buffered while the socket was connecting (lazy start).
+        const q = this.pendingSends.get(topic)
+        if (q && q.length) {
+          this.pendingSends.set(topic, [])
+          for (const { msg, ts } of q) {
+            if (Date.now() - ts > 30000) continue // stale — past the nonce challenge window
+            try {
+              ws.send(JSON.stringify(msg))
+            } catch {}
+          }
+        }
       }
 
       ws.onmessage = (event) => {

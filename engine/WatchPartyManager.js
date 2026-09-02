@@ -612,15 +612,23 @@ class WatchPartyManager extends EventEmitter {
   _broadcastAnnouncement(action = 'create') {
     if (!this.activeRoom) return
     const hostIdentity = this.engine.storage?.getDeviceIdentity?.() || {}
-    const msg = {
-      type: 'WATCH_ROOM_ANNOUNCE',
-      action,
-      roomCode: this.activeRoom.roomCode,
-      title: this.activeRoom.title,
-      hostName: hostIdentity.name || 'Host',
-      timestamp: Date.now()
+    // Discovery needs the room code (it IS the join capability), but the
+    // human-readable details only go to PAIRED peers — untrusted strangers on
+    // the swarm learn that a party exists, not who hosts it or what's playing.
+    for (const [, peerObj] of this.engine.peers?.entries() || []) {
+      if (!peerObj || !peerObj.signaling || typeof peerObj.signaling.send !== 'function') continue
+      const trusted = !!(peerObj.pairing && peerObj.pairing.trusted)
+      try {
+        peerObj.signaling.send({
+          type: 'WATCH_ROOM_ANNOUNCE',
+          action,
+          roomCode: this.activeRoom.roomCode,
+          title: trusted || action === 'close' ? this.activeRoom.title : 'Watch Party',
+          hostName: trusted ? hostIdentity.name || 'Host' : undefined,
+          timestamp: Date.now()
+        })
+      } catch {}
     }
-    this._broadcastToAllPeers(msg)
   }
 
   _broadcastRoomMessage(msg) {

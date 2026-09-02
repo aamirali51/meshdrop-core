@@ -27,6 +27,7 @@ const { createConnections, getTransferMethod } = require('./connections/index.js
 const { RelayClient } = require('./connections/relayClient.js')
 
 const PAIR_WAIT_TIMEOUT = 60 * 1000 // max time pairWithCode waits for verification
+const RELAY_FALLBACK_MS = 30 * 1000 // 'auto': relay engages after this long with zero direct peers
 const EXPIRATION_INTERVAL_MS = 10 * 1000
 
 // Expiration presets for one-time DROP shares. Single source of truth so the
@@ -665,7 +666,17 @@ class MeshEngine extends EventEmitter {
     this.started = true
     if (this.relayClient) {
       this.relayClient.setPeerId(this.peerId)
-      this.relayClient.start()
+      if (this.relayMode === 'relay-primary') {
+        this.relayClient.start()
+      } else if (this.relayMode === 'auto') {
+        // Privacy default: the relay is a FALLBACK for networks where direct
+        // DHT connectivity fails — not an always-on phone-home. It engages
+        // on pairing intent (setPairingIntent — pairing screen open / code
+        // entered, which also starts it from TrustManager.registerJoinerCode)
+        // or when the swarm has run with zero peers, the signature of a
+        // challenged network. 'direct-only' never starts it.
+        this._armRelayFallback()
+      }
     }
     console.log('[MeshEngine] ready')
     return this
@@ -676,6 +687,10 @@ class MeshEngine extends EventEmitter {
     this.started = false
     console.log('[MeshEngine] stopping...')
     if (this.relayClient) this.relayClient.stop()
+    if (this._relayFallbackTimer) {
+      clearTimeout(this._relayFallbackTimer)
+      this._relayFallbackTimer = null
+    }
     // Stop the unref'd maintenance intervals (reconnectKnownPeers, sendPings)
     // so they never touch the stores while we tear down below.
     if (this.connections && typeof this.connections.teardown === 'function') {
@@ -841,7 +856,10 @@ class MeshEngine extends EventEmitter {
       peerName: peerObj?.device?.name || 'Unknown',
       filePath,
       filename: path.basename(filePath),
-      fileSize: stats.size
+      fileSize: stats.size,
+      // 1:1 sends stream straight from disk (no full copy staged into the
+      // exchange store) — the same zero-duplication path folder sync uses.
+      source: 'stream'
     })
   }
 
@@ -1299,6 +1317,37 @@ class MeshEngine extends EventEmitter {
       console.warn('[MeshEngine] setCustomRelayUrl persist failed:', err.message)
     }
     return this.customRelayUrl
+  }
+
+  // ─── Relay availability (privacy: the relay is a fallback, not a beacon) ──
+
+  // Arm the connectivity fallback: in 'auto' mode the relay starts only when
+  // the swarm has been up with ZERO peers for the fallback window — the
+  // signature of a network where direct DHT connectivity cannot work.
+  _armRelayFallback() {
+    if (this._relayFallbackTimer) return
+    this._relayFallbackTimer = setTimeout(() => {
+      this._relayFallbackTimer = null
+      if (!this.started || this.relayMode === 'direct-only') return
+      if (this.peers.size > 0) return // direct connectivity works — stay quiet
+      console.log('[MeshEngine] No direct peers — enabling relay fallback')
+      this.relayClient.start()
+    }, RELAY_FALLBACK_MS)
+    if (this._relayFallbackTimer.unref) this._relayFallbackTimer.unref()
+  }
+
+  /**
+   * Signal pairing intent (pairing screen opened on this device). In 'auto'
+   * mode this brings the relay up immediately so a remote device on a
+   * challenged network can reach us for pairing. Sticky: closing the screen
+   * does not yank the relay out from under an in-flight pairing.
+   */
+  setPairingIntent(active = true) {
+    this._pairingIntent = !!active
+    if (this._pairingIntent && this.started && this.relayClient && this.relayMode !== 'direct-only') {
+      this.relayClient.start()
+    }
+    return this._pairingIntent
   }
 
   getStatus() {
