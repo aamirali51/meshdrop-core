@@ -188,11 +188,22 @@ class RelayClient {
       } catch {}
     }
 
-    // Run immediate poll, then every 1200ms
-    poll()
-    const timer = setInterval(poll, 1200)
-    if (timer.unref) timer.unref()
-    this.pollTimers.set(topic, timer)
+    // Run an immediate poll, then 1.2s while the topic is "hot" (first 90s —
+    // an active pairing window), backing off to 5s after that. A permanent
+    // host-code topic polls for the lifetime of the relay session, and an
+    // unpaced 1.2s interval burns through Cloudflare KV's free daily read
+    // quota in ~a day, which kills the KV path for everyone.
+    let hotUntil = Date.now() + 90 * 1000
+    const tick = async () => {
+      if (!this.started || !this.topics.has(topic)) return
+      await poll()
+      if (!this.started || !this.topics.has(topic)) return
+      const delay = Date.now() < hotUntil ? 1200 : 5000
+      const timer = setTimeout(tick, delay)
+      if (timer.unref) timer.unref()
+      this.pollTimers.set(topic, timer)
+    }
+    tick()
   }
 
   _connectTopic(topic) {

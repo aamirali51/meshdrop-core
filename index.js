@@ -27,6 +27,7 @@ const { createConnections, getTransferMethod } = require('./connections/index.js
 const { RelayClient } = require('./connections/relayClient.js')
 
 const PAIR_WAIT_TIMEOUT = 60 * 1000 // max time pairWithCode waits for verification
+const PAIR_DRIVE_INTERVAL_MS = 5 * 1000 // pairWithCode re-announces challenges + reconnects on this cadence
 const RELAY_FALLBACK_MS = 30 * 1000 // 'auto': relay engages after this long with zero direct peers
 const EXPIRATION_INTERVAL_MS = 10 * 1000
 
@@ -757,10 +758,12 @@ class MeshEngine extends EventEmitter {
     return new Promise((resolve, reject) => {
       let settled = false
       let gotPairingFailure = false
+      let drive = null
       const finish = (fn, value) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        if (drive) clearInterval(drive)
         this.removeListener(EVENTS.TRUST_PAIRED, onPaired)
         this.removeListener(EVENTS.PEER_DISCONNECTED, onDisconnected)
         this.removeListener(EVENTS.TRUST_REVOKED, onRevoked)
@@ -819,6 +822,21 @@ class MeshEngine extends EventEmitter {
         )
       }, timeoutMs)
       if (timer.unref) timer.unref()
+      // Actively DRIVE the pairing instead of waiting passively: re-announce
+      // our challenge to every connected peer and re-attempt direct
+      // connectivity to the host. One missed DHT connect or a suppressed
+      // first challenge must not stall the whole pairing — this is what makes
+      // re-pairing after deletion robust against relay/DHT flakiness.
+      drive = setInterval(() => {
+        if (settled) return
+        try {
+          this.trustManager.sendChallengesToAll({ force: true })
+          if (this.connections && typeof this.connections.reconnectKnownPeers === 'function') {
+            this.connections.reconnectKnownPeers().catch(() => {})
+          }
+        } catch {}
+      }, PAIR_DRIVE_INTERVAL_MS)
+      if (drive.unref) drive.unref()
       this.on(EVENTS.TRUST_PAIRED, onPaired)
       this.on(EVENTS.PEER_DISCONNECTED, onDisconnected)
       this.on(EVENTS.TRUST_REVOKED, onRevoked)

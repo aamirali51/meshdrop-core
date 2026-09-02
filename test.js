@@ -844,9 +844,22 @@ async function main() {
 
     // The receiver must stamp the sender's ORIGINAL mtime onto the received
     // file. With the regression the dest keeps its write-time mtime and every
-    // re-sync re-uploads it forever.
+    // re-sync re-uploads it forever. The stat is retried briefly: the rename
+    // into destPath happens BEFORE the completed event, but a concurrent
+    // retry's overwrite can momentarily win the race on Windows.
+    const statWait = async (p) => {
+      for (let i = 0; i < 20; i++) {
+        try {
+          return await fs.promises.stat(p)
+        } catch (err) {
+          if (!/ENOENT/i.test(String(err.code))) throw err
+          await new Promise((r) => setTimeout(r, 100))
+        }
+      }
+      return fs.statSync(p) // final attempt — throws if genuinely missing
+    }
     for (const m of resyncCompletions) {
-      const st = fs.statSync(m.destPath)
+      const st = await statWait(m.destPath)
       ok(
         `dest mtime stamped to sender's original (${path.basename(m.destPath)})`,
         Math.abs(st.mtimeMs - oldStamp.getTime()) < 2000,
