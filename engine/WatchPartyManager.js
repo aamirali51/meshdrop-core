@@ -431,6 +431,14 @@ class WatchPartyManager extends EventEmitter {
     const exchangeStore = this.engine.storage && this.engine.storage.exchangeStore
     if (!peerObj || !peerObj.connection || !exchangeStore) return
 
+    // A party media connection may never verify a pairing challenge (guests
+    // join by room code, not pairing): drop the watchdog so a long transfer is
+    // not killed mid-stream — the same contract the claims flow uses.
+    if (peerObj.pairing && peerObj.pairing.timeout) {
+      clearTimeout(peerObj.pairing.timeout)
+      peerObj.pairing.timeout = null
+    }
+
     try {
       const core = exchangeStore.get({ name: room.shareId })
       await core.ready()
@@ -513,11 +521,17 @@ class WatchPartyManager extends EventEmitter {
     }
 
     // Receive side of the per-core replication (pairs with the host's open).
-    // One stream per peer per connection — a rejoin must reuse it.
+    // One stream per peer per connection — a rejoin must reuse it. Like the
+    // host side (and claims), drop the pairing watchdog: an unpaired guest's
+    // media transfer must not be killed mid-stream by the 30s challenge timer.
     try {
       const peerObj = this.engine.peers ? this.engine.peers.get(peerId) : null
       const exchangeStore = this.engine.storage && this.engine.storage.exchangeStore
       if (peerObj && peerObj.connection && exchangeStore) {
+        if (peerObj.pairing && peerObj.pairing.timeout) {
+          clearTimeout(peerObj.pairing.timeout)
+          peerObj.pairing.timeout = null
+        }
         const core = exchangeStore.get(Buffer.from(coreKey, 'hex'))
         await core.ready()
         let stream = peerObj.partyMediaStream

@@ -119,16 +119,28 @@ function connectPeers(sideA, sideB) {
     }
   })
 
+  // Seed a pairing watchdog like the TrustManager arms for unpaired peers —
+  // the party media flow must drop it so long transfers survive (claims
+  // contract). A real timer handle keeps clearTimeout honest.
+  const watchdogA = setTimeout(() => {}, 10 * 60 * 1000)
+  const watchdogB = setTimeout(() => {}, 10 * 60 * 1000)
   sideA.peers.set(sideB.peerKey, {
     connection: connA,
     signaling: pipe(sideA, sideB),
-    device: { id: 'dev-' + sideB.peerKey, publicKey: sideB.peerKey, name: sideB.peerKey }
+    device: { id: 'dev-' + sideB.peerKey, publicKey: sideB.peerKey, name: sideB.peerKey },
+    pairing: { trusted: false, timeout: watchdogA }
   })
   sideB.peers.set(sideA.peerKey, {
     connection: connB,
     signaling: pipe(sideB, sideA),
-    device: { id: 'dev-' + sideA.peerKey, publicKey: sideA.peerKey, name: sideA.peerKey }
+    device: { id: 'dev-' + sideA.peerKey, publicKey: sideA.peerKey, name: sideA.peerKey },
+    pairing: { trusted: false, timeout: watchdogB }
   })
+}
+
+function pairingWatchdogOf(side, otherPeerKey) {
+  const peerObj = side.peers.get(otherPeerKey)
+  return peerObj && peerObj.pairing ? peerObj.pairing.timeout : undefined
 }
 
 function waitFor(fn, timeoutMs = 20000, label = 'condition') {
@@ -218,6 +230,11 @@ async function runAllTests() {
 
     const received = await fsp.readFile(completedA.destPath)
     assert('Received media is byte-identical', received.length === mediaBytes.length && received.equals(mediaBytes))
+    assert(
+      'Pairing watchdog dropped on both sides (unpaired transfer survives)',
+      pairingWatchdogOf(host, guestA.peerKey) === null && pairingWatchdogOf(guestA, host.peerKey) === null,
+      'host: ' + String(pairingWatchdogOf(host, guestA.peerKey)) + ' guest: ' + String(pairingWatchdogOf(guestA, host.peerKey))
+    )
 
     // Playback sync flows alongside the media transfer.
     host.watchParty.broadcastPlaybackState({ action: 'play', positionSec: 42.5 })
