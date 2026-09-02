@@ -603,6 +603,37 @@ async function main() {
     const flatName = claimCompletions.find((m) => m.destPath.endsWith('sub_drop-b.bin'))
     ok('nested path flattened to safe filename', !!flatName, flatName ? flatName.destPath : 'missing')
 
+    // ── 6b. Swarm distribution: the claimer re-seeds the drop ────────────
+    // The joiner now holds the share's verified cores. The HOST claims the
+    // same code back — the joiner must answer as a SEEDER and serve the
+    // blocks, so the host completes the download without touching its own
+    // staged cores. This is what keeps a 50-download drop from hammering
+    // the original host.
+    console.log('[test] swarm distribution: host claims back from the seeder...')
+    const hostBeforeSeed = host.lines.length
+    host.proc.stdin.write(JSON.stringify({ cmd: 'claim', code: multiDrop.code }) + '\n')
+    const hostSeedCompletions = await waitForCount(
+      host,
+      (m) => m.type === 'completed' && m.transferId && m.transferId.startsWith('claim-'),
+      2,
+      TRANSFER_TIMEOUT_MS + 60 * 1000,
+      'host seeder-claim transfers',
+      hostBeforeSeed
+    )
+    ok(
+      'host re-claimed via the seeder (2 files)',
+      hostSeedCompletions.length === 2,
+      `${hostSeedCompletions.length}/2`
+    )
+
+    const seededByHash = new Map()
+    for (const m of hostSeedCompletions) {
+      const h = await sha256File(m.destPath)
+      seededByHash.set(h, m.destPath)
+    }
+    ok('seeder-served #1 content matches (sha256)', seededByHash.has(hashA), hashA.slice(0, 16))
+    ok('seeder-served #2 content matches (sha256)', seededByHash.has(hashB), hashB.slice(0, 16))
+
     // ── 7. Folder DROP claim (folderPath → recursive enumeration) ───────
     console.log('[test] writing folder share (root file + nested file)...')
     const folderRoot = path.join(tmpRoot, 'share-folder')

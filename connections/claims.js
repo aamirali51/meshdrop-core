@@ -12,6 +12,13 @@ const { EVENTS, MESSAGES, dropTopic } = require('../protocol.js')
 function createClaims(ctx) {
   const { engine, peers, activeClaims } = ctx
 
+  // Swarm distribution registry: code -> { shareId, files } for drops this
+  // peer has fully claimed and hash-verified. A registered peer answers
+  // CLAIM_FILE_REQ as a seeder — it serves the verified blocks to new
+  // claimers so a popular drop stops hammering the original host. In-memory
+  // by design: seeding is best-effort and dies with the app.
+  const completedClaims = new Map()
+
   async function handleClaimFileReq(peerId, msg) {
     const code = (msg.code || '').trim().toUpperCase()
     console.log(
@@ -38,6 +45,17 @@ function createClaims(ctx) {
 
     const peerObj = peers.get(peerId)
     if (!peerObj || !peerObj.signaling) return
+
+    // Swarm distribution: a peer that completed this claim serves the blocks
+    // to new claimers. Checked BEFORE the host share scan — a seeder is not
+    // the share's authority, so it never emits the failure response (only
+    // the host judges expiry/download caps); a seeder that cannot serve
+    // stays silent and the host's answer (if any) rules.
+    const seeded = completedClaims.get(code)
+    if (seeded && seeded.files.length > 0) {
+      await serveClaimFromSeeder(peerId, peerObj, code, seeded)
+      return
+    }
 
     if (!foundShare) {
       console.log(`[MeshEngine] CLAIM_FILE_REQ for ${code} not found or expired`)
@@ -131,6 +149,61 @@ function createClaims(ctx) {
 
   const pendingClaimOffers = new Map()
 
+  // Seeder serve: mirror of the host serve step (watchdog drop, per-core
+  // replication toward the requester, descriptor response) minus the share
+  // authority — the blocks this peer serves were already hash-verified on
+  // download, so a seeder cannot poison anything.
+  async function serveClaimFromSeeder(peerId, peerObj, code, seeded) {
+    try {
+      // A seeding connection never verifies a pairing challenge: drop the
+      // watchdog so long downloads are not killed mid-transfer.
+      if (peerObj.pairing && peerObj.pairing.timeout) {
+        clearTimeout(peerObj.pairing.timeout)
+        peerObj.pairing.timeout = null
+      }
+
+      peerObj.dropStreams = peerObj.dropStreams || []
+      for (const f of seeded.files) {
+        if (typeof f.coreKey !== 'string' || f.coreKey.length !== 64) continue
+        const core = engine.storage.exchangeStore.get(Buffer.from(f.coreKey, 'hex'))
+        await core.ready()
+        const stream = core.replicate(peerObj.connection, { live: true })
+        stream.on('error', () => {})
+        peerObj.dropStreams.push(stream)
+      }
+
+      console.log(
+        `[MeshEngine] Seeder serving drop ${code} to ${peerId.slice(0, 12)}... (${seeded.files.length} file(s))`
+      )
+      peerObj.signaling.send({
+        type: MESSAGES.CLAIM_FILE_RES,
+        code,
+        success: true,
+        offer: {
+          transferId: `claim-${seeded.shareId}`,
+          filename: seeded.files[0].filename,
+          fileSize: seeded.files.reduce((sum, f) => sum + (f.fileSize || 0), 0),
+          fileType: seeded.files[0].fileType || '',
+          files: seeded.files.map((f) => ({
+            filename: f.filename,
+            fileSize: f.fileSize,
+            fileType: f.fileType || '',
+            coreKey: f.coreKey,
+            manifestHash: f.manifestHash || '',
+            checksum: f.checksum || ''
+          })),
+          senderIdentity: engine.deviceIdentity,
+          transferMethod: 'internet',
+          shareId: seeded.shareId
+        }
+      })
+    } catch (err) {
+      // Seeder serve failed: stay SILENT — the real host (if reachable)
+      // answers, and a failure response here would wrongly kill the claim.
+      console.error('[MeshEngine] Seeder serve failed:', err.message)
+    }
+  }
+
   // Helper to start the actual download for chosen files
   async function startClaimDownload(peerId, offer, offerFiles, code) {
     const peerObj = peers.get(peerId)
@@ -140,13 +213,8 @@ function createClaims(ctx) {
 
     if (code) {
       activeClaims.delete(code)
-      if (!isGroup) {
-        try {
-          engine.topicRegistry.leave(dropTopic(code))
-        } catch {}
-      }
-      // The host answered: the placeholder "waiting for sender" row (if any)
-      // is superseded by the real offer(s) below.
+      // NOTE: the drop topic stays joined — once this claim completes, this
+      // peer seeds the share for the next claimer (swarm distribution).
       if (engine.transferEngine) {
         await engine.transferEngine.clearWaitingClaims({ code }).catch(() => {})
       }
@@ -178,9 +246,11 @@ function createClaims(ctx) {
       }
     }
 
-    // Auto-accept and start one transfer per file. When every transfer of
-    // this claim bundle reaches a terminal state, tell the host ONCE so it
-    // can tear the share down (cap reached) or keep it live (multi-download).
+    // Auto-accept and start one transfer per file. Transfer ids are
+    // DETERMINISTIC (claim-<shareId>-<i>): a second descriptor for the same
+    // share (host + seeder both answering) dedupes in receiveOffer instead
+    // of downloading everything twice. Cores stay open after completion —
+    // this peer seeds the share until the app restarts.
     const records = []
     for (let i = 0; i < offerFiles.length; i++) {
       const f = offerFiles[i]
@@ -188,19 +258,20 @@ function createClaims(ctx) {
       const record = await engine.transferEngine.receiveOffer(
         {
           ...f,
-          transferId: `claim-${offer.shareId}-${i}-${Date.now().toString(36)}`,
+          transferId: `claim-${offer.shareId || code}-${i}`,
           transferMethod: 'internet',
           isClaim: true,
           peerKey: peerId,
           shareId: offer.shareId
         },
-        { autoAccept: true, isClaim: true }
+        { autoAccept: true, isClaim: true, keepCoreOpen: true }
       )
       if (record) records.push(record.id)
     }
 
     if (records.length > 0) {
       const pending = new Set(records)
+      let allCompleted = true
       const cleanup = () => {
         engine.removeListener(EVENTS.TRANSFER_COMPLETED, onTerminal)
         engine.removeListener(EVENTS.TRANSFER_FAILED, onTerminal)
@@ -209,8 +280,14 @@ function createClaims(ctx) {
       const onTerminal = (rec) => {
         if (!rec || !pending.has(rec.id)) return
         pending.delete(rec.id)
+        if (rec.status !== 'completed') allCompleted = false
         if (pending.size === 0) {
           cleanup()
+          // Every file hash-verified on disk: register as a seeder so the
+          // next claimer pulls from us instead of hammering the host.
+          if (allCompleted && code && offer.shareId) {
+            completedClaims.set(code, { shareId: offer.shareId, files: offerFiles })
+          }
           const p = peers.get(peerId)
           if (p && p.signaling) {
             p.signaling.send({ type: MESSAGES.CLAIM_FILE_DONE, shareId: offer.shareId })
@@ -222,6 +299,9 @@ function createClaims(ctx) {
       engine.on(EVENTS.TRANSFER_COMPLETED, onTerminal)
       engine.on(EVENTS.TRANSFER_FAILED, onTerminal)
       engine.on(EVENTS.TRANSFER_CANCELLED, onTerminal)
+    } else if (offerFiles.length > 0 && code && offer.shareId) {
+      // Every file was a duplicate (this peer already holds the share).
+      completedClaims.set(code, { shareId: offer.shareId, files: offerFiles })
     }
     return records
   }

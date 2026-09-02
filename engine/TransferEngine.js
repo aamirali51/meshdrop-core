@@ -625,7 +625,7 @@ class TransferEngine {
 
   // ── Receive ───────────────────────────────────────────────────────────────
 
-  async receiveOffer(offer, { autoAccept = false, isClaim = false } = {}) {
+  async receiveOffer(offer, { autoAccept = false, isClaim = false, keepCoreOpen = false } = {}) {
     const { transferId, filename, fileSize, fileType, coreKey, senderIdentity, transferMethod } =
       offer
 
@@ -733,6 +733,9 @@ class TransferEngine {
       transferMethod: this._resolveMethod(transferMethod, senderIdentity, isClaim),
       isEncrypted: true,
       isClaim: !!isClaim,
+      // Claims keep their verified core open after completion so the peer
+      // can seed the share (swarm distribution).
+      keepCoreOpen: !!keepCoreOpen,
       isSync,
       source: isSync ? 'sync' : isStreamOffer ? 'stream' : undefined,
       syncLibraryId: offer.syncLibraryId || '',
@@ -1031,7 +1034,10 @@ class TransferEngine {
       if (info.fd) await info.fd.close().catch(() => {})
       if (info.download && typeof info.download.destroy === 'function') info.download.destroy()
       this.runs.delete(id)
-      await core.close().catch(() => {})
+      // Claim keeps its verified core OPEN after completion: it becomes a
+      // seeder for the share (see connections/claims.js). Closing it here
+      // would take the peer out of the swarm.
+      if (!transfer.keepCoreOpen) await core.close().catch(() => {})
       this.queue.release(transfer)
       this._kickQueue('receive')
     }
