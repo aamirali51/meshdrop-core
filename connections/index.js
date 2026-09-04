@@ -77,6 +77,56 @@ function createConnections(engine) {
     replicateExchange,
   };
 
+  // Reconnect ONE peer that is currently on relay/internet onto a direct LAN
+  // path. Called when LAN discovery hears a peer that is already connected:
+  // destroying the connection triggers the normal cleanup (peers map,
+  // replication scope, claim streams, transfer park) and then we re-join the
+  // peer key so hyperswarm's direct-first punch lands on the LAN route.
+  //
+  // Guards: only switch peers that are actually relayed/internet (a direct LAN
+  // peer needs nothing), never while a switch is already in flight, and never
+  // more often than the cooldown so a failed direct attempt doesn't churn.
+  const LAN_SWITCH_COOLDOWN_MS = 60 * 1000
+  const _lanSwitchState = new Map() // peerId -> { lastAttemptAt, inflight }
+
+  async function switchPeerToDirect(peerId) {
+    const peerObj = ctx.peers.get(peerId)
+    if (!peerObj || !peerObj.connection || !peerObj.signaling) return
+    // Already on a direct LAN path — nothing to do.
+    const isRelayed = !!(peerObj.device && peerObj.device.relayed) || !!peerObj.relayed
+    if (!isRelayed && peerObj.transferMethod === 'lan') return
+    const st = _lanSwitchState.get(peerId)
+    if (st && st.inflight) return
+    if (st && Date.now() - st.lastAttemptAt < LAN_SWITCH_COOLDOWN_MS) return
+    if (!engine.autoLanSwitch) return
+
+    _lanSwitchState.set(peerId, { lastAttemptAt: Date.now(), inflight: true })
+    console.log(
+      `[MeshEngine] LAN switch: ${peerId.slice(0, 12)}... heard on LAN (currently ${peerObj.transferMethod || 'internet'}${isRelayed ? ', relayed' : ''}) — reconnecting direct`
+    )
+    try {
+      // Destroy this one connection. The on('close') handler removes the peer
+      // from the map and emits PEER_DISCONNECTED; in-flight transfers park as
+      // resumable and re-queue when the peer reconnects.
+      peerObj.connection.destroy(new Error('switching to LAN'))
+    } catch (err) {
+      console.warn(`[MeshEngine] LAN switch destroy failed for ${peerId.slice(0, 12)}...:`, err.message)
+    }
+    try {
+      // Re-join the peer key so hyperswarm re-establishes direct (LAN discovery
+      // primed the direct path). The identity-topic rejoin lets it announce.
+      const peerKey = Buffer.from(peerId, 'hex')
+      if (peerKey.length === 32) ctx.swarm.joinPeer(peerKey)
+      await devices.reconnectKnownPeers()
+      ctx.swarm.flush().catch(() => {})
+    } catch (err) {
+      console.warn(`[MeshEngine] LAN switch rejoin failed for ${peerId.slice(0, 12)}...:`, err.message)
+    } finally {
+      const s = _lanSwitchState.get(peerId)
+      if (s) s.inflight = false
+    }
+  }
+
   // Count only peers whose handshake completed: pairing.complete is set
   // exclusively by the verified challenge-response path.
   function authenticatedPeerCount() {
@@ -400,6 +450,12 @@ function createConnections(engine) {
     replicateExchange,
     sendPairingChallenges: signaling.sendPairingChallenges,
     handlePeerMessage: signaling.handlePeerMessage,
+    // First-chance inbound interceptor, consulted by signaling.js before the
+    // generic router (set by SiteManager for scoped allowlist challenges so
+    // they never reach the device-trust grant path).
+    setBeforePeerMessage(fn) {
+      ctx.beforePeerMessage = fn
+    },
     onConnection,
     initSwarm,
     reconnectKnownPeers: devices.reconnectKnownPeers,
@@ -410,6 +466,7 @@ function createConnections(engine) {
     flushPendingHandshake: devices.flushPendingHandshake,
     rebroadcastPeerCompletion: devices.rebroadcastPeerCompletion,
     maybeAutoTrustLanPeer: devices.maybeAutoTrustLanPeer,
+    switchPeerToDirect,
     confirmClaimDownload: claims.confirmClaimDownload,
     cancelClaimDownload: claims.cancelClaimDownload,
     // Flip the maintenance intervals off; called from engine.stop().

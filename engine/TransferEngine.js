@@ -921,6 +921,12 @@ class TransferEngine {
       const destPath = transfer.destPath
       const firstDataBlock = 1
       const lastDataBlock = blockCount // core block indices 1..blockCount
+      // Progressive-playback watermark (bytes that must be verified before a
+      // player can mount the stream). Set by the sender at stage time.
+      const playableAfter = Math.min(
+        manifest.fileSize,
+        typeof manifest.playableAfter === 'number' ? manifest.playableAfter : manifest.fileSize
+      )
 
       await fsp.mkdir(path.dirname(stagingPath), { recursive: true })
       // Resume: a partial .part file continues from a whole-block boundary.
@@ -968,14 +974,32 @@ class TransferEngine {
           }
           if (speed > peakSpeed) peakSpeed = speed
           const progress = manifest.fileSize === 0 ? 100 : Math.min(100, Math.round((verifiedBytes / manifest.fileSize) * 100))
+          const remaining = Math.max(0, manifest.fileSize - verifiedBytes)
+          const eta = speed > 0 ? Math.round(remaining / speed) : 0
+          const playable = verifiedBytes >= playableAfter || progress === 100
+          if (playable && transfer.playable !== true) {
+            transfer.playable = true
+            await this._persist(id, { playable: true })
+            this._emit(EVENTS.TRANSFER_PROGRESS, {
+              id,
+              filename: transfer.filename,
+              direction: transfer.direction || 'receive',
+              progress,
+              speed,
+              peakSpeed,
+              eta,
+              source: transfer.source,
+              playable: true,
+              isSync: !!(transfer.isSync || transfer.source === 'sync'),
+              syncLibraryId: transfer.syncLibraryId
+            })
+          }
           if (
             progress === 100 ||
             progress - lastEmittedProgress >= 2 ||
             now - lastEmitTime >= 1000
           ) {
             lastEmittedProgress = progress
-            const remaining = Math.max(0, manifest.fileSize - verifiedBytes)
-            const eta = speed > 0 ? Math.round(remaining / speed) : 0
             await this._persist(id, { progress, speed, peakSpeed, eta, byteOffset: verifiedBytes })
             this._emit(EVENTS.TRANSFER_PROGRESS, {
               id,

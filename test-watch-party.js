@@ -287,6 +287,180 @@ async function runAllTests() {
     }
     assert('No party media streams leaked', true)
 
+    // ── Test 5: Join-timeout surfaces a phantom room as ROOM_CLOSED ──────────
+    console.log('\nTest 5: Join timeout on unreachable host')
+    const lonelyGuest = makeSide('lonely-key', 'Lonely Guest', tmpRoot)
+    // No host connected: the join broadcast goes nowhere.
+    const closedEvents = []
+    lonelyGuest.watchParty.on(PARTY_EVENTS.ROOM_CLOSED, (e) => closedEvents.push(e))
+    const phantom = await lonelyGuest.watchParty.joinRoom({ roomCode: 'PARTY-XXXX-YYYY' })
+    assert('Guest joined a phantom room optimistically', phantom && phantom.isHost === false)
+    // The join-timeout is 30s; we don't want the suite to take that long, so
+    // reach in and fire the timer logic directly via the maintenance watchdog.
+    lonelyGuest.watchParty._roomMaintenanceTimer && clearInterval(lonelyGuest.watchParty._roomMaintenanceTimer)
+    // Simulate the passage of time: mark joinedAt far in the past, then run
+    // the same check _maintainRoom performs for the host-silence watchdog.
+    lonelyGuest.watchParty.activeRoom.joinedAt = Date.now() - 130000
+    lonelyGuest.watchParty._autoLeaveStaleRoom(lonelyGuest.watchParty.activeRoom, 'host unreachable')
+    assert('Phantom guest auto-left via host-silence watchdog', closedEvents.length === 1 && lonelyGuest.watchParty.activeRoom === null)
+    await lonelyGuest.storage.exchangeStore.close().catch(() => {})
+
+    // ── Test 6: Host close reaches guests (no zombie room) ───────────────────
+    console.log('\nTest 6: Host close propagates to guests')
+    const host6 = makeSide('host-6', 'Host Six', tmpRoot)
+    const guest6 = makeSide('guest-6', 'Guest Six', tmpRoot)
+    connectPeers(host6, guest6)
+    const room6 = await host6.watchParty.createRoom({ title: 'Six', filePath: mediaPath })
+    const guest6Closed = []
+    guest6.watchParty.on(PARTY_EVENTS.ROOM_CLOSED, (e) => guest6Closed.push(e))
+    await guest6.watchParty.joinRoom({ roomCode: room6.roomCode })
+    await host6.watchParty.leaveRoom()
+    // leaveRoom broadcasts close synchronously to connected peers before
+    // tearing down, so by the time the promise resolves the guest has seen it.
+    assert('Guest received ROOM_CLOSED after host left', guest6Closed.length === 1)
+    assert('Guest room cleared after host close', guest6.watchParty.activeRoom === null)
+    await host6.storage.exchangeStore.close().catch(() => {})
+    await guest6.storage.exchangeStore.close().catch(() => {})
+
+    // ── Test 7: Room-code normalization ──────────────────────────────────────
+    console.log('\nTest 7: Room-code normalization on join')
+    const norm = host.watchParty._normalizeRoomCode
+    assert('Canonical code passes through', norm('PARTY-ABCD-EFGH') === 'PARTY-ABCD-EFGH')
+    assert('Lowercase + spaces normalize', norm('party abcd efgh') === 'PARTY-ABCD-EFGH')
+    assert('Stripped code normalizes', norm('PARTYABCDEFGH') === 'PARTY-ABCD-EFGH')
+
+    // ── Test 8: controlsMode host-authority drops guest state syncs ─────────
+    console.log('\nTest 8: controlsMode host-authority')
+    const host8 = makeSide('host-8', 'Host Eight', tmpRoot)
+    const guest8 = makeSide('guest-8', 'Guest Eight', tmpRoot)
+    connectPeers(host8, guest8)
+    const room8 = await host8.watchParty.createRoom({ title: 'Eight', filePath: mediaPath, controlsMode: 'host' })
+    const guest8Syncs = []
+    host8.watchParty.on(PARTY_EVENTS.STATE_SYNC, (e) => guest8Syncs.push(e))
+    await guest8.watchParty.joinRoom({ roomCode: room8.roomCode })
+    // A guest attempts to drive playback in host-only mode — must be dropped.
+    guest8.watchParty.broadcastPlaybackState({ action: 'play', positionSec: 5 })
+    await new Promise((r) => setTimeout(r, 300))
+    assert('Host ignored non-host state sync in host mode', guest8Syncs.length === 0)
+    // Host playback still flows.
+    host8.watchParty.broadcastPlaybackState({ action: 'play', positionSec: 42 })
+    await new Promise((r) => setTimeout(r, 300))
+    assert('Host state sync still delivered in host mode', guest8Syncs.length >= 1)
+    await host8.storage.exchangeStore.close().catch(() => {})
+    await guest8.storage.exchangeStore.close().catch(() => {})
+
+    // ── Test 9: createRoom fails fast on staging error (no phantom host) ─────
+    console.log('\nTest 9: createRoom fails fast when media staging fails')
+    const host9 = makeSide('host-9', 'Host Nine', tmpRoot)
+    // Point at a path that does not exist: stat throws, room must reject.
+    let stagingFailed = false
+    try {
+      await host9.watchParty.createRoom({ title: 'Nine', filePath: path.join(tmpRoot, 'does-not-exist.mp4') })
+    } catch (err) {
+      stagingFailed = true
+    }
+    assert('createRoom rejected for unreadable media', stagingFailed === true)
+    assert('No phantom host room left behind', host9.watchParty.activeRoom === null)
+    await host9.storage.exchangeStore.close().catch(() => {})
+
+    // ── Test 10: Guest host-silence watchdog clears a stale room ─────────────
+    console.log('\nTest 10: Guest host-silence watchdog')
+    const host10 = makeSide('host-10', 'Host Ten', tmpRoot)
+    const guest10 = makeSide('guest-10', 'Guest Ten', tmpRoot)
+    connectPeers(host10, guest10)
+    const room10 = await host10.watchParty.createRoom({ title: 'Ten', filePath: mediaPath })
+    const guest10Closed = []
+    guest10.watchParty.on(PARTY_EVENTS.ROOM_CLOSED, (e) => guest10Closed.push(e))
+    await guest10.watchParty.joinRoom({ roomCode: room10.roomCode })
+    // No media transfer or state sync occurs (we don't wait for it) — simulate
+    // a host that went silent by back-dating both joinedAt and _hostHeardAt.
+    const g10room = guest10.watchParty.activeRoom
+    g10room.joinedAt = Date.now() - 130000
+    g10room._hostHeardAt = Date.now() - 130000
+    guest10.watchParty._autoLeaveStaleRoom(g10room, 'host unreachable')
+    assert('Guest auto-left after host silence', guest10Closed.length === 1 && guest10.watchParty.activeRoom === null)
+    await host10.storage.exchangeStore.close().catch(() => {})
+    await guest10.storage.exchangeStore.close().catch(() => {})
+
+    // ── Test 11: Guest room is enriched by the media offer ───────────────────
+    console.log('\nTest 11: Guest room enriched by media offer (host identity + controlsMode)')
+    const host11 = makeSide('host-11', 'Host Eleven', tmpRoot)
+    const guest11 = makeSide('guest-11', 'Guest Eleven', tmpRoot)
+    connectPeers(host11, guest11)
+    const room11 = await host11.watchParty.createRoom({ title: 'Eleven', filePath: mediaPath, controlsMode: 'open' })
+    const roomUpdates = []
+    guest11.watchParty.on(PARTY_EVENTS.ROOM_UPDATED, (e) => roomUpdates.push(e))
+    await guest11.watchParty.joinRoom({ roomCode: room11.roomCode })
+    await withTimeout(
+      waitFor(() => roomUpdates.length > 0, 5000, 'room updated'),
+      6000,
+      'guest room enrichment'
+    )
+    const enriched = roomUpdates[roomUpdates.length - 1] || {}
+    assert('Guest learned the host name from the media offer', enriched.hostName === 'Host Eleven', JSON.stringify(enriched))
+    assert('Guest learned the real media title', enriched.title === 'Eleven' || enriched.filename === 'movie.mp4', JSON.stringify(enriched))
+    assert('Guest learned controlsMode is open (collaborative)', enriched.controlsMode === 'open', JSON.stringify(enriched))
+    await host11.storage.exchangeStore.close().catch(() => {})
+    await guest11.storage.exchangeStore.close().catch(() => {})
+
+    // ── Test 12: playable watermark gates MEDIA_READY ────────────────────────
+    console.log('\nTest 12: Playable watermark gates source-ready (no .part handover)')
+    const host12 = makeSide('host-12', 'Host Twelve', tmpRoot)
+    const guest12 = makeSide('guest-12', 'Guest Twelve', tmpRoot)
+    connectPeers(host12, guest12)
+    // Build a fake mp4 whose moov sits right after ftyp (watermark ~64 bytes)
+    // so playable should fire almost immediately — but still AFTER the first
+    // progress tick, proving MEDIA_READY is not tied to the first byte.
+    const b4a = require('b4a')
+    const ftyp = b4a.alloc(24)
+    ftyp.writeUInt32BE(24, 0)
+    ftyp.write('ftyp', 4, 'latin1')
+    const moov = b4a.alloc(40)
+    moov.writeUInt32BE(40, 0)
+    moov.write('moov', 4, 'latin1')
+    const head = b4a.concat([ftyp, moov])
+    const totalSize = 256 * 1024
+    const mediaPath12 = path.join(tmpRoot, 'movie12.mp4')
+    const fd12 = await fsp.open(mediaPath12, 'w')
+    await fd12.write(head, 0, head.length, 0)
+    const zeroBlock = Buffer.alloc(65536)
+    let off12 = head.length
+    while (off12 < totalSize) {
+      const n = Math.min(zeroBlock.length, totalSize - off12)
+      await fd12.write(zeroBlock, 0, n, off12)
+      off12 += n
+    }
+    await fd12.close()
+
+    const progressEvents = []
+    guest12.on(EVENTS.TRANSFER_PROGRESS, (t) => {
+      if (t && t.id && String(t.id).startsWith('watch-')) progressEvents.push(t)
+    })
+    const ready12Events = []
+    guest12.watchParty.on(PARTY_EVENTS.MEDIA_READY, (e) => ready12Events.push(e))
+    const room12 = await host12.watchParty.createRoom({ title: 'Twelve', filePath: mediaPath12 })
+    // Attach the completion waiter BEFORE joining so a fast transfer cannot
+    // finish before the listener exists.
+    const completionP = waitForCompletedTransfer(guest12, room12.shareId, 'guest 12')
+    await guest12.watchParty.joinRoom({ roomCode: room12.roomCode })
+    await withTimeout(
+      waitFor(() => ready12Events.length > 0, 15000, 'media ready on playable'),
+      20000,
+      'playable media ready'
+    )
+    const readyEvt = ready12Events[0] || {}
+    assert('MEDIA_READY fired for playable fake-mp4', readyEvt.playable === true, JSON.stringify(readyEvt))
+    // Wait for completion so the record is final, then verify the playable
+    // progress event arrived before it.
+    await withTimeout(completionP, 20000, 'guest 12 complete')
+    const playableProgress = progressEvents.find((t) => t.playable === true)
+    assert('Transfer progress carried playable:true before completion', !!playableProgress, JSON.stringify(progressEvents.slice(0, 3)))
+    // After completion the record resolves and is marked playable.
+    const recAfter = await guest12.watchParty._getTransferRecord(room12.shareId)
+    assert('Completed transfer record is playable', recAfter && (recAfter.playable === true || recAfter.status === 'completed'))
+    await host12.storage.exchangeStore.close().catch(() => {})
+    await guest12.storage.exchangeStore.close().catch(() => {})
+
     await host.storage.exchangeStore.close().catch(() => {})
     await guestA.storage.exchangeStore.close().catch(() => {})
     await guestB.storage.exchangeStore.close().catch(() => {})

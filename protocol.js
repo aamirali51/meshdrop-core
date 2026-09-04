@@ -86,6 +86,16 @@ const EVENTS = {
   CLAIM_PREVIEW: 'claim:preview',
   WATCH_STATE_UPDATED: 'watch:state:updated',
   NOTIFICATION_RECEIVED: 'notification:received',
+  // MeshDrop Sites — a visitor proved ownership of the pasted code and was
+  // added to (or removed from) a site's allowlist. No device trust is granted.
+  SITE_VISITOR_ADDED: 'site:visitor:added',
+  SITE_VISITOR_REMOVED: 'site:visitor:removed',
+  // A visitor's allowlist challenge failed (wrong code / wrong device).
+  SITE_VISITOR_FAILED: 'site:visitor:failed',
+  // A visitor joined/left a site session (allowlisted + verified + connected).
+  SITE_VISIT_STARTED: 'site:visit:started',
+  SITE_VISIT_STOPPED: 'site:visit:stopped',
+  SITE_INVITE_RECEIVED: 'site:invite:received',
   ERROR: 'error'
 }
 
@@ -108,10 +118,17 @@ function dropTopic(code) {
   return `p2p-file-${code}`
 }
 
+// MeshDrop Sites — topic for a published site, announced by the host and
+// joined by allowlisted visitors to reach it (sibling of the drop/watch topics).
+function siteTopic(siteId) {
+  return `p2p-site-${siteId}`
+}
+
 const TOPIC_PREFIXES = {
   PAIR: 'p2p-pair-',
   PEER: 'p2p-peer-',
-  DROP: 'p2p-file-'
+  DROP: 'p2p-file-',
+  SITE: 'p2p-site-'
 }
 
 // ─── Wire validation ────────────────────────────────────────────────────────
@@ -132,6 +149,7 @@ module.exports = {
   pairingTopic,
   peerTopic,
   dropTopic,
+  siteTopic,
   TOPIC_PREFIXES,
   isPairingMessage
 }

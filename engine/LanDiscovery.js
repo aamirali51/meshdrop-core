@@ -46,6 +46,7 @@ class LanDiscovery {
     swarm,
     getDeviceIdentity,
     onPeerKey,
+    onPeerSeen = null,
     now = Date.now,
     port = DEFAULT_PORT,
     group = DEFAULT_GROUP,
@@ -57,6 +58,7 @@ class LanDiscovery {
     this.swarm = swarm
     this.getDeviceIdentity = getDeviceIdentity || (() => null)
     this.onPeerKey = onPeerKey || (() => {})
+    this.onPeerSeen = onPeerSeen || null
     this.now = now
     this.port = port
     this.group = group
@@ -241,6 +243,21 @@ class LanDiscovery {
     const existing = this.known.get(key)
     if (existing) {
       existing.seenAt = this.now()
+      // Fire the "seen again" hook so a peer that is ALREADY connected over
+      // relay/internet can be reconnected onto the LAN (the LAN-switch path).
+      // We deliberately do not hand a known key to onPeerKey — that path owns
+      // joinPeer for brand-new discoveries only.
+      if (this.onPeerSeen) {
+        try {
+          this.onPeerSeen(key, {
+            id: existing.id || (announcement && announcement.id),
+            name: existing.name || (announcement && announcement.name),
+            os: existing.os || (announcement && announcement.os)
+          })
+        } catch (err) {
+          console.warn('[MeshEngine] LanDiscovery onPeerSeen error:', err.message)
+        }
+      }
       return false
     }
 

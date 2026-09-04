@@ -66,6 +66,12 @@ function createSignaling(ctx) {
         if (peerObj && peerObj.pairing) {
           if (peerObj.pairing.trusted) {
             sendHandshake(peerId)
+          } else if (engine && typeof engine.isSiteSessionPeer === 'function' && engine.isSiteSessionPeer(peerId)) {
+            // Site-session peer (allowlist-authenticated visitor/host, not
+            // device-paired): skip the automatic pairing challenge — the
+            // allowlist is the auth, and a pairing challenge would arm the
+            // watchdog and kill the session.
+            console.log(`[MeshEngine] Skipping pairing challenge for site-session peer ${peerId.slice(0, 12)}...`)
           } else {
             sendPairingChallenges(peerId)
           }
@@ -103,6 +109,12 @@ function createSignaling(ctx) {
       onmessage(raw) {
         try {
           const msg = JSON.parse(raw)
+          // First-chance hook for scoped consumers (e.g. SiteManager's allowlist
+          // challenge): if it returns true, the message was consumed and must
+          // NOT reach the generic router (which could grant device trust).
+          if (ctx.beforePeerMessage && ctx.beforePeerMessage(peerId, msg) === true) {
+            return
+          }
           handlePeerMessage(peerId, msg)
         } catch (err) {
           console.error('[MeshEngine] Error parsing peer signal message:', err)
@@ -113,18 +125,17 @@ function createSignaling(ctx) {
     channel.open()
 
     // Retry sending handshake/challenges after open tick to handle async channel ready states
-    setTimeout(() => {
+    const isSitePeer = (peerId) =>
+      engine && typeof engine.isSiteSessionPeer === 'function' && engine.isSiteSessionPeer(peerId)
+    const maybeSendHandshakeOrChallenges = (peerId) => {
       const peerObj = peers.get(peerId)
       if (!peerObj || !peerObj.pairing) return
       if (peerObj.pairing.trusted) sendHandshake(peerId)
+      else if (isSitePeer(peerId)) return // site session — no auto pairing challenges
       else sendPairingChallenges(peerId)
-    }, 150)
-    setTimeout(() => {
-      const peerObj = peers.get(peerId)
-      if (!peerObj || !peerObj.pairing) return
-      if (peerObj.pairing.trusted) sendHandshake(peerId)
-      else sendPairingChallenges(peerId)
-    }, 600)
+    }
+    setTimeout(() => maybeSendHandshakeOrChallenges(peerId), 150)
+    setTimeout(() => maybeSendHandshakeOrChallenges(peerId), 600)
 
     return {
       send(obj) {
@@ -272,26 +283,51 @@ function createSignaling(ctx) {
           console.warn('[MeshEngine] handleSyncVerifyResult failed:', err?.message)
         })
       }
+    } else if (msg.type === 'SITE_INVITE') {
+      // Receiver side: host just allowed us on a shared folder. Persist + notify
+      // ONLY — a real session is opened by the UI calling sites.visit (which we
+      // know works). No auto-join here: it raced the DHT handshake and deadlocked.
+      const inv = { siteId: msg.siteId, code: msg.code, name: msg.name, expiresAt: msg.expiresAt || 0, addedAt: Date.now(), hostPeerId: peerId, hostName: msg.hostName || '', hostDeviceId: msg.hostDeviceId || '' }
+      engine.getBee('visitedSites').then((bee) => bee.put(msg.siteId || msg.code, inv)).catch(() => {})
+      if (engine.notificationStore) engine.notificationStore.addNotification('Shared Folder Received', `"${msg.name || 'A folder'}" shared with you · code ${msg.code || ''}`, 'info')
+      engine.emit(EVENTS.SITE_INVITE_RECEIVED || 'site:invite:received', inv)
+    } else if (msg.type?.startsWith?.('SITE_')) {
+      if (ctx.refs.handleSiteMessage) {
+        ctx.refs.handleSiteMessage(peerId, msg)
+      }
     } else if (msg.type?.startsWith?.('WATCH_')) {
       if (ctx.refs.handleWatchMessage) {
         ctx.refs.handleWatchMessage(peerId, msg)
       }
+      // WATCH messages have two surfaces:
+      //  - Room-based party: WatchPartyManager (reached through
+      //    handleWatchMessage) validates room membership + host authority and
+      //    emits party:state:sync / party:peer:status. Room-party messages are
+      //    identified by `sender` (state sync) — but peer-status carries
+      //    peerId/peerName and only the party manager ever sends it. Duplicating
+      //    either here as watch:state:updated would double-deliver, and emitting
+      //    them to a device that is NOT in the room would let any peer inject
+      //    playback — so suppress party traffic entirely.
+      //  - Legacy claim/group player: state-sync messages carry `senderDevice`
+      //    and the manager is not involved. Surface those as watch:state:updated
+      //    exactly as before (their roomCode is the share code, not a party).
+      const isPartyRoomMsg =
+        msg.type === MESSAGES.WATCH_PEER_STATUS ||
+        (!!msg.sender && !msg.senderDevice)
       if (msg.type === MESSAGES.WATCH_STATE_SYNC) {
-        engine.emit(EVENTS.WATCH_STATE_UPDATED, {
-          peerId,
-          action: msg.action,
-          positionSec: msg.positionSec,
-          timestampMs: msg.timestampMs,
-          senderDevice: msg.senderDevice || null,
-          roomCode: msg.roomCode
-        })
+        if (!isPartyRoomMsg) {
+          engine.emit(EVENTS.WATCH_STATE_UPDATED, {
+            peerId,
+            action: msg.action,
+            positionSec: msg.positionSec,
+            timestampMs: msg.timestampMs,
+            senderDevice: msg.senderDevice || null,
+            roomCode: msg.roomCode
+          })
+        }
       } else if (msg.type === MESSAGES.WATCH_PEER_STATUS) {
-        engine.emit(EVENTS.WATCH_STATE_UPDATED, {
-          peerId,
-          buffering: msg.buffering,
-          positionSec: msg.positionSec,
-          roomCode: msg.roomCode
-        })
+        // Peer status is a party-manager concept; it never had a legacy
+        // consumer on the raw watch:state:updated surface, so emit nothing.
       }
     }
   }

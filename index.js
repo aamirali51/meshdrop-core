@@ -16,6 +16,9 @@ const { TrustManager } = require('./engine/TrustManager.js')
 const { TransferEngine } = require('./engine/TransferEngine.js')
 const { SyncEngine } = require('./engine/SyncEngine.js')
 const { WatchPartyManager, PARTY_EVENTS } = require('./engine/WatchPartyManager.js')
+const { SiteManager } = require('./engine/SiteManager.js')
+const { SiteServer } = require('./engine/SiteServer.js')
+const { SiteVisitor } = require('./engine/SiteVisitor.js')
 const MetricsCollector = require('./engine/MetricsCollector.js')
 const TopicRegistry = require('./engine/TopicRegistry.js')
 const NotificationStore = require('./engine/NotificationStore.js')
@@ -172,6 +175,9 @@ class MeshEngine extends EventEmitter {
     // pairing handshake (prove knowledge of the MD- code) to be trusted — LAN
     // discovery only helps the connection establish, it grants no trust.
     this.autoTrustLAN = config.autoTrustLAN === true
+    // Auto-switch a relayed peer onto a direct LAN connection when the LAN
+    // discovery hears that peer on the local network (default ON).
+    this.autoLanSwitch = config.autoLanSwitch !== false
     this.lanDiscoveryEnabled = config.lanDiscovery !== false
     // Own-device relay: when true, this node prefers an online paired desktop
     // as the relay for connections that can't holepunch directly (instead of
@@ -199,6 +205,9 @@ class MeshEngine extends EventEmitter {
     this.lanDiscovery = null
     this.notificationStore = null
     this.connections = null
+    this.siteManager = null
+    this.siteServer = null
+    this.siteVisitor = null
     this.relayMode = config.relayMode || 'auto' // 'auto' | 'relay-primary' | 'direct-only'
     this.customRelayUrl = config.customRelayUrl || config.relayUrl || ''
     this.relayClient = new RelayClient({
@@ -385,9 +394,27 @@ class MeshEngine extends EventEmitter {
       os: platformMap[os.platform()] || os.platform()
     })
 
-    // Connection layer first: lanDiscovery wiring needs it (workers/main.js
-    // creates connections before the engines for the same reason).
+    // Restore visitedSites — no auto-join here (races the DHT + deadlocks in
+    // signal handlers). The renderer lists received shares via listReceived and
+    // the user (or auto-open) calls sites.visit over normal IPC, which works.
+    try {
+      const vbee = await this.storage.getBee('visitedSites')
+      const now = Date.now()
+      for await (const node of vbee.createReadStream()) {
+        const v = node.value
+        if (v && v.expiresAt > 0 && now >= v.expiresAt) await vbee.del(node.key).catch(() => {})
+      }
+    } catch {}
+
     this.connections = createConnections(this)
+
+    // MeshDrop Sites host-side manager: site registry + allowlist challenge
+    // state. init() hydrates the `sites` bee; installSignalHook() lets it
+    // intercept a visitor's PAIRING_RESP to a site challenge BEFORE the generic
+    // device-trust router sees it.
+    this.siteManager = new SiteManager({ engine: this, getBee: this.storage.getBee })
+    await this.siteManager.init()
+    this.siteManager.installSignalHook()
 
     this.metricsCollector = new MetricsCollector({ swarm: this.swarm })
     this.metricsCollector.start()
@@ -415,6 +442,7 @@ class MeshEngine extends EventEmitter {
       isRefreshing: () => this._refreshing === true,
       getDeviceIdentity: () => this.storage.getDeviceIdentity(),
       getPeerId: () => this.peerId,
+      isSiteSessionPeer: (peerId) => this.isSiteSessionPeer(peerId),
       onTrustGranted: (peerId, code) => {
         const peerObj = this.peers.get(peerId)
         if (peerObj && peerObj.pairing) peerObj.pairing.code = code
@@ -427,6 +455,9 @@ class MeshEngine extends EventEmitter {
         this.connections.rebroadcastPeerCompletion(peerId, code)
       }
     })
+    // TrustManager's relay path delegates SITE_VERIFY_RESP (host side) back to
+    // SiteManager for MAC verification + allowlisting.
+    this.trustManager.siteManager = this.siteManager
 
     this.notificationStore = new NotificationStore({
       emit: (event, data) => this.emit(event, data)
@@ -598,6 +629,50 @@ class MeshEngine extends EventEmitter {
       this.watchParty.on(evt, (data) => this.emit(evt, data))
     })
 
+    // MeshDrop Sites live-read (slice 3): host-side SiteServer serves a
+    // published folder to allowlisted visitors; visitor-side SiteVisitor lets
+    // this device browse another device's published site. Both consume SITE_*
+    // signaling — route to whichever is active (a device can host one site AND
+    // visit another simultaneously).
+    this.siteServer = new SiteServer({ engine: this })
+    const SiteVisitorCtor = require('./engine/SiteVisitor.js').SiteVisitor
+    this.siteVisitor = new SiteVisitorCtor({ engine: this })
+    this.connections.refs.handleSiteMessage = (peerId, msg) => {
+      // SITE_VERIFY_CHALLENGE (a host verifying a visitor's code for an
+      // allowlist) is answered here by the visitor — a pure capability proof,
+      // never a pairing. SITE_VERIFY_RESP (the visitor's answer) is verified
+      // by the HOST's SiteManager hook (beforePeerMessage consumes it).
+      if (msg && msg.type === 'SITE_VERIFY_CHALLENGE') {
+        if (this.trustManager && typeof this.trustManager.handleSiteVerifyChallenge === 'function') {
+          const peerObj = this.peers.get(peerId)
+          if (peerObj && peerObj.signaling) {
+            // Remember this host as a site verifier so the automatic pairing
+            // loop leaves the connection alone (site relationship, not pair).
+            if (this.siteVisitor && this.siteVisitor._verifierHosts) {
+              this.siteVisitor._verifierHosts.add(peerId)
+            }
+            // This is a site allowlist verification, not a pairing: clear the
+            // pairing watchdog so the connection is not killed mid-verification
+            // (same contract as claims + watch-party media).
+            if (peerObj.pairing && peerObj.pairing.timeout) {
+              clearTimeout(peerObj.pairing.timeout)
+              peerObj.pairing.timeout = null
+            }
+            this.trustManager.handleSiteVerifyChallenge((resp) => peerObj.signaling.send(resp), msg)
+          }
+        }
+        return
+      }
+      // The remaining SITE_* split by direction: responses / data / close go
+      // to the visitor (this device is browsing a host); requests go to the
+      // host's SiteServer (this device is hosting).
+      if (msg && typeof msg.type === 'string') {
+        const fromHost = /_(RES|ACK|END)$/.test(msg.type) || msg.type === 'SITE_READ_DATA' || msg.type === 'SITE_CLOSED'
+        if (fromHost && this.siteVisitor) this.siteVisitor.handleMessage(peerId, msg)
+        else if (this.siteServer) this.siteServer.handleMessage(peerId, msg)
+      }
+    }
+
     this.lanDiscovery = this.lanDiscoveryEnabled
       ? new LanDiscovery({
           swarm: this.swarm,
@@ -615,6 +690,21 @@ class MeshEngine extends EventEmitter {
               }
             } catch (err) {
               console.warn('[MeshEngine] LAN discovery joinPeer failed:', err.message)
+            }
+          },
+          onPeerSeen: (key) => {
+            // A peer we ALREADY know was just heard on the local network. If it
+            // is currently connected over relay/internet, reconnect it so the
+            // direct LAN path wins (faster transfers + playback).
+            try {
+              if (!this.autoLanSwitch) return
+              const peerObj = this.peers.get(key)
+              if (!peerObj || !peerObj.connection) return
+              this.connections.switchPeerToDirect(key).catch((err) => {
+                console.warn(`[MeshEngine] LAN switch failed for ${key.slice(0, 12)}...:`, err.message)
+              })
+            } catch (err) {
+              console.warn('[MeshEngine] LAN onPeerSeen handler failed:', err.message)
             }
           }
         })
@@ -643,6 +733,7 @@ class MeshEngine extends EventEmitter {
         this.customRelayUrl = s.customRelayUrl
         if (this.relayClient) this.relayClient.setRelayUrl(s.customRelayUrl)
       }
+      if (s && typeof s.autoLanSwitch === 'boolean') this.autoLanSwitch = s.autoLanSwitch
     } catch {}
 
     await this.replicationScope.init()
@@ -664,6 +755,12 @@ class MeshEngine extends EventEmitter {
 
     // Restore active/unexpired drop shares so their DHT topics re-announce on restart
     await this.restorePendingShares()
+
+    // Re-publish persisted shared folders so a restarted host re-announces its
+    // site topics. SiteManager.init() only hydrates the records; without this,
+    // already-added visitors could never re-discover the host after it reboots
+    // ("already added folder won't open after restart").
+    await this.restorePublishedSites()
 
     this.expirationTimer = setInterval(() => this.checkPendingExpirations(), EXPIRATION_INTERVAL_MS)
     if (this.expirationTimer.unref) this.expirationTimer.unref()
@@ -711,6 +808,18 @@ class MeshEngine extends EventEmitter {
     }
     if (this.metricsCollector) this.metricsCollector.stop()
     if (this.lanDiscovery) this.lanDiscovery.stop()
+    // Tear down any live watch-party room, its timers, and its engine listeners
+    // before the swarm/stores close underneath it.
+    if (this.watchParty && typeof this.watchParty.stop === 'function') this.watchParty.stop()
+    if (this.siteManager && typeof this.siteManager.stop === 'function') {
+      await this.siteManager.stop()
+    }
+    if (this.siteServer && typeof this.siteServer.stop === 'function') {
+      await this.siteServer.stop()
+    }
+    if (this.siteVisitor && typeof this.siteVisitor.stop === 'function') {
+      await this.siteVisitor.stop()
+    }
     if (this.syncEngine) await this.syncEngine.stop()
     if (this.transferEngine) await this.transferEngine.shutdown()
     if (this.replicationScope) this.replicationScope.closeAll()
@@ -1238,6 +1347,7 @@ class MeshEngine extends EventEmitter {
       return {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
+        autoLanSwitch: this.autoLanSwitch,
         preferOwnRelay: this.preferOwnRelay,
         relayMode: this.relayMode,
         customRelayUrl: this.customRelayUrl,
@@ -1247,6 +1357,7 @@ class MeshEngine extends EventEmitter {
       return {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
+        autoLanSwitch: this.autoLanSwitch,
         preferOwnRelay: this.preferOwnRelay,
         relayMode: this.relayMode,
         customRelayUrl: this.customRelayUrl
@@ -1281,6 +1392,19 @@ class MeshEngine extends EventEmitter {
       console.warn('[MeshEngine] setAutoTrustLAN persist failed:', err.message)
     }
     return this.autoTrustLAN
+  }
+
+  /** Toggle auto-switching relayed peers onto a direct LAN connection (persisted). */
+  async setAutoLanSwitch(value) {
+    this.autoLanSwitch = value !== false
+    try {
+      const bee = await this.getBee('settings')
+      const entry = await bee.get('settings')
+      await bee.put('settings', { ...(entry?.value || {}), autoLanSwitch: this.autoLanSwitch })
+    } catch (err) {
+      console.warn('[MeshEngine] setAutoLanSwitch persist failed:', err.message)
+    }
+    return this.autoLanSwitch
   }
 
   /**
@@ -1466,6 +1590,37 @@ class MeshEngine extends EventEmitter {
       }
     } catch (err) {
       console.warn('[MeshEngine] Failed to restore pending drop shares:', err.message)
+    }
+  }
+
+  // Re-publish persisted shared folders on boot. SiteManager.init() hydrates
+  // the site records, but only siteServer.publish() joins the DHT topics that
+  // make a host discoverable — so without this, a host that restarts stops
+  // answering existing visitors' SITE_DISCOVER, and folders that were already
+  // added on a peer can no longer be opened until the host re-shares manually.
+  async restorePublishedSites() {
+    if (!this.siteServer || !this.siteManager) return
+    try {
+      const sites = await this.siteManager.listSites()
+      const now = Date.now()
+      let restored = 0
+      let skippedExpired = 0
+      for (const site of sites || []) {
+        if (!site || !site.siteId || !site.folderPath) continue
+        if (site.expiresAt > 0 && now >= site.expiresAt) { skippedExpired++; continue }
+        if (this.siteServer._sites && this.siteServer._sites.has(site.siteId)) continue
+        try {
+          await this.siteServer.publish(site)
+          restored++
+        } catch (err) {
+          console.warn(`[MeshEngine] Failed to re-publish site ${site.siteId}:`, err.message)
+        }
+      }
+      if (restored > 0 || skippedExpired > 0) {
+        console.log(`[MeshEngine] Restored ${restored} published folder site(s) on boot${skippedExpired ? ` (${skippedExpired} expired skipped)` : ''}`)
+      }
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to restore published sites:', err.message)
     }
   }
 
@@ -1776,6 +1931,13 @@ class MeshEngine extends EventEmitter {
    */
   broadcastWatchState(params = {}) {
     if (!this.started) return false
+    // When a party room is active this routes through WatchPartyManager so the
+    // roomCode gate, host-authority rule, and per-room event all apply. The
+    // legacy broadcast (no active room) remains for the older claim/player path.
+    if (this.watchParty && this.watchParty.activeRoom) {
+      const ok = this.watchParty.broadcastPlaybackState(params)
+      return { success: ok, peersNotified: ok ? this.peers.size : 0 }
+    }
     const msg = {
       type: MESSAGES.WATCH_STATE_SYNC,
       action: params.action || 'play',
@@ -1836,6 +1998,286 @@ class MeshEngine extends EventEmitter {
   setPlayheadByte(transferId, byteOffset) {
     if (this.transferEngine && typeof this.transferEngine.setPlayheadByte === 'function') {
       return this.transferEngine.setPlayheadByte(transferId, byteOffset)
+    }
+    return false
+  }
+
+  // ─── MeshDrop Sites (host) ────────────────────────────────────────────────
+
+  // Publish a Drive site: designate a folder + name. Creates the site record
+  // and starts serving it (SiteServer announces the topics). Returns the site
+  // record (with its SITE- code + empty allowlist).
+  async publishSite(params = {}) {
+    if (!this.siteManager) throw new Error('SiteManager not initialized')
+    const site = await this.siteManager.createSite(params)
+    if (this.siteServer) {
+      await this.siteServer.publish(site)
+    }
+    return site
+  }
+
+  async unpublishSite(siteId) {
+    if (!this.siteManager) throw new Error('SiteManager not initialized')
+    if (this.siteServer) {
+      await this.siteServer.unpublish(siteId)
+    }
+    await this.siteManager.removeSite(siteId)
+    return { success: true }
+  }
+
+  async listSites() {
+    if (!this.siteManager) return []
+    return this.siteManager.listSites()
+  }
+
+  // Host pastes a visitor's MD- code into a site's allowlist. Resolves with
+  // the visitor's VERIFIED Noise public key once the visitor proves they hold
+  // the code (MAC challenge over their own pairing topic). Grants NO device
+  // trust — the visitor is added to this site's allowlist only.
+  async addSiteVisitor(siteId, visitorCode, opts) {
+    if (!this.siteManager) throw new Error('SiteManager not initialized')
+    return this.siteManager.addSiteVisitor(siteId, visitorCode, opts)
+  }
+
+  async removeSiteVisitor(siteId, publicKeyHex) {
+    if (!this.siteManager) throw new Error('SiteManager not initialized')
+    await this.siteManager.removeSiteVisitor(siteId, publicKeyHex)
+    return { success: true }
+  }
+
+  // What this device is currently hosting (if a site is published).
+  getActiveSite() {
+    return this.siteServer ? this.siteServer.getActiveSite() : null
+  }
+
+  // ─── MeshDrop Sites (visitor) ─────────────────────────────────────────────
+
+  // Enter a SITE- code to visit another device's published site. Resolves once
+  // the host confirms this device is allowlisted. Grants NO device trust.
+  async visitSite(code) {
+    if (!this.siteVisitor) throw new Error('SiteVisitor not initialized')
+    return this.siteVisitor.visitSite(code)
+  }
+
+  async leaveSite(siteId) {
+    if (!this.siteVisitor) return { success: true }
+    return this.siteVisitor.leaveSite(siteId)
+  }
+
+  // Active (fully-joined) visits, as an array. A device may browse several
+  // hosts' shared folders at once. Pending (still-discovering) visits have a
+  // null siteId and are excluded — they are not usable yet.
+  getActiveVisits() {
+    if (!this.siteVisitor) return []
+    return this.siteVisitor.listActiveVisits().filter((v) => v.siteId)
+  }
+
+  // The single active visit, when exactly one exists (back-compat for the
+  // pre-multi-visit UI/API); null otherwise.
+  getActiveVisit() {
+    const visits = this.getActiveVisits()
+    return visits.length === 1 ? visits[0] : null
+  }
+
+  // Resolve which visit a site-scoped request targets. When the caller passes
+  // a siteId, that visit must exist. With no siteId (legacy callers) we fall
+  // back to the single active visit, or null when the device is hosting.
+  _resolveVisitContext(siteId) {
+    if (siteId) {
+      const v = this.siteVisitor && this.siteVisitor._resolveKey
+        ? this.siteVisitor._requireSite(siteId)
+        : null
+      if (!v) throw new Error('Not visiting that folder')
+      return { mode: 'visit', site: v }
+    }
+    if (this.siteVisitor) {
+      const visits = this.siteVisitor.listActiveVisits()
+      if (visits.length === 1) {
+        const v = this.siteVisitor._requireSite(visits[0].siteId)
+        if (v) return { mode: 'visit', site: v }
+      }
+    }
+    if (this.siteServer && this.siteServer._sites && this.siteServer._sites.size > 0) {
+      return { mode: 'host' }
+    }
+    return null
+  }
+
+  _hostSite(siteId) {
+    if (!this.siteServer || !this.siteServer._sites) return null
+    if (siteId && this.siteServer._sites.has(siteId)) return this.siteServer._sites.get(siteId)
+    return this.siteServer._sites.values().next().value || null
+  }
+
+  // Visitor: list a folder of a visited site. Pass siteId to address a
+  // specific concurrent visit; without one, the single active visit (or this
+  // device's own hosted site) is used for back-compat.
+  async listSitePath(path, siteId) {
+    const ctx = this._resolveVisitContext(siteId)
+    if (ctx && ctx.mode === 'host') {
+      const { fsp } = require('./compat.js')
+      const { listDir, resolveSitePath } = require('./siteProtocol.js')
+      const site = this._hostSite(siteId)
+      if (!site) return []
+      let target = site.root
+      if (path && path !== '/') {
+        const resolved = resolveSitePath(site.root, path)
+        if (resolved) {
+          const st = await fsp.stat(resolved).catch(() => null)
+          if (st && st.isDirectory()) target = resolved
+          else if (st && st.isFile()) return [{ name: require('path').basename(resolved), path, type: 'file', size: st.size, mtimeMs: st.mtimeMs }]
+        }
+      }
+      return listDir(fsp, target, site.root)
+    }
+    if (!this.siteVisitor) throw new Error('SiteVisitor not initialized')
+    if (ctx && ctx.mode === 'visit') return this.siteVisitor.list(ctx.site.siteId, path)
+    throw new Error('Not visiting that folder')
+  }
+
+  // Visitor: read a file (or byte range) from a visited site. Returns
+  // { status, size, start, end, hash, body } with the body SHA-256-verified.
+  async readSiteFile(path, opts = {}, siteId) {
+    // Back-compat: callers may pass siteId as the 2nd arg.
+    if (typeof opts === 'string') { siteId = opts; opts = {} }
+    const ctx = this._resolveVisitContext(siteId)
+    if (ctx && ctx.mode === 'host') {
+      const { fsp } = require('./compat.js')
+      const { resolveSiteFile, getSiteMimeType: _mime, parseRange } = require('./siteProtocol.js')
+      const site = this._hostSite(siteId)
+      if (site) {
+        const info = await resolveSiteFile(fsp, site.root, path, { spa: !!site.spa })
+        if (info.kind === 'file') {
+          const body = await fsp.readFile(info.abs)
+          const mime = _mime(info.abs)
+          const size = body.length
+          // Honor byte ranges so <video> streaming/seeking works when a host
+          // previews its own folder (the visitor path already ranges; the host
+          // path used to ignore opts.range and return the whole file as if it
+          // were the requested slice — corrupting video seek responses).
+          let start = 0
+          let end = size - 1
+          if (opts && opts.range) {
+            const r = parseRange(opts.range, size)
+            if (r) { start = r.start; end = r.end }
+            // Unsatisfiable/malformed range: fall back to the full body as a
+            // 0..size-1 slice; the gateway serves it (200/206 with correct
+            // Content-Range) rather than corrupting the response.
+          }
+          const slice = body.subarray(start, end + 1)
+          return { status: 'ok', size, start, end, hash: require('crypto').createHash('sha256').update(body).digest('hex'), body: slice, mime, etag: `${info.stat.mtimeMs.toString(36)}-${info.stat.size.toString(36)}` }
+        }
+      }
+    }
+    if (!this.siteVisitor) throw new Error('SiteVisitor not initialized')
+    if (ctx && ctx.mode === 'visit') return this.siteVisitor.read(ctx.site.siteId, path, opts)
+    throw new Error('Not visiting that folder')
+  }
+
+  async writeSiteFile(path, data, siteId) {
+    if (!this.siteVisitor) throw new Error('SiteVisitor not initialized')
+    const ctx = this._resolveVisitContext(siteId)
+    if (!ctx || ctx.mode !== 'visit') throw new Error('Not visiting that folder')
+    return this.siteVisitor.writeFile(ctx.site.siteId, path, data)
+  }
+
+  async mkdirSitePath(path, siteId) {
+    if (!this.siteVisitor) throw new Error('SiteVisitor not initialized')
+    const ctx = this._resolveVisitContext(siteId)
+    if (!ctx || ctx.mode !== 'visit') throw new Error('Not visiting that folder')
+    return this.siteVisitor.mkdir(ctx.site.siteId, path)
+  }
+
+  async deleteSitePath(path, siteId) {
+    if (!this.siteVisitor) throw new Error('SiteVisitor not initialized')
+    const ctx = this._resolveVisitContext(siteId)
+    if (!ctx || ctx.mode !== 'visit') throw new Error('Not visiting that folder')
+    return this.siteVisitor.remove(ctx.site.siteId, path)
+  }
+
+  // Recursive folder stats from the hosting device: file/dir count, total
+  // bytes, newest mtime. Lets the visitor's folder-card grid show rich
+  // metadata without walking the whole tree over the wire.
+  async siteStats(siteId) {
+    if (!this.siteVisitor || !siteId) throw new Error('SiteVisitor not initialized')
+    const ctx = this._resolveVisitContext(siteId)
+    if (!ctx || ctx.mode !== 'visit') throw new Error('Not visiting that folder')
+    return this.siteVisitor.stats(ctx.site.siteId)
+  }
+
+  listActiveSites() {
+    if (this.siteServer && typeof this.siteServer.listActiveSites === 'function') return this.siteServer.listActiveSites()
+    return []
+  }
+
+  // Folders shared TO us (invites we accepted persist here) — survives restart.
+  async listReceivedSites() {
+    try {
+      const bee = await this.storage.getBee('visitedSites')
+      const out = []
+      const now = Date.now()
+      for await (const node of bee.createReadStream()) {
+        const v = node.value
+        if (v && v.expiresAt > 0 && now >= v.expiresAt) { await bee.del(node.key).catch(() => {}); continue }
+        if (v && v.code) out.push({ siteId: v.siteId, code: v.code, name: v.name, expiresAt: v.expiresAt || 0, hostPeerId: v.hostPeerId, addedAt: v.addedAt || 0, hostName: v.hostName || '', hostDeviceId: v.hostDeviceId || '' })
+      }
+      return out
+    } catch { return [] }
+  }
+
+  async removeReceivedSite(siteId) {
+    try {
+      const bee = await this.storage.getBee('visitedSites')
+      await bee.del(siteId).catch(() => {})
+    } catch {}
+    return { success: true }
+  }
+
+  async updateSite(siteId, patch) {
+    if (!this.siteManager) throw new Error('SiteManager not initialized')
+    const site = await this.siteManager.updateSite(siteId, patch)
+    // Keep live SiteServer mirror fresh if that site is currently published
+    if (this.siteServer && this.siteServer._sites && this.siteServer._sites.has(siteId)) {
+      const live = this.siteServer._sites.get(siteId)
+      Object.assign(live, site)
+      if (patch.folderPath) live.root = require('path').resolve(site.folderPath)
+    }
+    return site
+  }
+
+  // True when `peerId` is a known site-session peer: either WE are hosting and
+  // the peer is allowlisted on any active site (or has a live visitor session),
+  // or WE are visiting a site hosted by that peer. Site sessions are
+  // allowlist-authenticated, NOT device-paired — so the automatic pairing
+  // challenge loop must leave these connections alone (same contract as claims
+  // + watch-party media).
+  isSiteSessionPeer(peerId) {
+    if (!peerId) return false
+    const server = this.siteServer
+    if (server) {
+      if (server._visitors && server._visitors.has(peerId)) return true
+      for (const s of server._sites.values()) {
+        if (s.allowlist && s.allowlist.some((e) => (typeof e === 'string' ? e === peerId : e.key === peerId))) return true
+      }
+    }
+    // Visiting: while a site visit is pending/active, the user's intent is to
+    // browse a site (not pair), so we suppress automatic pairing challenges to
+    // whichever peer is answering. Once the host is known, only that peer is a
+    // site peer. Also: a host that verified us for one of its sites (we answered
+    // its SITE_VERIFY_CHALLENGE) is a site relationship, not a pairing.
+    const visitor = this.siteVisitor
+    if (visitor && visitor._verifierHosts && visitor._verifierHosts.has(peerId)) {
+      return true
+    }
+    // A peer is a site peer when it hosts one of our active visits, or when one
+    // of our visits is still discovering (host not yet known) — in that window
+    // we leave every connection alone so the discovery/hello can complete.
+    if (visitor && visitor.listActiveVisits) {
+      const visits = visitor.listActiveVisits()
+      for (const v of visits) {
+        if (!v.hostPeerId) return true // pending discover — suppress all auto-challenges
+        if (v.hostPeerId === peerId) return true
+      }
     }
     return false
   }

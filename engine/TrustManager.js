@@ -35,7 +35,8 @@ class TrustManager {
     isRefreshing,
     onTrustGranted,
     getDeviceIdentity,
-    getPeerId
+    getPeerId,
+    isSiteSessionPeer
   }) {
     this.getBee = getBee
     this.computeTopicHash = computeTopicHash
@@ -49,6 +50,7 @@ class TrustManager {
     this.onTrustGranted = onTrustGranted || (() => {}) // (peerId, code) => void
     this.getDeviceIdentity = getDeviceIdentity || (() => ({}))
     this.getPeerId = getPeerId || (() => '')
+    this.isSiteSessionPeer = isSiteSessionPeer || (() => false) // () => bool
     this.pairingSecrets = new Map() // codeId -> { code, role, createdAt, expiresAt, codeId }
     this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
     this.revokedKeys = new Map() // hex noise public key -> revokedAt ms; refused until a fresh pairing
@@ -379,6 +381,101 @@ class TrustManager {
     return cleanCode
   }
 
+  // MeshDrop Sites — register a VISITOR's pairing code on the HOST side so the
+  // host can verify that the visitor holds it (the allowlist flow). The host
+  // joins the visitor's own pairing topic (which every device announces
+  // permanently) and challenges; the visitor answers with mac(code, nonce); a
+  // match proves code ownership and the visitor's key is allowlisted — WITHOUT
+  // granting device trust.
+  //
+  // CRITICAL SCOPE BOUNDARY: this must NOT auto-answer challenges for the code
+  // (unlike registerJoinerCode's reciprocal handleChallenge path). If the host
+  // answered a challenge on the visitor's topic with this code, it would
+  // impersonate the visitor and could complete a pairing that grants the host
+  // trust on the visitor's side. Site verification is one-way: the HOST
+  // challenges, the VISITOR answers.
+  //
+  // Returns { code, codeId, topic, nonceHex, macHex? } for the caller to send,
+  // or null if the format is invalid.
+  registerHostVerificationCode(rawCode) {
+    const cleanCode = normalizePairingCode(rawCode)
+    if (!cleanCode) return null
+    const cid = codeId(cleanCode)
+    const topic = `p2p-pair-${cleanCode}`
+    this._joinPairingTopic(cleanCode)
+    // Host-side verification intent: bring the relay up right away so the
+    // challenge reaches the visitor even in lazy-'auto' mode (same as pairing
+    // intent does for a joiner).
+    if (this.relayClient) this.relayClient.start()
+    const nonce = randomBytes(16)
+    const challenge = { codeId: cid, nonce: b4a.toString(nonce, 'hex') }
+    return { code: cleanCode, codeId: cid, topic, challenge, nonce: challenge.nonce }
+  }
+
+  // Leave a visitor's pairing topic after a host-side site verification settles
+  // (success, failure, or timeout). Mirrors dropJoinerCode: never touches host
+  // secrets (role: 'host'). Harmless no-op if the topic was never joined.
+  leaveHostVerificationCode(code) {
+    if (!code) return
+    try {
+      if (this.relayClient) this.relayClient.leave(`p2p-pair-${code}`)
+      if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
+    } catch {}
+  }
+
+  // VISITOR side of a site allowlist challenge (SITE_VERIFY_CHALLENGE from a
+  // host that was given one of OUR MD- codes). We answer with mac(code, nonce)
+  // over the same channel the challenge arrived on. This proves we hold the
+  // code WITHOUT any device pairing/trust — it is a pure capability proof for
+  // the host's site allowlist. The host's PAIRING challenge/response machinery
+  // is never involved, so this cannot grant the host trust on our side.
+  // When `viaRelay` is true the response also carries our noise publicKey
+  // (the relay has no authenticated peer identity, so the host needs it to
+  // know which key to allowlist).
+  handleSiteVerifyChallenge(sendFn, msg, viaRelay) {
+    if (!msg || typeof msg.nonce !== 'string' || typeof msg.codeId !== 'string') return
+    const secret = this.pairingSecrets.get(msg.codeId)
+    // Only answer for a code we actually hold (our permanent host code, or a
+    // joiner code we entered). Never answer for a code we don't have.
+    if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) return
+    const nonceBuf = b4a.from(msg.nonce, 'hex')
+    if (nonceBuf.length !== 16) return
+    const sig = mac(secret.code, nonceBuf)
+    const resp = {
+      type: 'SITE_VERIFY_RESP',
+      siteId: msg.siteId,
+      codeId: msg.codeId,
+      nonce: msg.nonce,
+      mac: b4a.toString(sig, 'hex')
+    }
+    if (viaRelay && this.getPeerId) {
+      const myKey = this.getPeerId()
+      if (myKey) resp.publicKey = myKey
+    }
+    try {
+      sendFn(resp)
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to send SITE_VERIFY_RESP:', err.message)
+    }
+  }
+
+  // MeshDrop Sites — verify a visitor's PAIRING_RESP against a code the host
+  // registered via registerHostVerificationCode. Confirms the MAC ONLY; never
+  // grants device trust (does not touch trustedPeerKeys / onTrustGranted —
+  // KB invariant 3). On success the caller may add the visitor's Noise public
+  // key (from the transport) to the site allowlist. Returns the matched
+  // { code } or null.
+  verifyHostVerificationResponse(visitorCode, challenge, answerMac) {
+    if (!challenge || typeof answerMac !== 'string' || typeof visitorCode !== 'string') return null
+    const expected = b4a.toString(mac(visitorCode, b4a.from(String(challenge.nonce), 'hex')), 'hex')
+    // Constant-time compare — the MAC is a capability proof.
+    if (expected.length !== answerMac.length) return null
+    const a = b4a.from(expected, 'hex')
+    const b = b4a.from(answerMac, 'hex')
+    if (!a.equals(b)) return null
+    return { code: visitorCode }
+  }
+
   /**
    * Broadcast pairing challenges to all connected peers that require verification,
    * and answer any pending challenges that arrived before the secret was registered.
@@ -438,6 +535,27 @@ class TrustManager {
   // Handle messages received over the Cloudflare Port 443 WSS Relay
   handleRelayMessage(topic, msg, fromPeerId) {
     if (!msg || typeof msg !== 'object') return
+
+    // MeshDrop Sites allowlist verification over the relay:
+    //  - A host's SITE_VERIFY_CHALLENGE reaches the visitor here; answer it.
+    //  - A visitor's SITE_VERIFY_RESP reaches the host here; hand it to the
+    //    SiteManager hook (the same MAC verification as the direct path).
+    if (msg.type === 'SITE_VERIFY_CHALLENGE') {
+      if (this.relayClient) {
+        this.handleSiteVerifyChallenge((resp) => this.relayClient.send(topic, resp), msg, true)
+      }
+      return
+    }
+    if (msg.type === 'SITE_VERIFY_RESP') {
+      // The host's SiteManager verifies + allowlists (same MAC check as the
+      // direct path). The engine wires this.siteManager.
+      if (this.siteManager && typeof this.siteManager.handleRelayVerifyResponse === 'function') {
+        this.siteManager.handleRelayVerifyResponse(fromPeerId, msg).catch((err) => {
+          console.warn('[MeshEngine] Relay SITE_VERIFY_RESP handling failed:', err.message)
+        })
+      }
+      return
+    }
 
     // 1. Inbound Pairing Challenge from Joiner via WSS relay
     if (msg.type === MESSAGES.PAIRING_CHALLENGE) {
@@ -625,6 +743,9 @@ class TrustManager {
       const p = this.getPeers().get(peerId)
       if (!p || !p.pairing) return
       if (p.pairing.trusted || p.pairing.complete) return
+      // Site-session peers (allowlist-authenticated, never paired) must not be
+      // killed by the pairing watchdog — their connection is the site session.
+      if (this.isSiteSessionPeer && this.isSiteSessionPeer(peerId)) return
       console.warn(
         `[MeshEngine] Pairing timed out for ${peerId.slice(0, 12)}... (challenge never verified)`
       )
@@ -748,11 +869,20 @@ class TrustManager {
     // completes on BOTH sides. A challenge we cannot answer (neither side
     // knows the other's code) keeps its suppression — answering is impossible
     // and re-arming would only continue the connect/destroy loop.
-    if (secretUsable) {
-      this.unansweredPairings.delete(peerId)
-      this._armPairingTimeout(peerId)
-    } else if (!this._isPairingSuppressed(peerId)) {
-      this._armPairingTimeout(peerId)
+    // Site-session peers (allowlist-authenticated, not pairing) never arm the
+    // watchdog: their connection must survive for browsing, and an unanswered
+    // cross-code challenge is expected, not a failure.
+    const isSitePeer =
+      this.isSiteSessionPeer && typeof this.isSiteSessionPeer === 'function'
+        ? this.isSiteSessionPeer(peerId)
+        : false
+    if (!isSitePeer) {
+      if (secretUsable) {
+        this.unansweredPairings.delete(peerId)
+        this._armPairingTimeout(peerId)
+      } else if (!this._isPairingSuppressed(peerId)) {
+        this._armPairingTimeout(peerId)
+      }
     }
 
     if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) {
@@ -786,9 +916,10 @@ class TrustManager {
     // CHALLENGER's side. If we were not already challenging them (no outstanding
     // nonce), challenge them back with the code we hold — they can only answer
     // it if they genuinely know it. Guarded by hadOutstanding so two actively
-    // pairing peers cannot ping-pong challenges forever.
+    // pairing peers cannot ping-pong challenges forever. Site-session peers are
+    // never reciprocated (they are not pairing).
     const hadOutstanding = peerObj.pairing.outstanding.length > 0
-    if (!hadOutstanding && !peerObj.pairing.trusted) {
+    if (!hadOutstanding && !peerObj.pairing.trusted && !isSitePeer) {
       this.sendChallenges(peerId, { force: true })
     }
   }
