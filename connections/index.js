@@ -253,6 +253,7 @@ function createConnections(engine) {
       pendingHandshake: null, // HANDSHAKE received before our challenge verified
       timeout: null,
       code: null,
+      partyAuthorizedRoom: null, // temporary room-code auth; never device trust
     };
 
     ctx.peers.set(peerId, {
@@ -262,6 +263,15 @@ function createConnections(engine) {
       transferMethod,
       pairing,
     });
+
+    // Joining a DHT topic initiates discovery; the Watch Party guest often
+    // selected its room before this peer existed. Let the room manager queue
+    // its membership announcement on the newly registered signaling peer.
+    if (typeof ctx.refs.handleWatchPeerAvailable === "function") {
+      try {
+        ctx.refs.handleWatchPeerAvailable(peerId);
+      } catch {}
+    }
 
     if (directTrusted) {
       replicateExchange(peerId);

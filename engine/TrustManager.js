@@ -613,6 +613,18 @@ class TrustManager {
     const peerObj = this.getPeers().get(peerId)
     if (!peerObj || !peerObj.pairing) return
     if (peerObj.pairing.trusted || peerObj.pairing.complete) return
+    // A Watch Party room code authorizes only that room's control/media
+    // connection. It does NOT make the device trusted, but its transfer may
+    // legitimately outlive the pairing watchdog. Delayed signaling retries
+    // can arrive after the party handler cleared an earlier timer, so refuse
+    // to re-arm while this exact room-scoped authorization is active.
+    if (peerObj.pairing.partyAuthorizedRoom) {
+      if (peerObj.pairing.timeout) {
+        clearTimeout(peerObj.pairing.timeout)
+        peerObj.pairing.timeout = null
+      }
+      return
+    }
     if (peerObj.pairing.timeout) clearTimeout(peerObj.pairing.timeout)
     // Network-transition awareness: when the swarm is being rebuilt (Wi-Fi →
     // cellular, router swap), the challenge/response legitimately takes longer
@@ -625,6 +637,7 @@ class TrustManager {
       const p = this.getPeers().get(peerId)
       if (!p || !p.pairing) return
       if (p.pairing.trusted || p.pairing.complete) return
+      if (p.pairing.partyAuthorizedRoom) return
       console.warn(
         `[MeshEngine] Pairing timed out for ${peerId.slice(0, 12)}... (challenge never verified)`
       )

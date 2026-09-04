@@ -136,6 +136,15 @@ function connectPeers(sideA, sideB) {
     device: { id: 'dev-' + sideA.peerKey, publicKey: sideA.peerKey, name: sideA.peerKey },
     pairing: { trusted: false, timeout: watchdogB }
   })
+
+  // Mirror the production connection lifecycle: room membership may have
+  // been selected before Hyperswarm finishes establishing this peer.
+  if (typeof sideA.watchParty.handlePeerAvailable === 'function') {
+    sideA.watchParty.handlePeerAvailable(sideB.peerKey)
+  }
+  if (typeof sideB.watchParty.handlePeerAvailable === 'function') {
+    sideB.watchParty.handlePeerAvailable(sideA.peerKey)
+  }
 }
 
 function pairingWatchdogOf(side, otherPeerKey) {
@@ -235,6 +244,13 @@ async function runAllTests() {
       pairingWatchdogOf(host, guestA.peerKey) === null && pairingWatchdogOf(guestA, host.peerKey) === null,
       'host: ' + String(pairingWatchdogOf(host, guestA.peerKey)) + ' guest: ' + String(pairingWatchdogOf(guestA, host.peerKey))
     )
+    assert(
+      'Room authorization is scoped without granting device trust',
+      host.peers.get(guestA.peerKey).pairing.partyAuthorizedRoom === room.roomCode &&
+        guestA.peers.get(host.peerKey).pairing.partyAuthorizedRoom === room.roomCode &&
+        host.peers.get(guestA.peerKey).pairing.trusted === false &&
+        guestA.peers.get(host.peerKey).pairing.trusted === false
+    )
 
     // Playback sync flows alongside the media transfer.
     host.watchParty.broadcastPlaybackState({ action: 'play', positionSec: 42.5 })
@@ -245,15 +261,35 @@ async function runAllTests() {
     assert('Pause sync reached guest', stateSyncEvents.some((e) => e.action === 'pause' && e.positionSec === 42.5))
     assert('Seek sync reached guest', stateSyncEvents.some((e) => e.action === 'seek' && e.positionSec === 100))
 
-    // ── Test 2: Late joiner still gets the staged media ─────────────────────
-    console.log('\nTest 2: Late joiner receives the staged media')
+    // ── Test 2: Room selected before the DHT peer exists ────────────────────
+    console.log('\nTest 2: Guest joins before its room-topic peer connection exists')
     const guestB = makeSide('guest-b-key', 'Second Desktop', tmpRoot)
-    connectPeers(host, guestB)
-
     await guestB.watchParty.joinRoom({ roomCode: room.roomCode })
-    const completedB = await waitForCompletedTransfer(guestB, room.shareId, 'guest B')
+    const completedBPromise = waitForCompletedTransfer(guestB, room.shareId, 'guest B delayed connection')
+    connectPeers(host, guestB)
+    const completedB = await withTimeout(
+      completedBPromise,
+      5000,
+      'guest B media after delayed peer connection'
+    )
     const receivedB = await fsp.readFile(completedB.destPath)
-    assert('Late joiner received byte-identical media', receivedB.equals(mediaBytes))
+    assert('Delayed-connection guest received byte-identical media', receivedB.equals(mediaBytes))
+
+    // A signaling reconnect/open callback can repeat membership. The host may
+    // resend the descriptor, but it must not duplicate participants or live
+    // replication streams on the same connection.
+    guestB.watchParty.handlePeerAvailable(host.peerKey)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert(
+      'Repeated peer availability keeps one participant entry',
+      host.watchParty.activeRoom.participants.has(guestB.peerKey) &&
+        host.watchParty.activeRoom.participants.size === 2
+    )
+    assert(
+      'Repeated peer availability reuses the existing media stream',
+      host.peers.get(guestB.peerKey).dropStreams.length === 1 &&
+        guestB.peers.get(host.peerKey).dropStreams.length === 1
+    )
 
     // ── Test 3: Rejoin with completed media reports source-ready instantly ──
     console.log('\nTest 3: Rejoin with completed media')
@@ -275,7 +311,15 @@ async function runAllTests() {
     // ── Test 4: Teardown ─────────────────────────────────────────────────────
     console.log('\nTest 4: Room teardown')
     await guestB.watchParty.leaveRoom()
+    assert(
+      'Guest clears its room-scoped authorization on leave',
+      guestB.peers.get(host.peerKey).pairing.partyAuthorizedRoom == null
+    )
     await host.watchParty.leaveRoom()
+    assert(
+      'Host clears all room-scoped authorizations on close',
+      Array.from(host.peers.values()).every((peerObj) => peerObj.pairing.partyAuthorizedRoom == null)
+    )
     assert('Host room closed cleanly', host.watchParty.activeRoom === null)
 
     for (const side of [host, guestA, guestB]) {

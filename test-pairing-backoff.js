@@ -9,7 +9,9 @@
 // 4. An incoming challenge we CAN answer resets suppression, is answered, and
 //    is reciprocated so trust completes on BOTH sides (ping-pong guarded).
 // 5. registerJoinerCode (user entered a code) clears suppression for everyone.
-// 6. A verified response clears the backoff and grants trust.
+// 6. Room-scoped party authorization prevents delayed watchdog re-arming
+//    without granting device trust.
+// 7. A verified response clears the backoff and grants trust.
 
 const { TrustManager } = require('./engine/TrustManager.js')
 const { mac, randomBytes, codeId } = require('./crypto.js')
@@ -146,7 +148,20 @@ async function runAllTests() {
   assert('Joiner code accepted', typeof joined === 'string' && joined.startsWith('MD-'), String(joined))
   assert('registerJoinerCode clears suppression for all peers', !tm._isPairingSuppressed('peer-c'))
 
-  // ── 6. Verified response clears backoff and grants trust ─────────────────
+  // ── 6. Party authorization blocks delayed watchdog re-arm ────────────────
+  addPeer(peers, 'peer-party')
+  const partyPeer = peers.get('peer-party')
+  partyPeer.pairing.partyAuthorizedRoom = 'PARTY-TEST'
+  tm.sendChallenges('peer-party')
+  assert('Party peer can remain untrusted', partyPeer.pairing.trusted === false)
+  assert('Pairing challenge may still be sent during a party', challengesTo('peer-party') > 0)
+  assert('Party authorization prevents watchdog re-arm', partyPeer.pairing.timeout == null)
+  partyPeer.pairing.partyAuthorizedRoom = null
+  partyPeer.pairing.outstanding = []
+  tm.sendChallenges('peer-party')
+  assert('Watchdog resumes after party authorization clears', !!partyPeer.pairing.timeout)
+
+  // ── 7. Verified response clears backoff and grants trust ─────────────────
   const outstanding = peers.get('peer-a').pairing.outstanding[0]
   tm._recordUnansweredPairing('peer-a')
   assert('peer-a re-suppressed for the test', tm._isPairingSuppressed('peer-a'))

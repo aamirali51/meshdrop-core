@@ -591,6 +591,8 @@ class MeshEngine extends EventEmitter {
       this.connections.refs.handleSyncVerify = (peerId, msg) => this.syncEngine.handleSyncVerify(peerId, msg)
       this.connections.refs.handleSyncVerifyResult = (peerId, msg) => this.syncEngine.handleSyncVerifyResult(peerId, msg)
       this.connections.refs.handleWatchMessage = (peerId, msg) => this.watchParty && this.watchParty.handleMessage(peerId, msg)
+      this.connections.refs.handleWatchPeerAvailable = (peerId) =>
+        this.watchParty && this.watchParty.handlePeerAvailable(peerId)
     }
 
     this.watchParty = new WatchPartyManager({ engine: this })

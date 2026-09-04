@@ -175,8 +175,6 @@ class WatchPartyManager extends EventEmitter {
       this.engine.topicRegistry.join(topic, { client: true, server: true })
     }
 
-    const myIdentity = this.engine.storage?.getDeviceIdentity?.() || { name: 'Peer Device' }
-
     this.activeRoom = {
       roomCode: cleanCode,
       shareId: `watch-${cleanCode.toLowerCase()}`,
@@ -188,18 +186,65 @@ class WatchPartyManager extends EventEmitter {
     }
     this._mediaReadyNotified = false
 
-    // Send join message to the swarm
-    this._broadcastRoomMessage({
+    // Send join message to peers that already exist. Peers discovered after
+    // this point receive the same message via handlePeerAvailable().
+    this._broadcastRoomMessage(this._buildRoomJoinMessage())
+
+    this.emit(PARTY_EVENTS.ROOM_JOINED, this.getRoomInfo())
+    return this.getRoomInfo()
+  }
+
+  /**
+   * A room-topic peer may appear only after joinRoom() has returned. Re-send
+   * this guest's membership to that specific peer so the host can authorize
+   * and serve the media. Signaling queues the message until its channel opens.
+   * Reconnects intentionally repeat this idempotent announcement.
+   */
+  handlePeerAvailable(peerId) {
+    const room = this.activeRoom
+    if (!room || room.isHost || !peerId) return false
+
+    const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(peerId) : null
+    if (!peerObj || !peerObj.signaling || typeof peerObj.signaling.send !== 'function') {
+      return false
+    }
+
+    try {
+      peerObj.signaling.send(this._buildRoomJoinMessage())
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  _buildRoomJoinMessage() {
+    const myIdentity = this.engine.storage?.getDeviceIdentity?.() || { name: 'Peer Device' }
+    return {
       type: 'WATCH_ROOM_JOIN',
-      roomCode: cleanCode,
+      roomCode: this.activeRoom.roomCode,
       peer: {
         id: myIdentity.id || 'peer',
         name: myIdentity.name || 'Peer'
       }
-    })
+    }
+  }
 
-    this.emit(PARTY_EVENTS.ROOM_JOINED, this.getRoomInfo())
-    return this.getRoomInfo()
+  _authorizePartyPeer(peerId, roomCode) {
+    const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(peerId) : null
+    if (!peerObj || !peerObj.pairing) return
+    peerObj.pairing.partyAuthorizedRoom = roomCode
+    if (peerObj.pairing.timeout) {
+      clearTimeout(peerObj.pairing.timeout)
+      peerObj.pairing.timeout = null
+    }
+  }
+
+  _clearPartyPeerAuthorization(peerId, roomCode) {
+    const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(peerId) : null
+    if (!peerObj || !peerObj.pairing) return
+    if (peerObj.pairing.partyAuthorizedRoom === roomCode) {
+      peerObj.pairing.partyAuthorizedRoom = null
+    }
   }
 
   /**
@@ -239,6 +284,14 @@ class WatchPartyManager extends EventEmitter {
     }
     this._mediaStreams.clear()
     this._mediaReadyNotified = false
+
+    // Room-code knowledge is deliberately narrower than paired-device trust.
+    // Remove that temporary connection exemption when this room ends.
+    if (this.engine && this.engine.peers) {
+      for (const peerId of this.engine.peers.keys()) {
+        this._clearPartyPeerAuthorization(peerId, room.roomCode)
+      }
+    }
 
     this.activeRoom = null
     this.emit(PARTY_EVENTS.ROOM_LEFT, { roomCode: room.roomCode })
@@ -373,6 +426,7 @@ class WatchPartyManager extends EventEmitter {
       this.emit(PARTY_EVENTS.DISCOVERED_ROOMS, this.listDiscoveredRooms())
     } else if (msg.type === 'WATCH_ROOM_JOIN') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
+        this._authorizePartyPeer(peerId, msg.roomCode)
         this.activeRoom.participants.set(peerId, {
           peerId,
           name: msg.peer?.name || 'Peer',
@@ -394,6 +448,7 @@ class WatchPartyManager extends EventEmitter {
       this._handleMediaOffer(peerId, msg).catch(() => {})
     } else if (msg.type === 'WATCH_ROOM_LEAVE') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
+        this._clearPartyPeerAuthorization(peerId, msg.roomCode)
         this.activeRoom.participants.delete(peerId)
         this.emit(PARTY_EVENTS.PEER_LEFT, { roomCode: msg.roomCode, peerId })
       }
@@ -431,13 +486,9 @@ class WatchPartyManager extends EventEmitter {
     const exchangeStore = this.engine.storage && this.engine.storage.exchangeStore
     if (!peerObj || !peerObj.connection || !exchangeStore) return
 
-    // A party media connection may never verify a pairing challenge (guests
-    // join by room code, not pairing): drop the watchdog so a long transfer is
-    // not killed mid-stream — the same contract the claims flow uses.
-    if (peerObj.pairing && peerObj.pairing.timeout) {
-      clearTimeout(peerObj.pairing.timeout)
-      peerObj.pairing.timeout = null
-    }
+    // Guests join by room code, not device pairing. Keep that authorization
+    // connection-scoped so delayed pairing retries cannot kill long media.
+    this._authorizePartyPeer(peerId, room.roomCode)
 
     try {
       const core = exchangeStore.get({ name: room.shareId })
@@ -502,6 +553,11 @@ class WatchPartyManager extends EventEmitter {
     room.filename = filename
     room.fileSize = fileSize
 
+    // The offer is accepted only from the active room and for its
+    // deterministic share id, so it activates the same narrow authorization
+    // on the guest side before any delayed pairing retry can re-arm.
+    this._authorizePartyPeer(peerId, room.roomCode)
+
     const transferEngine = this.engine && this.engine.transferEngine
     if (!transferEngine) return
 
@@ -528,10 +584,6 @@ class WatchPartyManager extends EventEmitter {
       const peerObj = this.engine.peers ? this.engine.peers.get(peerId) : null
       const exchangeStore = this.engine.storage && this.engine.storage.exchangeStore
       if (peerObj && peerObj.connection && exchangeStore) {
-        if (peerObj.pairing && peerObj.pairing.timeout) {
-          clearTimeout(peerObj.pairing.timeout)
-          peerObj.pairing.timeout = null
-        }
         const core = exchangeStore.get(Buffer.from(coreKey, 'hex'))
         await core.ready()
         let stream = peerObj.partyMediaStream
