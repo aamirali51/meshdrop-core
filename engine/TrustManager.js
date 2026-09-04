@@ -50,6 +50,7 @@ class TrustManager {
     this.onTrustGranted = onTrustGranted || (() => {}) // (peerId, code) => void
     this.getDeviceIdentity = getDeviceIdentity || (() => ({}))
     this.getPeerId = getPeerId || (() => '')
+    this.engine = null // wired to the owning MeshEngine after construction
     this.isSiteSessionPeer = isSiteSessionPeer || (() => false) // () => bool
     this.pairingSecrets = new Map() // codeId -> { code, role, createdAt, expiresAt, codeId }
     this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
@@ -626,7 +627,14 @@ class TrustManager {
       const peerIdentity = msg.identity || {}
       const targetPublicKey = peerIdentity.publicKey || fromPeerId || `relay-${Date.now()}`
       const deviceId = peerIdentity.id || (targetPublicKey ? targetPublicKey.slice(0, 16) : 'remote-device')
+      const nowIso = new Date().toISOString()
 
+      // A relay pairing is the mobile app's fallback path when direct DHT
+      // connectivity fails, so it is exercised on first pairing and on every
+      // reconnect after a phone app update. Presence: the peer has no socket
+      // and no close event — isOnline is derived from relay-liveness freshness,
+      // so the persisted row must never carry a stale "true" (which would keep
+      // the device green in the desktop list forever).
       const remoteDevice = {
         id: deviceId,
         publicKey: targetPublicKey,
@@ -636,11 +644,13 @@ class TrustManager {
         avatar: peerIdentity.avatar || '',
         isTrusted: true,
         isEncrypted: true,
-        isOnline: true,
-        lastSeen: new Date().toISOString(),
+        isOnline: false,
+        lastSeen: nowIso,
+        relayLastSeen: nowIso,
         transferMethod: 'relay',
         relayed: true,
-        trustedAt: new Date().toISOString()
+        pairedVia: (this.getDeviceIdentity ? this.getDeviceIdentity().id : null) || null,
+        trustedAt: nowIso
       }
 
       if (targetPublicKey && targetPublicKey.length === 64) {
@@ -650,7 +660,24 @@ class TrustManager {
 
       // Persist in device bee
       this.getBee('devices')
-        .then((bee) => bee.put(deviceId, remoteDevice))
+        .then(async (bee) => {
+          // Preserve a user's custom rename across relay reconnects (the
+          // "renamed phone resets to 'MeshDrop Mobile'" bug).
+          const existing = await bee.get(deviceId).catch(() => null)
+          const prev = (existing && existing.value) || null
+          if (prev) {
+            if (prev.customName) remoteDevice.name = prev.customName
+            remoteDevice.customName = prev.customName || ''
+            if (!prev.customName) remoteDevice.lastReportedName = peerIdentity.name || ''
+            remoteDevice.avatar = prev.avatar || remoteDevice.avatar
+            remoteDevice.trustedAt = prev.trustedAt || remoteDevice.trustedAt
+            remoteDevice.pairedVia = prev.pairedVia || remoteDevice.pairedVia
+          } else {
+            remoteDevice.customName = ''
+            remoteDevice.lastReportedName = remoteDevice.name || ''
+          }
+          await bee.put(deviceId, remoteDevice)
+        })
         .catch(() => {})
 
       // Send reciprocal handshake info back via relay
@@ -667,6 +694,14 @@ class TrustManager {
 
       this.onTrustGranted(targetPublicKey, outstanding.code)
       this.emit(EVENTS.TRUST_PAIRED, { peer: remoteDevice, code: outstanding.code })
+      // The relay pair is verified and live right now — nudge the engine's
+      // relay-presence clock so a just-paired device can never read as stale.
+      try {
+        const dev = this.getPeers().get(targetPublicKey)?.device
+        if (dev && typeof dev.isOnline === 'boolean' && dev.relayed) {
+          if (this.engine && typeof this.engine.touchPresence === 'function') this.engine.touchPresence(dev)
+        }
+      } catch {}
       this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
       return
     }
@@ -677,20 +712,52 @@ class TrustManager {
       const targetPublicKey = peerIdentity.publicKey || fromPeerId
       if (targetPublicKey && this.isTrustedPublicKey(targetPublicKey)) {
         const deviceId = peerIdentity.id || targetPublicKey.slice(0, 16)
+        const nowIso = new Date().toISOString()
+        // This path re-fires on every relay reconnect (e.g. after a phone app
+        // update). Presence is derived from relay-liveness freshness, never
+        // from the persisted row — the row must not carry stale "true".
         const remoteDevice = {
           id: deviceId,
           publicKey: targetPublicKey,
           name: peerIdentity.name || 'Remote Peer',
           os: peerIdentity.os || 'Unknown',
+          osVersion: peerIdentity.osVersion || '',
+          avatar: peerIdentity.avatar || '',
           isTrusted: true,
-          isOnline: true,
-          lastSeen: new Date().toISOString(),
+          isOnline: false,
+          lastSeen: nowIso,
+          relayLastSeen: nowIso,
           transferMethod: 'relay',
-          relayed: true
+          relayed: true,
+          trustedAt: new Date().toISOString()
         }
+        // Preserve a user's custom rename across relay reconnects, and carry
+        // the earlier pairing metadata (pairedVia, avatar) forward.
         this.getBee('devices')
-          .then((bee) => bee.put(deviceId, remoteDevice))
+          .then(async (bee) => {
+            const existing = await bee.get(deviceId).catch(() => null)
+            const prev = (existing && existing.value) || null
+            if (prev) {
+              if (prev.customName) remoteDevice.name = prev.customName
+              remoteDevice.customName = prev.customName || ''
+              if (!prev.customName) remoteDevice.lastReportedName = peerIdentity.name || ''
+              remoteDevice.pairedVia = prev.pairedVia || remoteDevice.pairedVia
+              remoteDevice.avatar = prev.avatar || remoteDevice.avatar
+              remoteDevice.trustedAt = prev.trustedAt || remoteDevice.trustedAt
+            } else {
+              remoteDevice.customName = ''
+              remoteDevice.lastReportedName = remoteDevice.name || ''
+            }
+            await bee.put(deviceId, remoteDevice)
+          })
           .catch(() => {})
+        // The relay peer is verified and live right now — nudge relay-presence
+        // so the desktop list does not flip it to offline on the next refresh.
+        try {
+          if (this.engine && typeof this.engine.touchPresence === 'function') {
+            this.engine.touchPresence(remoteDevice)
+          }
+        } catch {}
         this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
       }
     }

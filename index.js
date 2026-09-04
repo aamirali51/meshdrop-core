@@ -33,6 +33,12 @@ const PAIR_WAIT_TIMEOUT = 60 * 1000 // max time pairWithCode waits for verificat
 const PAIR_DRIVE_INTERVAL_MS = 5 * 1000 // pairWithCode re-announces challenges + reconnects on this cadence
 const RELAY_FALLBACK_MS = 30 * 1000 // 'auto': relay engages after this long with zero direct peers
 const EXPIRATION_INTERVAL_MS = 10 * 1000
+// A paired device that last proved it was alive longer ago than this is shown
+// offline. Proven presence is a live authenticated peer (connections/index.js)
+// or a relay WSS round-trip touching this engine less than STALE ago. Anything
+// older is treated as gone — relay links carry no close event, so this timeout
+// (not the socket) is what turns a relay-paired phone offline after it drops.
+const PRESENCE_STALE_MS = 90 * 1000
 
 // Expiration presets for one-time DROP shares. Single source of truth so the
 // engine, Electron handlers, and the renderer agree on the accepted values.
@@ -219,6 +225,12 @@ class MeshEngine extends EventEmitter {
       http: config.relayHttp || null
     })
     this.expirationTimer = null
+    // Presence bookkeeping. This engine's own identity id (filled at
+    // start() from storage.setDeviceInfo) so stop() can mark devices we
+    // relayed/paired through OURSELVES offline without touching rows other
+    // engines wrote; and a monotonic clock for ordering relay liveness.
+    this.selfDeviceId = null
+    this.presenceClock = 0
     // Set when refreshNetwork() finds the DHT unreachable (dead network, no
     // replacement yet). A self-scheduled retry re-runs the rebuild so the
     // engine heals when connectivity silently returns without an OS event.
@@ -311,6 +323,25 @@ class MeshEngine extends EventEmitter {
   }
 
   async _rebuildSwarm() {
+    // Relay presence rides on this engine's wall-clock (presenceClock), which
+    // must survive a swarm rebuild — refreshNetwork() reconnects in place, so
+    // relay devices that were live moments ago must not be flagged stale.
+    if (this.selfDeviceId && this.storage) {
+      try {
+        const bee = await this.storage.getBee('devices')
+        for await (const node of bee.createReadStream()) {
+          const dev = node.value
+          if (!dev || typeof dev !== 'object') continue
+          if (dev.relayed !== true) continue
+          if (dev.pairedVia && dev.pairedVia !== this.selfDeviceId) continue
+          if (dev.relayLastSeen) {
+            await bee.put(node.key, { ...dev, isOnline: true })
+          }
+        }
+      } catch (err) {
+        console.warn('[MeshEngine] failed to preserve relay presence across rebuild:', err.message)
+      }
+    }
     console.log('[MeshEngine] Network change detected — rebuilding swarm')
     // Tear down established peer connections FIRST. swarm.destroy() kills the
     // DHT transport (UDP socket → NAT mappings, relay TCP) but does not iterate
@@ -319,6 +350,12 @@ class MeshEngine extends EventEmitter {
     // in-flight transfers keep writing into the dead socket. Destroying each
     // connection triggers the on('close') cleanup (peers map, replication
     // scope, claim streams, transfer park) immediately.
+    // Pause active transfers ~1s BEFORE destroying connections so in-flight
+    // scheduler waits bail instead of erroring on the torn-down transport;
+    // resume keeps the playhead and the sweeps continue from the lowest hole.
+    if (this.transferEngine && typeof this.transferEngine.onNetworkChanged === 'function') {
+      this.transferEngine.onNetworkChanged()
+    }
     for (const peerObj of this.peers.values()) {
       const conn = peerObj && peerObj.connection
       if (conn && typeof conn.destroy === 'function') {
@@ -339,6 +376,9 @@ class MeshEngine extends EventEmitter {
     if (this.metricsCollector && typeof this.metricsCollector.rebind === 'function') {
       this.metricsCollector.rebind(this.swarm)
     }
+    // Relay presence rides on this engine's wall-clock (presenceClock), which
+    // must survive a swarm rebuild — refreshNetwork() is called in-place, not a
+    // restart, so relay devices that were live moments ago must stay online.
     if (this.lanDiscovery) {
       this.lanDiscovery.swarm = this.swarm
       if (typeof this.lanDiscovery.refresh === 'function') {
@@ -368,6 +408,10 @@ class MeshEngine extends EventEmitter {
     }
 
     console.log('[MeshEngine] starting...')
+
+    // Presence bookkeeping: remember our own stable identity id so stop() can
+    // tell which devices this engine paired/relayed and mark them offline.
+    this.selfDeviceId = this.deviceIdentity?.id || null
 
     // The swarm noise keypair is this node's peer identity and MUST persist
     // across restarts: trust, device records, and direct reconnects all key
@@ -458,6 +502,7 @@ class MeshEngine extends EventEmitter {
     // TrustManager's relay path delegates SITE_VERIFY_RESP (host side) back to
     // SiteManager for MAC verification + allowlisting.
     this.trustManager.siteManager = this.siteManager
+    this.trustManager.engine = this
 
     this.notificationStore = new NotificationStore({
       emit: (event, data) => this.emit(event, data)
@@ -561,6 +606,12 @@ class MeshEngine extends EventEmitter {
       // Base dir for the .p2p-staging partial sweep at init.
       getStagingRoot: () => this.downloadsDir
     })
+    // Apply the host runtime's network profile (desktop vs mobile-wifi vs
+    // mobile-cellular) so the scheduler/prefetch/sync-window tuning is correct
+    // from the first transfer. Can change later via setNetworkProfile().
+    if (this.config.networkProfile) {
+      this.transferEngine.setNetworkProfile(this.config.networkProfile)
+    }
 
     this.syncEngine = new SyncEngine({
       getBee: this.storage.getBee,
@@ -742,6 +793,10 @@ class MeshEngine extends EventEmitter {
 
     const identity = await this.storage.initIdentity()
     console.log('[MeshEngine] Device identity:', identity.name, identity.id)
+    // initIdentity() is the source of the stable id the rest of start() relies
+    // on — set it here so stop() (and relay-presence bookkeeping) can identify
+    // rows this engine owns.
+    this.selfDeviceId = identity.id || this.selfDeviceId || null
 
     await this.trustManager.loadRevokedKeys()
     await this.trustManager.loadTrustedPeerKeys()
@@ -802,6 +857,16 @@ class MeshEngine extends EventEmitter {
       clearInterval(this.expirationTimer)
       this.expirationTimer = null
     }
+    // Mark paired relay devices offline BEFORE the connection bookkeeping is
+    // torn down. Direct peers already fall offline when their connection's
+    // 'close' fires; relay-paired devices have no socket and no close event, so
+    // without this their stale isOnline rows would survive the restart and make
+    // them look online until the staleness sweep runs.
+    try {
+      if (this.storage) await this._markPairedRelayDevicesOffline()
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to mark relay devices offline on stop:', err.message)
+    }
     if (this._networkRetryTimer) {
       clearTimeout(this._networkRetryTimer)
       this._networkRetryTimer = null
@@ -830,6 +895,73 @@ class MeshEngine extends EventEmitter {
       await this.storage.exchangeStore.close().catch(() => {})
     }
     console.log('[MeshEngine] stopped')
+    // Full teardown — clear presence bookkeeping so a later start() re-inits it.
+    this.selfDeviceId = null
+    this.presenceClock = 0
+  }
+
+  // ─── Presence helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Whether a persisted device record should be shown online given the live
+   * peers map. Direct peers are online only while an authenticated connection
+   * to them lives in `this.peers`. Relay-paired devices have no socket, so they
+   * count as online only while their relay liveness is fresh (see
+   * PRESENCE_STALE_MS). Rows that are relayed AND direct are online while the
+   * direct connection lives.
+   * @param {{ id: string, publicKey?: string, identityKey?: string }} dev
+   */
+  isDeviceOnline(dev) {
+    if (!dev || !dev.id) return false
+    for (const peerObj of this.peers.values()) {
+      const pd = peerObj.device
+      if (
+        pd &&
+        pd.id === dev.id &&
+        peerObj.pairing &&
+        peerObj.pairing.complete &&
+        pd.isOnline === true &&
+        pd.name !== 'Connecting...'
+      ) {
+        return true
+      }
+    }
+    if (dev.relayed === true) {
+      const last = typeof dev.relayLastSeen === 'number' ? dev.relayLastSeen : 0
+      if (last > 0 && this.presenceClock - last < PRESENCE_STALE_MS) return true
+    }
+    return false
+  }
+
+  /** Tick relay liveness for a peer, once per presence window. */
+  touchPresence(dev) {
+    if (!dev || !dev.relayed) return
+    this.presenceClock++
+    if (typeof dev.relayLastSeen !== 'number' || this.presenceClock - dev.relayLastSeen >= 1) {
+      dev.relayLastSeen = this.presenceClock
+    }
+  }
+
+  /**
+   * Write `isOnline: false` into every paired relay device this engine owns.
+   * Runs during stop() (relay peers have no socket close to do it) and before
+   * listDevices so a restarted engine never re-hydrates stale online rows.
+   */
+  async _markPairedRelayDevicesOffline() {
+    if (!this.selfDeviceId) return
+    try {
+      const bee = await this.getBee('devices')
+      for await (const node of bee.createReadStream()) {
+        const dev = node.value
+        if (!dev || typeof dev !== 'object') continue
+        if (dev.relayed !== true) continue
+        if (dev.pairedVia && dev.pairedVia !== this.selfDeviceId) continue
+        if (dev.isOnline !== true) continue
+        await bee.put(node.key, { ...dev, isOnline: false })
+      }
+    } catch (err) {
+      console.warn('[MeshEngine] _markPairedRelayDevicesOffline failed:', err.message)
+    }
   }
 
   // ─── Identity & pairing ───────────────────────────────────────────────────
@@ -1220,6 +1352,9 @@ class MeshEngine extends EventEmitter {
    * by the stable identity key; self and placeholder rows are excluded.
    */
   async listDevices() {
+    // A restart must never re-hydrate stale online rows from a previous run:
+    // clear relay presence first, then re-derive from live connections below.
+    await this._markPairedRelayDevicesOffline()
     const deviceMap = new Map()
     const canonicalKey = (dev) =>
       typeof dev.identityKey === 'string' && dev.identityKey
@@ -1241,7 +1376,12 @@ class MeshEngine extends EventEmitter {
         if (!key) continue
         const existing = deviceMap.get(key)
         if (existing && (existing.lastSeen || '') > (dev.lastSeen || '')) continue
-        deviceMap.set(key, { ...dev, isOnline: false })
+        // The bee row's name may be a stale "MeshDrop Mobile" that a reconnect
+        // overwrote before the preserve-name fix landed. A user rename recorded
+        // in customName always wins; otherwise fall back to the live peer's
+        // reported name so old clobbers self-heal.
+        const rowName = dev.customName || dev.name || ''
+        deviceMap.set(key, { ...dev, isOnline: this.isDeviceOnline(dev), name: rowName })
       }
     } catch (err) {
       console.warn('[MeshEngine] listDevices (persisted) failed:', err.message)
@@ -1253,8 +1393,10 @@ class MeshEngine extends EventEmitter {
       const key = canonicalKey(dev)
       if (!key) continue
       const existing = deviceMap.get(key)
-      const name = (existing && existing.name) ? existing.name : dev.name
-      deviceMap.set(key, { ...dev, ...existing, name, isOnline: true })
+      // The user's custom name outranks whatever the peer currently reports,
+      // including on reconnect (the bug that reset renamed devices).
+      const name = (existing && existing.customName) ? existing.customName : dev.name
+      deviceMap.set(key, { ...dev, ...existing, name, isOnline: this.isDeviceOnline(dev) })
     }
 
     return Array.from(deviceMap.values())
@@ -1270,7 +1412,17 @@ class MeshEngine extends EventEmitter {
     const entry = await bee.get(id)
     if (!entry || !entry.value) throw new Error('Device not found')
 
-    const updated = { ...entry.value, name: cleanName }
+    // A user rename is authoritative: it persists as customName so handshake /
+    // reconnect rewrites (which carry the device's own reported name) can never
+    // clobber it. The reported name is preserved as lastReportedName so a
+    // future genuine rename can be detected.
+    const prevReported = entry.value.lastReportedName || entry.value.name || ''
+    const updated = {
+      ...entry.value,
+      name: cleanName,
+      customName: cleanName,
+      lastReportedName: prevReported
+    }
     await bee.put(id, updated)
 
     // Update in-memory peerObj if peer is currently connected
@@ -1998,6 +2150,29 @@ class MeshEngine extends EventEmitter {
   setPlayheadByte(transferId, byteOffset) {
     if (this.transferEngine && typeof this.transferEngine.setPlayheadByte === 'function') {
       return this.transferEngine.setPlayheadByte(transferId, byteOffset)
+    }
+    return false
+  }
+
+  // Network profile (desktop vs mobile-wifi vs mobile-cellular). The host
+  // runtime passes it at construction and switches it live on network change.
+  getNetworkProfile() {
+    return this.transferEngine ? this.transferEngine.getNetworkProfile() : null
+  }
+
+  setNetworkProfile(profile) {
+    if (this.transferEngine && typeof this.transferEngine.setNetworkProfile === 'function') {
+      this.transferEngine.setNetworkProfile(profile)
+    }
+    return this
+  }
+
+  // P3: a video player actually read bytes at this offset (desktop webdav 206 /
+  // mobile bridge). Marks media playback active so the sync-stream sender can
+  // widen its in-flight window while the player is consuming the stream.
+  noteMediaRead(transferId, byteOffset) {
+    if (this.transferEngine && typeof this.transferEngine.noteMediaRead === 'function') {
+      return this.transferEngine.noteMediaRead(transferId, byteOffset)
     }
     return false
   }

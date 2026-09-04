@@ -92,7 +92,10 @@ async function run() {
   assert.strictEqual(reloadedSite.name, 'My Drive', 'site metadata survives reload')
   assert.strictEqual(reloadedSite.folderPath, 'E:\\Drive', 'folder survives reload')
   assert.strictEqual(reloadedSite.code, site.code, 'site code survives reload')
-  assert.ok(reloadedSite.allowlist.includes(visitorKey), 'allowlist survives reload')
+  assert.ok(
+    reloadedSite.allowlist.some((e) => e.key === visitorKey),
+    'allowlist survives reload'
+  )
 
   // Lookup by human code also survives.
   const byCode = await reloadedStore.getSiteByCode(site.code)

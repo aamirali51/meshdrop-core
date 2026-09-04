@@ -27,15 +27,27 @@ const {
   CHUNK_SIZE,
   DEFAULT_PRIORITY,
   MAX_TRANSFER_SIZE,
+  MIN_WINDOW,
+  MAX_WINDOW,
   STATUS,
   SCHEMA_VERSION,
   SCHEMA_KEY,
   TERMINAL,
-  sleep
+  sleep,
+  DEFAULT_HEAD_BYTES,
+  DEFAULT_TAIL_BYTES,
+  MIN_TAIL_BYTES,
+  PREFETCH_BATCH,
+  LRU_CAP_BYTES,
+  LRU_TTL_MS
 } = require('./transfer/constants.js')
 const { getFileType, safeFilename, buildManifest, parseManifest } = require('./transfer/integrity.js')
 const { TransferQueue } = require('./transfer/queue.js')
 const { ChunkScheduler } = require('./transfer/scheduler.js')
+const { BlockCache } = require('./transfer/blockCache.js')
+
+// Coerce a numeric profile field, falling back when absent/invalid.
+const numOr = (v, dflt) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : dflt)
 
 // ─── Sync streaming channel ─────────────────────────────────────────────────
 // Sync transfers stream blocks directly from the source file over a dedicated
@@ -94,6 +106,13 @@ class TransferEngine {
     this.queue = new TransferQueue()
     this.runs = new Map() // transferId -> { direction, fd, core, flags, scheduler }
     this.pendingOffers = new Map() // transferId -> { offer, autoAccept }
+    // Network profile + verified-block cache. The profile is a plain options
+    // object set by the host runtime (desktop vs mobile-wifi vs mobile-cellular);
+    // defaults are desktop-safe. The cache is shared across transfers so head/
+    // tail blocks verified by a prefetch pass are reusable while a player reads.
+    this._networkProfile = null
+    this._profileCache = new BlockCache({ capBytes: LRU_CAP_BYTES, ttlMs: LRU_TTL_MS })
+    this._mediaActiveUntil = 0 // P3: set by noteMediaRead/setMediaPlaybackActive
     // transferId -> { chan, reg } — sync stream channels are created
     // synchronously in receiveOffer so protomux can pair them with the remote's
     // open frame (pairing must happen within a microtask or the channel is
@@ -102,6 +121,97 @@ class TransferEngine {
     // Retention: the transfers bee is a log that would grow forever; prune
     // terminal records periodically (see _pruneTerminalTransfers).
     this._terminalEvents = 0
+  }
+
+  // Network profile (desktop vs mobile-wifi vs mobile-cellular) with desktop-
+  // safe defaults. The host runtime sets it via MeshEngine.setNetworkProfile;
+  // the scheduler/prefetch read it through this getter so it can change
+  // mid-transfer (cellular ↔ wifi) without touching the transfer record.
+  getNetworkProfile() {
+    const p = this._networkProfile || {}
+    return {
+      kind: p.kind || 'desktop',
+      headBytes: numOr(p.headBytes, DEFAULT_HEAD_BYTES),
+      tailBytes: numOr(p.tailBytes, DEFAULT_TAIL_BYTES),
+      lookaheadBlocks: numOr(p.lookaheadBlocks, 256),
+      syncWindowBytes: numOr(p.syncWindowBytes, 8 * 1024 * 1024),
+      requestTimeoutMs: numOr(p.requestTimeoutMs, 500),
+      maxConcurrentPeers: numOr(p.maxConcurrentPeers, Infinity),
+      lruBytes: numOr(p.lruBytes, LRU_CAP_BYTES)
+    }
+  }
+
+  setNetworkProfile(profile) {
+    this._networkProfile = profile || null
+    const lruBytes = this.getNetworkProfile().lruBytes
+    this._profileCache.setCapBytes(lruBytes)
+    return this
+  }
+
+  // P3: a video player is actively reading this transfer (webdav 206 / mobile
+  // bridge). Keeps the sync-stream sender window wide while media plays and
+  // decays after `idleMs` of no reads so a paused/closed player does not hold
+  // the window (and receiver memory) open forever.
+  noteMediaRead(transferId) {
+    this._mediaActiveUntil = Math.max(this._mediaActiveUntil || 0, Date.now() + 4000)
+    const info = this.runs.get(transferId)
+    if (info) info.lastMediaReadAt = Date.now()
+    // Kick any sync sender that may be blocked on a narrow window.
+    if (info && info.direction === 'send' && typeof info.kick === 'function') {
+      try { info.kick() } catch {}
+    }
+    return true
+  }
+
+  setMediaPlaybackActive(active) {
+    if (active) {
+      this._mediaActiveUntil = Math.max(this._mediaActiveUntil || 0, Date.now() + 4000)
+    } else if (this._mediaActiveUntil) {
+      // Allow the current lease to expire naturally (a just-finished read
+      // should not instantly collapse the window mid-seek).
+      this._mediaActiveUntil = Math.min(this._mediaActiveUntil, Date.now() + 1000)
+    }
+    return this
+  }
+
+  isMediaPlaybackActive() {
+    return !!this._mediaActiveUntil && Date.now() < this._mediaActiveUntil
+  }
+
+  // P2: network/interface changed (Wi-Fi → cellular, router swap, VPN toggle).
+  // Pause every active scheduler for ~1s so in-flight core.get waits bail out
+  // instead of blocking on a connection that is about to be destroyed; resume
+  // keeps firstDataBlock/bytesWritten untouched, so the playhead survives and
+  // the sweeps restart from the lowest hole (now served by whichever peers
+  // reconnected). Called by MeshEngine.refreshNetwork() before it rebuilds.
+  onNetworkChanged() {
+    const paused = []
+    for (const [id, info] of this.runs.entries()) {
+      if (info && info.scheduler && typeof info.scheduler.pause === 'function') {
+        info.scheduler.pause()
+        paused.push(info.scheduler)
+      }
+    }
+    if (paused.length === 0) return this
+    setTimeout(() => {
+      for (const s of paused) {
+        if (typeof s.resume === 'function') s.resume()
+      }
+    }, 1000)
+    return this
+  }
+
+  _defaultProfile() {
+    return {
+      kind: 'desktop',
+      headBytes: DEFAULT_HEAD_BYTES,
+      tailBytes: DEFAULT_TAIL_BYTES,
+      lookaheadBlocks: 256,
+      syncWindowBytes: 8 * 1024 * 1024,
+      requestTimeoutMs: 500,
+      maxConcurrentPeers: Infinity,
+      lruBytes: LRU_CAP_BYTES
+    }
   }
 
   // Keep the persisted transfer log bounded: after every PRUNE_EVERY terminal
@@ -751,6 +861,10 @@ class TransferEngine {
       // The signaling router injects the noise peer key as senderPeerId — the
       // stream channel needs it to open on the right connection.
       peerKey: offer.senderPeerId || offer.peerKey || '',
+      // P2 multi-seeder: secondary seeders that answered the same claim code.
+      // _runReceive attaches replication to any that are still connected so
+      // missing blocks can be pulled from whichever peer has them.
+      seederPeerIds: Array.isArray(offer.seederPeerIds) ? offer.seederPeerIds : [],
       coreKey,
       baseDir,
       destPath,
@@ -891,6 +1005,33 @@ class TransferEngine {
     const core = this.exchangeStore.get(keyBuf)
     await core.ready()
 
+    // P2 multi-seeder: attach replication streams to any connected secondary
+    // seeders carried on the record (claims flow — host + completedClaims peers
+    // on the drop topic). Hypercore replication is per (core, connection), so
+    // attaching N streams to this core lets core.get serve a missing block from
+    // whichever peer has it. Each is 1:1 with a peerObj/connection; the primary
+    // peer's stream was already opened by the claim handshake (claims.js), but
+    // opening again on the same connection would corrupt the wire, so skip the
+    // primary peerKey and any peer already replicated to.
+    const primaryPeerKey = transfer.peerKey
+    const seeders = Array.isArray(transfer.seederPeerIds) ? transfer.seederPeerIds : []
+    const seenPeerKeys = new Set(primaryPeerKey ? [primaryPeerKey] : [])
+    for (const seederKey of seeders) {
+      if (!seederKey || seederKey === primaryPeerKey || seenPeerKeys.has(seederKey)) continue
+      seenPeerKeys.add(seederKey)
+      const peerObj = this.getPeers().get(seederKey)
+      if (!peerObj || !peerObj.connection) continue
+      try {
+        const stream = core.replicate(peerObj.connection, { live: true })
+        if (stream && typeof stream.on === 'function') stream.on('error', () => {})
+        peerObj.dropStreams = peerObj.dropStreams || []
+        if (peerObj.dropStreams.indexOf(stream) === -1) peerObj.dropStreams.push(stream)
+        console.log(`[TransferEngine] ${id}: attached secondary seeder ${seederKey.slice(0, 12)}...`)
+      } catch (err) {
+        console.warn(`[TransferEngine] ${id}: secondary seeder attach failed: ${err.message}`)
+      }
+    }
+
     const info = {
       direction: 'receive',
       fd: null,
@@ -927,6 +1068,12 @@ class TransferEngine {
         manifest.fileSize,
         typeof manifest.playableAfter === 'number' ? manifest.playableAfter : manifest.fileSize
       )
+      // P1: make blockSize/blockCount/manifest available on the run info so
+      // setPlayheadByte converts byte offsets correctly (it previously always
+      // fell back to CHUNK_SIZE) and the prefetch pass can read the manifest.
+      info.blockSize = blockSize
+      info.blockCount = blockCount
+      info.manifest = manifest
 
       await fsp.mkdir(path.dirname(stagingPath), { recursive: true })
       // Resume: a partial .part file continues from a whole-block boundary.
@@ -951,6 +1098,82 @@ class TransferEngine {
       let lastEmittedProgress = Math.round((bytesWritten / manifest.fileSize) * 100)
       verifiedBytes = bytesWritten
 
+      // ── P1 head/tail priority prefetch ─────────────────────────────────────
+      // Before the sequential scheduler sweep starts, fetch the file HEAD
+      // (container headers / moov / init) and TAIL (Matroska Cues / seek
+      // metadata) so a player can mount the stream and seek immediately —
+      // verified bytes are written to the .part AND cached in the shared LRU
+      // so the scheduler never re-fetches them. Manifest (block 0) is already
+      // in hand from core.get(0) above.
+      const profile = this.getNetworkProfile()
+      const headBytes = Math.min(profile.headBytes, Math.max(0, manifest.fileSize))
+      const tailBytes = Math.min(
+        manifest.fileSize,
+        Math.max(profile.tailBytes, MIN_TAIL_BYTES)
+      )
+      const headBlockCount = Math.max(0, Math.ceil(headBytes / blockSize))
+      const tailStartByte = Math.max(0, manifest.fileSize - tailBytes)
+      const tailStartBlock = Math.max(resumeBlockIndex + 1, Math.ceil(tailStartByte / blockSize) + 1)
+      const prefetchTargets = []
+      if (headBlockCount > resumeBlockIndex) {
+        // Head blocks [resumeBlockIndex+1 .. headBlockCount].
+        for (let i = resumeBlockIndex + 1; i <= Math.min(headBlockCount, lastDataBlock); i++) prefetchTargets.push(i)
+      }
+      if (tailStartBlock <= lastDataBlock) {
+        // Tail blocks [tailStartBlock .. lastDataBlock].
+        for (let i = tailStartBlock; i <= lastDataBlock; i++) prefetchTargets.push(i)
+      }
+      // Dedupe (head and tail overlap on small files) and drop already-verified.
+      const prefetchQueue = []
+      const seen = new Set()
+      for (const i of prefetchTargets) {
+        if (seen.has(i)) continue
+        seen.add(i)
+        if (i <= resumeBlockIndex) continue // already on disk
+        if (bytesWritten >= manifest.fileSize) continue
+        prefetchQueue.push(i)
+      }
+      // On a fresh (non-resume) receive, the head is the player's first mount
+      // point — jump it ahead of the tail so playback starts first.
+      if (resumeBlockIndex === 0) {
+        prefetchQueue.sort((a, b) => a - b)
+      }
+
+      const profileWindow = Math.max(MIN_WINDOW, Math.min(MAX_WINDOW, profile.lookaheadBlocks))
+      if (prefetchQueue.length > 0 && !info.flags.cancelled && !info.flags.paused) {
+        const hashList = manifest.blocks // manifest.blocks[n] is core block 1+n's hash
+        for (let i = 0; i < prefetchQueue.length && !info.flags.cancelled; i += PREFETCH_BATCH) {
+          const batch = prefetchQueue.slice(i, i + PREFETCH_BATCH)
+          const settled = await Promise.allSettled(
+            batch.map(async (coreIndex) => {
+              const block = await core.get(coreIndex, { wait: true, timeout: profile.requestTimeoutMs })
+              if (!block) throw new Error('empty block')
+              const expected = hashList[coreIndex - firstDataBlock]
+              const actual = b4a.toString(sha256(block), 'hex')
+              if (expected && actual !== expected) {
+                throw new Error(`Block ${coreIndex} checksum mismatch`)
+              }
+              return { coreIndex, block }
+            })
+          )
+          for (const s of settled) {
+            if (s.status !== 'fulfilled') {
+              // A transient prefetch failure must not fail the transfer — the
+              // sequential sweep will fetch the block; the window shrinks there.
+              continue
+            }
+            const { coreIndex, block } = s.value
+            const fileOffset = (coreIndex - firstDataBlock) * blockSize
+            // Cache the VERIFIED block BEFORE the disk write so a concurrent
+            // player read never waits on the fd.
+            this._profileCache.set(transfer.id, coreIndex, block)
+            await info.fd.write(block, 0, block.length, fileOffset)
+            verifiedBytes += block.length
+          }
+        }
+        if (info.flags.cancelled) throw new Error('interrupted')
+      }
+
       const scheduler = new ChunkScheduler({
         core,
         firstDataBlock: firstDataBlock + resumeBlockIndex,
@@ -958,8 +1181,18 @@ class TransferEngine {
         blocks: manifest.blocks.slice(resumeBlockIndex),
         blockSize,
         isStreaming: !!transfer.isStreaming,
+        streamWindow: profileWindow,
+        cache: this._profileCache,
+        transferId: transfer.id,
+        requestTimeoutMs: profile.requestTimeoutMs,
         onBlock: async (coreIndex, block) => {
           const fileOffset = (coreIndex - firstDataBlock) * blockSize
+          // Verified head/tail/manifest blocks go to the LRU first so the next
+          // read of the same region (seek back, player re-request) is served
+          // from memory instead of the disk or the network.
+          const isPriorityRegion =
+            coreIndex <= headBlockCount || coreIndex >= tailStartBlock || coreIndex === firstDataBlock
+          if (isPriorityRegion) this._profileCache.set(transfer.id, coreIndex, block)
           await info.fd.write(block, 0, block.length, fileOffset)
           verifiedBytes += block.length
 
@@ -1017,6 +1250,9 @@ class TransferEngine {
         }
       })
       info.scheduler = scheduler
+      // Kick hypercore's block exchange before the scheduler sweeps; on the
+      // claim/party path the receiver's core fills once this download range
+      // tells the replication stream which blocks to pull.
       const dl = core.download({ start: firstDataBlock, end: lastDataBlock })
       if (dl && typeof dl.destroy === 'function') info.download = dl
 
@@ -1057,6 +1293,10 @@ class TransferEngine {
     } finally {
       if (info.fd) await info.fd.close().catch(() => {})
       if (info.download && typeof info.download.destroy === 'function') info.download.destroy()
+      // P1: drop cached head/tail blocks for this transfer on ANY terminal path.
+      // A `.part` may survive an interrupt and resume later — stale cache must
+      // never be served to a resumed/new transfer reusing the id.
+      this._profileCache.flushTransfer(transfer.id)
       this.runs.delete(id)
       // Claim keeps its verified core OPEN after completion: it becomes a
       // seeder for the share (see connections/claims.js). Closing it here
@@ -1159,6 +1399,9 @@ class TransferEngine {
   // whose channel has NOT closed (dead relay, silent peer) must still abort.
   async _waitSync(info, predicate, timeoutMs, label, deadlineFn) {
     const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0
+    // Allow noteMediaRead to wake a sender blocked on a narrow window.
+    let kickResolve = null
+    info.kick = () => { if (kickResolve) { const r = kickResolve; kickResolve = null; r() } }
     for (;;) {
       if (info.flags.cancelled) throw new Error('interrupted')
       if (info.channelClosed) throw new Error('interrupted: peer disconnected')
@@ -1166,7 +1409,7 @@ class TransferEngine {
       if (predicate()) return
       if (deadline > 0 && Date.now() >= deadline) throw new Error(label + ' timed out')
       if (deadlineFn && deadlineFn()) throw new Error(label + ' timed out')
-      await sleep(25)
+      await new Promise((resolve) => { kickResolve = resolve; setTimeout(resolve, 25) })
     }
   }
 
@@ -1327,12 +1570,23 @@ class TransferEngine {
         blockMsg.send(payload)
         bytesSent += bytesRead
 
-        // Windowed flow control: keep at most SYNC_STREAM_WINDOW blocks in flight.
+        // Windowed flow control: keep at most SYNC_STREAM_WINDOW blocks in
+        // flight, widened while the receiver is actively playing media and
+        // bounded by the network profile's bytes-in-flight cap (P3). The cap
+        // protects the receiver's serialized-write chain (single-threaded Bare
+        // heap on mobile) from buffering more than it can survive.
+        const profile = this.getNetworkProfile()
+        const mediaWide = this.isMediaPlaybackActive() ? 3 : 1
+        const windowBytes = profile.syncWindowBytes * mediaWide
+        const effectiveWindow = Math.max(
+          SYNC_STREAM_WINDOW,
+          Math.min(256, Math.floor(windowBytes / manifest.blockSize))
+        )
         const sentBlocks = i - startBlock
-        if (sentBlocks - info.ackedBlocks >= SYNC_STREAM_WINDOW) {
+        if (sentBlocks - info.ackedBlocks >= effectiveWindow) {
           await this._waitSync(
             info,
-            () => info.ackedBlocks >= sentBlocks - Math.floor(SYNC_STREAM_WINDOW / 2),
+            () => info.ackedBlocks >= sentBlocks - Math.floor(effectiveWindow / 2),
             0,
             'interrupted: flow control (no ACKs from peer)',
             () => Date.now() - info.lastAckAt > SYNC_FLOW_TIMEOUT
@@ -2077,6 +2331,10 @@ class TransferEngine {
     const entry = await bee.get(transferId)
     if (!entry) throw new Error('Transfer not found')
 
+    // P1: a cancelled/interrupted transfer keeps its .part for resume; drop its
+    // cached head/tail blocks so a later resume never serves stale bytes.
+    this._profileCache.flushTransfer(transferId)
+
     const info = this.runs.get(transferId)
     if (info) {
       info.flags.cancelled = true
@@ -2135,7 +2393,8 @@ class TransferEngine {
   setPlayhead(transferId, blockIndex) {
     const info = this.runs.get(transferId)
     if (info && info.scheduler && typeof info.scheduler.setPlayhead === 'function') {
-      info.scheduler.setPlayhead(blockIndex)
+      const blockSize = info.blockSize || CHUNK_SIZE
+      info.scheduler.setPlayhead(blockIndex * blockSize)
       return true
     }
     return false
@@ -2144,9 +2403,11 @@ class TransferEngine {
   setPlayheadByte(transferId, byteOffset) {
     const info = this.runs.get(transferId)
     if (info && info.scheduler && typeof info.scheduler.setPlayhead === 'function') {
+      // info.blockSize is now set post-manifest on both receive paths, so a
+      // 206 range start converts to the correct byte-based scheduler playhead.
       const blockSize = info.blockSize || CHUNK_SIZE
       const blockIndex = Math.floor(byteOffset / blockSize) + 1
-      info.scheduler.setPlayhead(blockIndex)
+      info.scheduler.setPlayhead(blockIndex * blockSize)
       return true
     }
     return false

@@ -12,6 +12,21 @@ const MAX_CONCURRENT = 2 // max active transfers per direction (global)
 const MAX_PER_PEER = 1 // max active transfers per direction per peer
 const MAX_TRANSFER_SIZE = 500 * 1024 * 1024 * 1024 // 500 GB hard cap
 
+// ─── Head/tail priority fetch (video startup latency) ───────────────────────
+// Progressive-playback containers (mp4/mkv/ts...) need the file HEAD (format
+// headers, moov, init segments) before a player can mount the stream, and the
+// TAIL for containers whose seek/cue metadata lives at the end (Matroska Cues,
+// mp4 'sidx'/'mfra'). Priority fetching pulls both windows first so playback
+// starts (and seeks) before the sequential sweep reaches them. All values are
+// overridable per runtime via the network profile (desktop vs mobile-wifi vs
+// mobile-cellular).
+const DEFAULT_HEAD_BYTES = 4 * 1024 * 1024 // head window (matches integrity PROBE_BYTES)
+const DEFAULT_TAIL_BYTES = 2 * 1024 * 1024 // desktop / wi-fi tail window
+const MIN_TAIL_BYTES = 512 * 1024 // cellular floor; also the small-file minimum
+const PREFETCH_BATCH = 4 // bounded parallel core.gets during the prefetch pass
+const LRU_CAP_BYTES = 64 * 1024 * 1024 // in-memory verified head/tail block cache
+const LRU_TTL_MS = 60 * 1000
+
 const STATUS = {
   QUEUED: 'queued',
   ACTIVE: 'active',
@@ -43,6 +58,12 @@ module.exports = {
   MAX_CONCURRENT,
   MAX_PER_PEER,
   MAX_TRANSFER_SIZE,
+  DEFAULT_HEAD_BYTES,
+  DEFAULT_TAIL_BYTES,
+  MIN_TAIL_BYTES,
+  PREFETCH_BATCH,
+  LRU_CAP_BYTES,
+  LRU_TTL_MS,
   STATUS,
   SCHEMA_VERSION,
   SCHEMA_KEY,

@@ -89,7 +89,28 @@ function createDeviceRegistry(ctx) {
     try {
       const bee = await engine.getBee('devices')
       const { relayed: _relayed, ...deviceToPersist } = peerObj.device
-      await bee.put(deviceId, deviceToPersist)
+      // The user's rename is authoritative: a device's own reported name must
+      // never clobber a custom name on reconnect (the "renamed phone resets to
+      // 'MeshDrop Mobile' after an app update" bug). Keep the stored custom
+      // name, remember what the peer reports now, and carry the trust timeline.
+      const existing = await bee.get(deviceId).catch(() => null)
+      const prev = (existing && existing.value) || null
+      const persisted = { ...deviceToPersist }
+      if (prev) {
+        if (prev.customName) {
+          persisted.name = prev.customName
+        }
+        persisted.customName = prev.customName || ''
+        persisted.lastReportedName = deviceToPersist.name || prev.lastReportedName || ''
+        persisted.trustedAt = prev.trustedAt || persisted.trustedAt
+        persisted.pairedAt = prev.pairedAt || persisted.pairedAt
+        persisted.isFavorite = prev.isFavorite || false
+        persisted.avatar = prev.avatar || persisted.avatar
+      } else {
+        persisted.customName = ''
+        persisted.lastReportedName = persisted.name || ''
+      }
+      await bee.put(deviceId, persisted)
     } catch (err) {
       console.error('[MeshEngine] Failed to save device to bee:', err)
     }

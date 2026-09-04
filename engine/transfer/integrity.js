@@ -41,6 +41,137 @@ function safeFilename(name) {
   return String(name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_')
 }
 
+// ─── Container sniffing (P4) ────────────────────────────────────────────────
+// Receiver-side container detection. The manifest records a coarse container
+// at stage time, but a receiver must sniff INDEPENDENTLY (a remote sender may
+// predate the field). Used by webdav.js / the mobile bridge to decide whether
+// to serve a container raw to a native player, remux it, or mark it
+// unsupported. Reads only the head — no full-file scan.
+
+// EBML (Matroska/WebM) element walker over a head buffer: yields { id, size,
+// headerSize } for top-level elements it can size from the head. The Matroska
+// Segment's child elements (Info, Tracks...) are nested after the Segment
+// header; we only need the Tracks element's codec IDs, which live near the
+// start of the Segment for the vast majority of real files.
+function *ebmlElements(buf, start = 0, end = buf.length) {
+  let off = start
+  while (off + 4 <= end) {
+    // EBML ID (variable length, but all real Matroska IDs fit 4 bytes).
+    const idLen = ebmlIdLength(buf, off)
+    if (idLen === 0) return
+    const id = buf.readUIntBE(off, idLen)
+    off += idLen
+    if (off >= end) return
+    // VINT size.
+    const sizeRes = ebmlVint(buf, off, end)
+    if (!sizeRes) return
+    off = sizeRes.next
+    const headerSize = off - start
+    yield { id, size: sizeRes.value, headerSize, start: off }
+    off += sizeRes.value
+  }
+}
+
+// EBML ID length from the leading-zero-bit position (IDs are VINT-ish but
+// with the marker bit NOT counted — all practical Matroska IDs are 1-4 bytes).
+function ebmlIdLength(buf, off) {
+  const b = buf[off]
+  if (b === 0) return 0
+  if ((b & 0x80) === 0x80) return 1
+  if ((b & 0x40) === 0x40) return 2
+  if ((b & 0x20) === 0x20) return 3
+  if ((b & 0x10) === 0x10) return 4
+  return 0
+}
+
+// EBML VINT (variable-length integer) with the length-marker bit cleared.
+function ebmlVint(buf, off, end) {
+  if (off >= end) return null
+  const b = buf[off]
+  let len = 1
+  if ((b & 0x80) === 0x80) len = 1
+  else if ((b & 0x40) === 0x40) len = 2
+  else if ((b & 0x20) === 0x20) len = 3
+  else if ((b & 0x10) === 0x10) len = 4
+  else if ((b & 0x08) === 0x08) len = 5
+  else if ((b & 0x04) === 0x04) len = 6
+  else if ((b & 0x02) === 0x02) len = 7
+  else if ((b & 0x01) === 0x01) len = 8
+  else return null
+  if (off + len > end) return null
+  const mask = 0xff >> len
+  const first = buf[off] & mask
+  let value = first
+  for (let i = 1; i < len; i++) value = value * 256 + buf[off + i]
+  return { value, next: off + len }
+}
+
+// Matroska/WebM element IDs (from the spec).
+const EBML_ID = 0x1a45dfa3
+const SEGMENT_ID = 0x18538067
+const TRACKS_ID = 0x1654ae6b
+const TRACK_ENTRY_ID = 0xae
+const CODEC_ID_ID = 0x86
+
+// Sniff a head buffer for a playable container. Returns null for non-media,
+// or { container, codecs } where container ∈ { 'mp4', 'mkv', 'webm', 'other' }
+// and codecs is an array of normalized codec strings (e.g. ['h264','aac']).
+// MP4 detection reuses the ftyp probe; MKV/WebM walks EBML for the Tracks
+// codec IDs. Only reads the head — a truncated head yields partial info.
+function sniffContainer(head) {
+  if (!head || head.length < 12) return null
+  // MP4-family: box starts with a 4-byte size + 'ftyp'/'styp'.
+  const boxType = head.toString('latin1', 4, 8)
+  if (boxType === 'ftyp' || boxType === 'styp') {
+    const moovEnd = scanMp4MoovEnd(head)
+    return { container: 'mp4', codecs: [], moovEnd }
+  }
+  // EBML (Matroska/WebM).
+  const ebmlMagic = head.readUIntBE(0, 4)
+  if (ebmlMagic === EBML_ID) {
+    const isWebm = head.subarray(0, Math.min(head.length, 64)).includes('webm')
+    const codecs = new Set()
+    try {
+      // Walk top-level EBML elements; the first is the EBML header, the second
+      // the Segment. Codec IDs live in Segment > Tracks > TrackEntry > CodecID.
+      for (const el of ebmlElements(head, 0, Math.min(head.length, 256 * 1024))) {
+        if (el.id === SEGMENT_ID) {
+          // Walk the Segment's children (up to ~256 KiB into the segment) for
+          // the Tracks element, then its TrackEntry CodecID children.
+          const segEnd = Math.min(head.length, el.start + Math.min(el.size, 256 * 1024))
+          for (const segEl of ebmlElements(head, el.start, segEnd)) {
+            if (segEl.id !== TRACKS_ID) continue
+            const tracksEnd = Math.min(head.length, segEl.start + Math.min(segEl.size, 64 * 1024))
+            // TrackEntry children are nested lists; walk one level for entries
+            // then their CodecID.
+            for (const entry of ebmlElements(head, segEl.start, tracksEnd)) {
+              if (entry.id !== TRACK_ENTRY_ID) continue
+              const entryEnd = Math.min(head.length, entry.start + Math.min(entry.size, 4096))
+              for (const field of ebmlElements(head, entry.start, entryEnd)) {
+                if (field.id === CODEC_ID_ID) {
+                  const id = head.toString('latin1', field.start, Math.min(head.length, field.start + field.size)).replace(/\0.*$/, '')
+                  if (id.includes('V_MPEG4/ISO/AVC')) codecs.add('h264')
+                  else if (id.includes('V_MPEGH/ISO/HEVC')) codecs.add('hevc')
+                  else if (id.includes('V_VP9')) codecs.add('vp9')
+                  else if (id.includes('V_VP8')) codecs.add('vp8')
+                  else if (id.includes('A_AAC')) codecs.add('aac')
+                  else if (id.includes('A_MPEG/L3')) codecs.add('mp3')
+                  else if (id.includes('A_OPUS')) codecs.add('opus')
+                  else if (id.includes('A_VORBIS')) codecs.add('vorbis')
+                  else if (id.includes('A_AC3') || id.includes('A_EAC3')) codecs.add('ac3')
+                }
+              }
+            }
+          }
+          break
+        }
+      }
+    } catch {}
+    return { container: isWebm ? 'webm' : 'mkv', codecs: Array.from(codecs) }
+  }
+  return null
+}
+
 // How much of the file head the receiver needs before a generic container is
 // considered playable (headers + init + early samples). 4 MiB is a safe
 // over-estimate for TS/MKV/WebM/AVI; for MP4-family the real moov watermark is
@@ -200,5 +331,6 @@ module.exports = {
   parseManifest,
   computePlayableWatermark,
   scanMp4MoovEnd,
+  sniffContainer,
   PROBE_BYTES
 }

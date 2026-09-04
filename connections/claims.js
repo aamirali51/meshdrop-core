@@ -148,6 +148,15 @@ function createClaims(ctx) {
   }
 
   const pendingClaimOffers = new Map()
+  // Multi-seeder roster: shareId -> Set<peerKey>. Every peer that answers a
+  // CLAIM_FILE_REQ for the share (the host + any completedClaims seeder) is
+  // recorded here so the claimer can open replication streams to SEVERAL
+  // seeders at once and pull each block from whichever delivers first
+  // (latency-weighted multi-peer swarming). Populated opportunistically as
+  // duplicate descriptors arrive for an already-started download; the primary
+  // transfer still binds to the first responder, and the extras become
+  // secondary replication sources on the SAME core instance.
+  const claimRoster = new Map()
 
   // Seeder serve: mirror of the host serve step (watchdog drop, per-core
   // replication toward the requester, descriptor response) minus the share
@@ -227,23 +236,59 @@ function createClaims(ctx) {
       peerObj.pairing.timeout = null
     }
 
-    // Open per-core replication for every claimed file — the same keys as
-    // the host's file-drop-* cores — so block fetch works WITHOUT opening
-    // the whole exchange store. Claims never have pairing trust, so the
-    // store-wide ReplicationScope gate would (correctly) refuse them.
-    peerObj.dropStreams = peerObj.dropStreams || []
-    for (const f of offerFiles) {
-      if (typeof f.coreKey !== 'string' || f.coreKey.length !== 64) continue
-      try {
-        const core = engine.storage.exchangeStore.get(Buffer.from(f.coreKey, 'hex'))
-        await core.ready()
-        const stream = core.replicate(peerObj.connection, { live: true })
-        stream.on('error', () => {})
-        peerObj.dropStreams.push(stream)
-        console.log(`[MeshEngine] Claimed drop core opened for ${f.filename}`)
-      } catch (err) {
-        console.error('[MeshEngine] Failed to open claimed drop core:', err.message)
+    // Multi-seeder swarming: open per-core replication to the PRIMARY peer
+    // (the first responder) AND every secondary seeder that answered the same
+    // CLAIM_FILE_REQ (host + completedClaims peers on the drop topic). All
+    // streams attach to the SAME core instances, so hypercore's internal block
+    // exchange can serve a missing block from whichever peer has it — the
+    // scheduler's completed/inflight dedupe means one block is requested once
+    // even though N seeders could serve it.
+    const primaryPeerId = peerId
+    const shareKey = offer.shareId || code || ''
+    const roster = new Set([primaryPeerId])
+    const known = shareKey ? (claimRoster.get(shareKey) || new Set()) : new Set()
+    for (const k of known) roster.add(k)
+    if (shareKey) claimRoster.set(shareKey, roster)
+
+    const openDropReplication = async (targetPeerId, files) => {
+      const p = peers.get(targetPeerId)
+      if (!p || !p.connection) return
+      if (p.pairing && p.pairing.timeout) {
+        clearTimeout(p.pairing.timeout)
+        p.pairing.timeout = null
       }
+      p.dropStreams = p.dropStreams || []
+      for (const f of files) {
+        if (typeof f.coreKey !== 'string' || f.coreKey.length !== 64) continue
+        try {
+          const core = engine.storage.exchangeStore.get(Buffer.from(f.coreKey, 'hex'))
+          await core.ready()
+          const stream = core.replicate(p.connection, { live: true })
+          stream.on('error', () => {})
+          p.dropStreams.push(stream)
+          console.log(
+            `[MeshEngine] Claimed drop core opened for ${f.filename} via ${targetPeerId.slice(0, 12)}...`
+          )
+        } catch (err) {
+          console.error('[MeshEngine] Failed to open claimed drop core:', err.message)
+        }
+      }
+    }
+
+    await openDropReplication(primaryPeerId, offerFiles)
+    // Secondary seeders attach too — but ONLY up to the host's configured fan-in
+    // cap so a phone on cellular isn't replicating from 20 peers at once. The
+    // transfer record's seederPeerIds lets _runReceive attach late joiners on
+    // resume. (Cap read from the engine's network profile when available.)
+    const profile = engine.transferEngine && typeof engine.transferEngine.getNetworkProfile === 'function'
+      ? engine.transferEngine.getNetworkProfile()
+      : null
+    const maxFanIn = profile && Number.isFinite(profile.maxConcurrentPeers)
+      ? Math.max(1, Math.floor(profile.maxConcurrentPeers))
+      : 3
+    const extraSeeders = Array.from(roster).filter((id) => id !== primaryPeerId).slice(0, Math.max(0, maxFanIn - 1))
+    for (const seederId of extraSeeders) {
+      await openDropReplication(seederId, offerFiles)
     }
 
     // Auto-accept and start one transfer per file. Transfer ids are
@@ -261,6 +306,9 @@ function createClaims(ctx) {
           transferId: `claim-${offer.shareId || code}-${i}`,
           transferMethod: 'internet',
           isClaim: true,
+          // Secondary seeder peer keys ride on the record so _runReceive can
+          // re-attach replication to any that are still connected on resume.
+          seederPeerIds: Array.from(roster),
           peerKey: peerId,
           shareId: offer.shareId
         },
@@ -283,6 +331,8 @@ function createClaims(ctx) {
         if (rec.status !== 'completed') allCompleted = false
         if (pending.size === 0) {
           cleanup()
+          // Drop the multi-seeder roster entry (the transfer is terminal).
+          if (shareKey) claimRoster.delete(shareKey)
           // Every file hash-verified on disk: register as a seeder so the
           // next claimer pulls from us instead of hammering the host.
           if (allCompleted && code && offer.shareId) {
@@ -330,6 +380,47 @@ function createClaims(ctx) {
       const claimOpts = (engine.activeClaimOptions && engine.activeClaimOptions.get(code)) || {}
       const isInteractive = claimOpts.interactive === true || engine.interactiveClaims === true
       const isFolderOrMulti = offerFiles.length > 1 || !!msg.offer.folderName
+
+      // Multi-seeder: a SECOND responder for the same share (host + a
+      // completedClaims seeder both answering the claim) must not start a
+      // duplicate download — instead it joins the roster and its connection is
+      // attached to the already-open cores so the active transfer can pull
+      // blocks from it. Detect "already downloading" by checking whether the
+      // deterministic claim transfer ids already exist.
+      const shareKey = msg.offer.shareId || code || ''
+      if (shareKey && engine.transferEngine) {
+        const probeId = `claim-${shareKey}-0`
+        const bee = await engine.getBee('transfers')
+        const existing = await bee.get(probeId)
+        const alreadyActive = existing && existing.value && existing.value.status !== 'completed'
+        if (alreadyActive) {
+          console.log(
+            `[MeshEngine] Duplicate CLAIM_FILE_RES for ${code}: adding ${peerId.slice(0, 12)}... as secondary seeder`
+          )
+          const roster = claimRoster.get(shareKey) || new Set()
+          roster.add(peerId)
+          claimRoster.set(shareKey, roster)
+          // Attach this seeder's connection to the claimed cores (same keys as
+          // the primary offer) so the running receive can fetch from it.
+          const p = peers.get(peerId)
+          if (p && p.connection && engine.storage && engine.storage.exchangeStore) {
+            p.dropStreams = p.dropStreams || []
+            for (const f of offerFiles) {
+              if (typeof f.coreKey !== 'string' || f.coreKey.length !== 64) continue
+              try {
+                const core = engine.storage.exchangeStore.get(Buffer.from(f.coreKey, 'hex'))
+                await core.ready()
+                const stream = core.replicate(p.connection, { live: true })
+                stream.on('error', () => {})
+                p.dropStreams.push(stream)
+              } catch (err) {
+                console.error('[MeshEngine] Secondary seeder attach failed:', err.message)
+              }
+            }
+          }
+          return
+        }
+      }
 
       if (isInteractive && isFolderOrMulti) {
         console.log(`[MeshEngine] Emitting CLAIM_PREVIEW for ${code} (${offerFiles.length} files)`)
