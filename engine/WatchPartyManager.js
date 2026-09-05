@@ -20,8 +20,20 @@ const PARTY_EVENTS = {
   DISCOVERED_ROOMS: 'party:rooms:discovered',
   MEDIA_OFFER: 'party:media:offer',
   MEDIA_READY: 'party:media:ready',
-  MEDIA_ERROR: 'party:media:error'
+  MEDIA_ERROR: 'party:media:error',
+  CHAT: 'party:chat',
+  CHAT_HISTORY: 'party:chat:history',
+  VOICE: 'party:voice',
+  MODERATED: 'party:moderated'
 }
+
+// Chat log kept per room (replayed to late joiners) and per-message caps.
+const CHAT_LOG_MAX = 100
+const CHAT_HISTORY_REPLAY = 50
+const CHAT_TEXT_MAX = 1000
+// Subtitle sidecars ride INSIDE the media offer (tiny text files, no second
+// transfer pipeline). 1 MB covers even feature-length SRTs with margin.
+const SUBTITLE_MAX_BYTES = 1024 * 1024
 
 // A guest that hears nothing back from the host (wrong code, host vanished,
 // host still staging) is told to leave instead of lingering in a phantom room.
@@ -184,7 +196,7 @@ class WatchPartyManager extends EventEmitter {
       if (this.activeRoom) {
         throw new Error('Already in a watch party — leave it before starting another')
       }
-      const { title, filePath, controlsMode = 'host' } = params
+      const { title, filePath, controlsMode = 'host', isPrivate = false, subtitlePath = null, rewindWindowSec = 0 } = params
       if (!filePath) throw new Error('File path required to create a watch party')
 
       const filename = path.basename(filePath)
@@ -214,6 +226,11 @@ class WatchPartyManager extends EventEmitter {
       if (this.engine && this.engine.topicRegistry) {
         this.engine.topicRegistry.join(topic, { client: true, server: true })
       }
+      // Host side mirrors the guest: room traffic must also flow over the
+      // relay topic for peers without a direct link.
+      if (this.engine && this.engine.relayClient) {
+        this.engine.relayClient.join(topic)
+      }
 
       const room = {
         roomCode,
@@ -228,6 +245,22 @@ class WatchPartyManager extends EventEmitter {
         checksum: '',
         isHost: true,
         controlsMode,
+        isPrivate: Boolean(isPrivate),
+        // Guests may only rewind this many seconds behind the playback master
+        // (0 = unlimited). Enforced host-side on incoming seeks.
+        rewindWindowSec: Math.max(0, Number(rewindWindowSec) || 0),
+        // Playback authority in 'host' controls mode (can be promoted away
+        // from the media host via moderation).
+        playbackPeerId: hostIdentity.id || 'host',
+        // Latest authoritative position reported by the playback master —
+        // used for the rewind-window rule and guest catch-up.
+        hostPositionSec: null,
+        muted: new Set(),
+        kicked: new Set(),
+        chatLog: [],
+        queue: [],
+        mediaEpoch: 1,
+        subtitle: null,
         hostPeerId: hostIdentity.id || 'host',
         hostName: hostIdentity.name || 'Host',
         participants: new Map(),
@@ -265,6 +298,16 @@ class WatchPartyManager extends EventEmitter {
         throw new Error('Party media staging did not produce a playable source')
       }
 
+      // Optional subtitle sidecar: read + normalize to WebVTT now and ride it
+      // inside every media offer — no second transfer pipeline needed.
+      if (subtitlePath) {
+        try {
+          room.subtitle = await this._loadSubtitle(subtitlePath)
+        } catch (err) {
+          console.warn('[WatchPartyManager] subtitle load failed:', err.message)
+        }
+      }
+
       // Broadcast the initial room announcement to all connected peers. The
       // periodic 10s maintenance tick re-announces while the room stays live,
       // so late joiners / rediscovery keep working.
@@ -293,6 +336,11 @@ class WatchPartyManager extends EventEmitter {
       if (this.engine.topicRegistry) {
         this.engine.topicRegistry.join(topic, { client: true, server: true })
       }
+      // Also join the room topic on the relay so a guest whose direct link is
+      // gone (mobile OS parked the app) still reaches the host.
+      if (this.engine.relayClient) {
+        this.engine.relayClient.join(topic)
+      }
 
       const myIdentity = this.engine.storage?.getDeviceIdentity?.() || { name: 'Peer Device' }
 
@@ -302,6 +350,14 @@ class WatchPartyManager extends EventEmitter {
         title: cleanCode,
         isHost: false,
         controlsMode: 'host',
+        isMuted: false,
+        muted: new Set(),
+        kicked: new Set(),
+        chatLog: [],
+        mediaEpoch: 1,
+        subtitle: null,
+        playbackPeerId: null,
+        hostPositionSec: null,
         participants: new Map(),
         joinedAt: Date.now()
       }
@@ -472,6 +528,17 @@ class WatchPartyManager extends EventEmitter {
     const { action, positionSec, playbackRate = 1.0 } = params
     const myIdentity = this.engine.storage?.getDeviceIdentity?.() || {}
 
+    // The host is its own playback master by default: record the position
+    // locally (self-broadcasts never loop back through handleMessage).
+    const room0 = this.activeRoom
+    const masterId0 = room0.playbackPeerId || room0.hostPeerId
+    if (typeof positionSec === 'number' && (!masterId0 || masterId0 === myIdentity.id)) {
+      room0.hostPositionSec = positionSec
+    }
+    // Remember the last action so a late-joiner push reflects the host's real
+    // state (a paused host must not join-push action 'play').
+    room0._lastAction = action || 'play'
+
     const payload = {
       type: 'WATCH_STATE_SYNC',
       roomCode: this.activeRoom.roomCode,
@@ -499,6 +566,14 @@ class WatchPartyManager extends EventEmitter {
     const { positionSec, buffering, bufferedPercent = 0 } = params
     const myIdentity = this.engine.storage?.getDeviceIdentity?.() || {}
 
+    // Track the playback master's authoritative position (host reports its
+    // own playhead here; guests see it via the same message).
+    const room0 = this.activeRoom
+    const masterId0 = room0.playbackPeerId || room0.hostPeerId
+    if (typeof positionSec === 'number' && (!masterId0 || masterId0 === myIdentity.id)) {
+      room0.hostPositionSec = positionSec
+    }
+
     const payload = {
       type: 'WATCH_PEER_STATUS',
       roomCode: this.activeRoom.roomCode,
@@ -515,15 +590,19 @@ class WatchPartyManager extends EventEmitter {
 
   /**
    * Send a real-time emoji reaction (🍿, 🔥, 👏, ❤️, 😂).
+   * positionSec stamps the reaction at the sender's current playhead so UIs
+   * can pop it when playback reaches that moment.
    */
-  sendReaction(emoji) {
+  sendReaction(emoji, positionSec = null) {
     if (!this.activeRoom) return false
 
     const myIdentity = this.engine.storage?.getDeviceIdentity?.() || {}
     const payload = {
       type: 'WATCH_REACTION',
       roomCode: this.activeRoom.roomCode,
+      reactionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       emoji: emoji || '🍿',
+      positionSec: typeof positionSec === 'number' ? positionSec : null,
       senderName: myIdentity.name || 'Peer',
       timestamp: Date.now()
     }
@@ -533,6 +612,315 @@ class WatchPartyManager extends EventEmitter {
     return true
   }
 
+  // ─── Chat ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Send a room chat message. Broadcast to peers, kept in the local log
+   * (host keeps the authoritative copy for late-joiner replay), emitted to
+   * the local UI. Muted guests may still chat — mute is voice-only.
+   */
+  sendChat(text) {
+    const room = this.activeRoom
+    if (!room) return false
+    const clean = String(text || '').trim().slice(0, CHAT_TEXT_MAX)
+    if (!clean) return false
+
+    const myIdentity = this.engine.storage?.getDeviceIdentity?.() || {}
+    const payload = {
+      type: 'WATCH_CHAT',
+      roomCode: room.roomCode,
+      messageId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      text: clean,
+      sender: { id: myIdentity.id, name: myIdentity.name || 'Peer' },
+      timestamp: Date.now()
+    }
+
+    this._appendChat(room, payload)
+    this._broadcastRoomMessage(payload)
+    this.emit(PARTY_EVENTS.CHAT, payload)
+    return true
+  }
+
+  getChatHistory() {
+    return this.activeRoom ? this.activeRoom.chatLog.slice() : []
+  }
+
+  _appendChat(room, msg) {
+    // Room traffic now rides both direct and relay paths; the same message
+    // can legitimately arrive twice. messageId is the dedup capability.
+    if (msg.messageId && room.chatLog.some((m) => m && m.messageId === msg.messageId)) return
+    room.chatLog.push(msg)
+    if (room.chatLog.length > CHAT_LOG_MAX) room.chatLog.splice(0, room.chatLog.length - CHAT_LOG_MAX)
+  }
+
+  // ─── Moderation (host-authoritative) ──────────────────────────────────────
+
+  /**
+   * Host: kick a guest (connection dropped + code stays valid for others),
+   * mute/unmute their voice, or promote them to playback master (they drive
+   * playback; media stays staged here).
+   */
+  moderate(params = {}) {
+    const room = this.activeRoom
+    if (!room) return { success: false, error: 'not in a room' }
+    if (!room.isHost) return { success: false, error: 'host only' }
+    const { action, targetPeerId } = params
+    if (!action || !targetPeerId) return { success: false, error: 'action and targetPeerId required' }
+    if (targetPeerId === room.hostPeerId) return { success: false, error: 'cannot moderate the host' }
+    if (!room.participants.has(targetPeerId)) return { success: false, error: 'peer not in room' }
+
+    const msg = {
+      type: 'WATCH_MODERATE',
+      roomCode: room.roomCode,
+      action,
+      targetPeerId,
+      by: { id: room.hostPeerId, name: room.hostName },
+      timestamp: Date.now()
+    }
+
+    if (action === 'kick') {
+      room.kicked.add(targetPeerId)
+      room.participants.delete(targetPeerId)
+      this._broadcastRoomMessage(msg)
+      this._destroyPeerMedia(targetPeerId)
+      const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(targetPeerId) : null
+      if (peerObj && peerObj.connection && typeof peerObj.connection.destroy === 'function') {
+        try {
+          peerObj.connection.destroy()
+        } catch {}
+      }
+      this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    } else if (action === 'mute' || action === 'unmute') {
+      if (action === 'mute') room.muted.add(targetPeerId)
+      else room.muted.delete(targetPeerId)
+      const p = room.participants.get(targetPeerId)
+      if (p) p.isMuted = action === 'mute'
+      this._broadcastRoomMessage(msg)
+      this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    } else if (action === 'promote') {
+      room.playbackPeerId = targetPeerId
+      this._broadcastRoomMessage(msg)
+      this._broadcastAnnouncement('create')
+      this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    } else {
+      return { success: false, error: `unknown action: ${action}` }
+    }
+
+    this.emit(PARTY_EVENTS.MODERATED, { ...msg, applied: true })
+    return { success: true }
+  }
+
+  /** Host: let guests rewind at most this many seconds behind the master. */
+  setRewindWindow(seconds) {
+    const room = this.activeRoom
+    if (!room || !room.isHost) return false
+    room.rewindWindowSec = Math.max(0, Number(seconds) || 0)
+    this._broadcastAnnouncement('create')
+    this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    return true
+  }
+
+  // ─── Queue (host) ─────────────────────────────────────────────────────────
+
+  /** Host: append a local file to the party queue. */
+  async queueAdd(params = {}) {
+    const room = this.activeRoom
+    if (!room) throw new Error('not in a room')
+    if (!room.isHost) throw new Error('host only')
+    const { filePath, title } = params
+    if (!filePath) throw new Error('filePath required')
+    const filename = path.basename(filePath)
+    let fileSize = 0
+    try {
+      const stat = await fsp.stat(filePath)
+      fileSize = stat.size
+    } catch (err) {
+      throw new Error(`Queue file not readable: ${err.message}`)
+    }
+    if (!(fileSize > 0)) throw new Error('Queue file is empty')
+    room.queue.push({ filePath, filename, title: title || filename, fileSize })
+    this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    return this.getRoomInfo()
+  }
+
+  /** Host: drop a queued item by index. */
+  queueRemove(index) {
+    const room = this.activeRoom
+    if (!room || !room.isHost) return { success: false }
+    const i = Number(index) || 0
+    if (i < 0 || i >= room.queue.length) return { success: false, error: 'bad index' }
+    room.queue.splice(i, 1)
+    this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    return { success: true }
+  }
+
+  /**
+   * Host: retire the current media and stage the next queued item. Bumps the
+   * room's mediaEpoch — every epoch derives a fresh deterministic shareId, so
+   * guests who still hold the previous file keep it while a NEW core (and
+   * transfer record) is created for this one. The new hypercore multiplexes
+   * onto the peers' existing replication session (hypercore 11 channel mux).
+   */
+  async queueNext() {
+    const room = this.activeRoom
+    if (!room || !room.isHost) throw new Error('host only')
+    const item = room.queue.shift()
+    if (!item) return null
+
+    const transferEngine = this.engine && this.engine.transferEngine
+    if (!transferEngine || typeof transferEngine.stageDrop !== 'function') {
+      throw new Error('transfer engine unavailable')
+    }
+
+    room.mediaEpoch += 1
+    room.shareId = this._shareIdForEpoch(room.roomCode, room.mediaEpoch)
+    room.filePath = item.filePath
+    room.filename = item.filename
+    room.title = item.title
+    room.fileSize = item.fileSize
+    room.fileType = typeof transferEngine.getFileType === 'function' ? transferEngine.getFileType(item.filename) : ''
+    room.subtitle = null
+    room._hostHeardAt = Date.now()
+
+    const staged = await transferEngine.stageDrop({
+      transferId: room.shareId,
+      coreName: room.shareId,
+      filePath: room.filePath,
+      filename: room.filename,
+      fileSize: room.fileSize,
+      fileType: room.fileType
+    })
+    room.coreKey = staged.coreKey
+    room.manifestHash = staged.manifestHash
+    room.checksum = staged.checksum
+
+    this._mediaReadyNotified = false
+    // Re-announce (title changed) and re-offer the new media to everyone in
+    // the room. Guests get a fresh MEDIA_OFFER → MEDIA_READY cycle per epoch.
+    this._broadcastAnnouncement('create')
+    for (const peerId of room.participants.keys()) {
+      try {
+        await this._serveMediaToPeer(peerId)
+      } catch (err) {
+        console.warn('[WatchPartyManager] queue re-offer failed:', err.message)
+      }
+    }
+    this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    return this.getRoomInfo()
+  }
+
+  // ─── Voice (push-to-talk over the signaling channel) ──────────────────────
+
+  /**
+   * Broadcast a raw PCM voice chunk (base64, mono 16kHz s16le). Chunks are
+   * small (~3KB per 100ms) and infrequent (only while someone holds PTT), so
+   * they ride the regular signaling channel fine on LAN. Muted senders are
+   * stopped locally; the host also drops chunks from muted peers.
+   */
+  sendVoiceChunk(params = {}) {
+    const room = this.activeRoom
+    if (!room) return false
+    if (room.isMuted) return false
+    if (typeof params.audioB64 !== 'string' || !params.audioB64 || params.audioB64.length > 200000) return false
+
+    const myIdentity = this.engine.storage?.getDeviceIdentity?.() || {}
+    this._broadcastRoomMessage({
+      type: 'WATCH_VOICE',
+      roomCode: room.roomCode,
+      seq: params.seq || 0,
+      durationMs: params.durationMs || 100,
+      audioB64: params.audioB64,
+      sender: { id: myIdentity.id, name: myIdentity.name || 'Peer' },
+      timestamp: Date.now()
+    })
+    return true
+  }
+
+  /** Guest: after being muted by the host, stop sending voice locally too. */
+  setLocalMuted(muted) {
+    const room = this.activeRoom
+    if (!room) return false
+    room.isMuted = Boolean(muted)
+    return true
+  }
+
+  // ─── Subtitles ────────────────────────────────────────────────────────────
+
+  /** Host: attach/replace the subtitle sidecar (converted to VTT). */
+  async setSubtitle(subtitlePath) {
+    const room = this.activeRoom
+    if (!room || !room.isHost) return { success: false, error: 'host only' }
+    if (!subtitlePath) {
+      room.subtitle = null
+    } else {
+      room.subtitle = await this._loadSubtitle(subtitlePath)
+    }
+    // Push the updated track with the (unchanged) media offer.
+    for (const peerId of room.participants.keys()) {
+      try {
+        await this._serveMediaToPeer(peerId)
+      } catch {}
+    }
+    this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+    return { success: true, subtitle: room.subtitle ? { filename: room.subtitle.filename } : null }
+  }
+
+  /** Current subtitle sidecar ({filename, vtt}) or null — served to local UI. */
+  getSubtitle() {
+    return this.activeRoom && this.activeRoom.subtitle ? { ...this.activeRoom.subtitle } : null
+  }
+
+  async _loadSubtitle(subtitlePath) {
+    const raw = await fsp.readFile(subtitlePath, 'utf8')
+    if (Buffer.byteLength(raw, 'utf8') > SUBTITLE_MAX_BYTES) {
+      throw new Error('subtitle file too large')
+    }
+    const filename = path.basename(subtitlePath)
+    const isVtt = /\.vtt$/i.test(filename)
+    return { filename, vtt: isVtt ? raw : this._srtToVtt(raw) }
+  }
+
+  _srtToVtt(srt) {
+    const body = String(srt)
+      .replace(/\r+/g, '')
+      .replace(/^\uFEFF/, '')
+      .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
+    return `WEBVTT\n\n${body.trim()}\n`
+  }
+
+  _shareIdForEpoch(roomCode, epoch) {
+    const base = `watch-${String(roomCode).toLowerCase()}`
+    return epoch > 1 ? `${base}-e${epoch}` : base
+  }
+
+  _sendToPeer(peerId, msg) {
+    const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(peerId) : null
+    if (peerObj && peerObj.signaling && typeof peerObj.signaling.send === 'function') {
+      try {
+        peerObj.signaling.send(msg)
+      } catch {}
+    }
+  }
+
+  _destroyPeerMedia(peerId) {
+    const streams = this._mediaStreams.get(peerId)
+    if (streams) {
+      for (const s of streams) {
+        try {
+          s.destroy()
+        } catch {}
+      }
+      this._mediaStreams.delete(peerId)
+    }
+    const peerObj = this.engine && this.engine.peers ? this.engine.peers.get(peerId) : null
+    if (peerObj && peerObj.partyMediaStream) {
+      try {
+        peerObj.partyMediaStream.destroy()
+      } catch {}
+      peerObj.partyMediaStream = null
+    }
+  }
+
   /**
    * List all discovered active rooms hosted across the swarm.
    */
@@ -540,7 +928,10 @@ class WatchPartyManager extends EventEmitter {
     const now = Date.now()
     const valid = []
     for (const [code, room] of this.discoveredRooms.entries()) {
-      if (now - room.timestamp < 120000) { // Valid within 2 mins of last keepalive
+      // The host re-announces every 10s (_maintainRoom). A stale entry means
+      // the room is gone or unreachable — offering it in "Join with Room
+      // Code" lists a party that can never answer the join.
+      if (now - room.timestamp < 35000) {
         valid.push(room)
       } else {
         this.discoveredRooms.delete(code)
@@ -563,6 +954,18 @@ class WatchPartyManager extends EventEmitter {
       fileSize: this.activeRoom.fileSize,
       isHost: this.activeRoom.isHost,
       controlsMode: this.activeRoom.controlsMode,
+      isPrivate: Boolean(this.activeRoom.isPrivate),
+      rewindWindowSec: this.activeRoom.rewindWindowSec || 0,
+      playbackPeerId: this.activeRoom.playbackPeerId || this.activeRoom.hostPeerId,
+      mediaEpoch: this.activeRoom.mediaEpoch || 1,
+      queue: (this.activeRoom.queue || []).map((q) => ({
+        title: q.title,
+        filename: q.filename,
+        fileSize: q.fileSize
+      })),
+      subtitleName: this.activeRoom.subtitle ? this.activeRoom.subtitle.filename : null,
+      hostPositionSec: typeof this.activeRoom.hostPositionSec === 'number' ? this.activeRoom.hostPositionSec : null,
+      isLocalMuted: Boolean(this.activeRoom.isMuted),
       hostPeerId: this.activeRoom.hostPeerId,
       hostName: this.activeRoom.hostName,
       participantCount: this.activeRoom.participants.size + 1,
@@ -582,23 +985,46 @@ class WatchPartyManager extends EventEmitter {
         // If we're a guest in the room whose host just closed it, leave.
         this._handleHostClosed(msg.roomCode)
       } else if (msg.roomCode && msg.title) {
-        this.discoveredRooms.set(msg.roomCode, {
-          roomCode: msg.roomCode,
-          title: msg.title,
-          hostName: msg.hostName,
-          hostPeerId: peerId,
-          timestamp: Date.now()
-        })
+        // A guest already in this room is hearing the host over the relay —
+        // count it as host activity so the silence watchdog never drops a
+        // room whose direct link died but whose relay heartbeat still flows.
+        if (this.activeRoom && !this.activeRoom.isHost && this.activeRoom.roomCode === msg.roomCode) {
+          this.activeRoom._hostHeardAt = Date.now()
+        }
+        // Private rooms are code-only: joinable, never discoverable.
+        if (!msg.isPrivate) {
+          this.discoveredRooms.set(msg.roomCode, {
+            roomCode: msg.roomCode,
+            title: msg.title,
+            hostName: msg.hostName,
+            hostPeerId: peerId,
+            timestamp: Date.now()
+          })
+        }
       }
       this.emit(PARTY_EVENTS.DISCOVERED_ROOMS, this.listDiscoveredRooms())
     } else if (msg.type === 'WATCH_ROOM_JOIN') {
       if (this.activeRoom && this.activeRoom.isHost && this.activeRoom.roomCode === msg.roomCode) {
+        // Kick enforcement: the join capability (room code) never expires, so
+        // a removed peer's id is denylisted for the life of the room.
+        if (this.activeRoom.kicked.has(peerId)) {
+          this._sendToPeer(peerId, {
+            type: 'WATCH_MODERATE',
+            roomCode: msg.roomCode,
+            action: 'kick',
+            targetPeerId: peerId,
+            by: { id: this.activeRoom.hostPeerId, name: this.activeRoom.hostName },
+            timestamp: Date.now()
+          })
+          return
+        }
         const isRejoin = this.activeRoom.participants.has(peerId)
         this.activeRoom.participants.set(peerId, {
           peerId,
           name: msg.peer?.name || 'Peer',
           joinedAt: Date.now(),
-          status: 'connected'
+          status: 'connected',
+          isMuted: this.activeRoom.muted.has(peerId)
         })
         this.emit(PARTY_EVENTS.PEER_JOINED, {
           roomCode: msg.roomCode,
@@ -612,6 +1038,28 @@ class WatchPartyManager extends EventEmitter {
         // so its data plane comes up alongside the control plane it joined for.
         // A rejoin on a live connection reuses the existing stream (no-op).
         if (!isRejoin) {
+          // Late joiner: replay the recent chat so the panel isn't empty.
+          if (this.activeRoom.chatLog.length > 0) {
+            this._sendToPeer(peerId, {
+              type: 'WATCH_CHAT_HISTORY',
+              roomCode: msg.roomCode,
+              messages: this.activeRoom.chatLog.slice(-CHAT_HISTORY_REPLAY)
+            })
+          }
+          // Push the host's current playback state so the guest starts where
+          // the party actually is instead of at 0:00 while waiting for the
+          // next sync.
+          if (typeof this.activeRoom.hostPositionSec === 'number') {
+            this._sendToPeer(peerId, {
+              type: 'WATCH_STATE_SYNC',
+              roomCode: msg.roomCode,
+              action: this.activeRoom._lastAction || 'play',
+              positionSec: this.activeRoom.hostPositionSec,
+              playbackRate: 1,
+              timestampMs: Date.now(),
+              sender: { id: this.activeRoom.hostPeerId, name: this.activeRoom.hostName }
+            })
+          }
           this._serveMediaToPeer(peerId).catch((err) => {
             this.emit(PARTY_EVENTS.MEDIA_ERROR, {
               roomCode: this.activeRoom && this.activeRoom.roomCode,
@@ -631,7 +1079,8 @@ class WatchPartyManager extends EventEmitter {
       }
     } else if (msg.type === 'WATCH_PEER_STATUS') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
-        const p = this.activeRoom.participants.get(peerId)
+        const room = this.activeRoom
+        const p = room.participants.get(peerId)
         if (p) {
           p.positionSec = msg.positionSec
           p.buffering = msg.buffering
@@ -644,25 +1093,126 @@ class WatchPartyManager extends EventEmitter {
             this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
           }
         }
+        // Guests learn the master's authoritative playhead from its status.
+        const masterId = room.playbackPeerId || room.hostPeerId
+        if (!room.isHost && masterId && msg.peerId && msg.peerId === masterId && typeof msg.positionSec === 'number') {
+          room.hostPositionSec = msg.positionSec
+          room._hostHeardAt = Date.now()
+        }
         this.emit(PARTY_EVENTS.PEER_STATUS, msg)
       }
     } else if (msg.type === 'WATCH_STATE_SYNC') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
         const room = this.activeRoom
-        // Host-authority: in 'host' mode only the host peer may drive playback.
-        // Guests never match room.hostPeerId, so their syncs are dropped —
-        // unless the room is 'open' (collaborative).
-        if (room.controlsMode === 'host' && room.isHost) {
-          const senderId = (msg.sender && msg.sender.id) || peerId
-          if (room.hostPeerId && senderId !== room.hostPeerId) return
+        const masterId = room.playbackPeerId || room.hostPeerId
+        const senderId = (msg.sender && msg.sender.id) || peerId
+        // The host spoke — a relayed guest must not be watchdog-dropped while
+        // its state-sync heartbeat keeps arriving.
+        if (!room.isHost && senderId === (room.hostPeerId || masterId)) {
+          room._hostHeardAt = Date.now()
         }
+        // Host-authority: in 'host' mode only the playback master may drive
+        // playback. Guests never match the master id, so their syncs are
+        // dropped — unless the room is 'open' (collaborative).
+        if (room.controlsMode === 'host' && room.isHost) {
+          if (masterId && senderId !== masterId) return
+        }
+        // Track the playback master's authoritative position (used by the
+        // rewind-window rule and guest catch-up).
+        if (masterId && senderId === masterId && typeof msg.positionSec === 'number') {
+          room.hostPositionSec = msg.positionSec
+        }
+        // Rewind window: in open rooms the host rejects guest seeks further
+        // back than the window and re-asserts the authoritative position so
+        // the seeking guest snaps forward again.
+        if (
+          room.isHost &&
+          room.rewindWindowSec > 0 &&
+          senderId !== masterId &&
+          msg.action === 'seek' &&
+          typeof msg.positionSec === 'number' &&
+          typeof room.hostPositionSec === 'number' &&
+          msg.positionSec < room.hostPositionSec - room.rewindWindowSec
+        ) {
+          this.broadcastPlaybackState({ action: 'seek', positionSec: room.hostPositionSec })
+          return
+        }
+        // Guest-side guard: outside 'open' rooms only accept syncs from the
+        // master, so a rogue guest cannot drive other guests.
+        if (!room.isHost && room.controlsMode !== 'open' && masterId && senderId !== masterId) return
         // Track host liveness for the guest host-silence watchdog.
         if (!room.isHost) room._hostHeardAt = Date.now()
         this.emit(PARTY_EVENTS.STATE_SYNC, msg)
       }
     } else if (msg.type === 'WATCH_REACTION') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
+        // Room traffic rides both direct and relay paths — the same reaction
+        // arrives twice. Dedup on reactionId so the UI pops it once.
+        if (msg.reactionId) {
+          const rid = msg.reactionId
+          if (!this._seenReactions) this._seenReactions = new Set()
+          if (this._seenReactions.has(rid)) return
+          this._seenReactions.add(rid)
+          if (this._seenReactions.size > 512) {
+            this._seenReactions = new Set(Array.from(this._seenReactions).slice(-256))
+          }
+        }
         this.emit(PARTY_EVENTS.REACTION, msg)
+      }
+    } else if (msg.type === 'WATCH_CHAT') {
+      if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode && msg.text) {
+        // Both sides log received messages; the host's log additionally feeds
+        // the late-joiner history replay. _appendChat dedups by messageId —
+        // the same message can arrive over both the direct and relay paths —
+        // and a duplicate must not re-emit to the UI either.
+        const seen = this.activeRoom.chatLog.some((m) => m && m.messageId && m.messageId === msg.messageId)
+        this._appendChat(this.activeRoom, msg)
+        if (!seen) this.emit(PARTY_EVENTS.CHAT, msg)
+      }
+    } else if (msg.type === 'WATCH_CHAT_HISTORY') {
+      if (this.activeRoom && !this.activeRoom.isHost && this.activeRoom.roomCode === msg.roomCode) {
+        const room = this.activeRoom
+        if (Array.isArray(msg.messages)) {
+          room.chatLog = msg.messages.filter((m) => m && m.text).slice(-CHAT_LOG_MAX)
+        }
+        this.emit(PARTY_EVENTS.CHAT_HISTORY, { roomCode: msg.roomCode, messages: room.chatLog.slice() })
+      }
+    } else if (msg.type === 'WATCH_MODERATE') {
+      if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode && msg.targetPeerId) {
+        const room = this.activeRoom
+        if (room.isHost) return
+        const me = this.engine.storage?.getDeviceIdentity?.() || {}
+        if (msg.action === 'kick' && msg.targetPeerId === me.id) {
+          this.emit(PARTY_EVENTS.MODERATED, { ...msg, reason: 'kicked' })
+          this._clearJoinTimer()
+          const prev = room
+          this._teardownRoomState(prev)
+          this.emit(PARTY_EVENTS.ROOM_CLOSED, {
+            roomCode: prev.roomCode,
+            reason: 'kicked',
+            error: 'You were removed from the party by the host.'
+          })
+          return
+        }
+        if (msg.action === 'mute' && msg.targetPeerId === me.id) {
+          room.isMuted = true
+        } else if (msg.action === 'unmute' && msg.targetPeerId === me.id) {
+          room.isMuted = false
+        } else if (msg.action === 'promote') {
+          // Playback authority moved: the promoted guest now drives playback.
+          room.playbackPeerId = msg.targetPeerId
+        }
+        this.emit(PARTY_EVENTS.MODERATED, msg)
+        this.emit(PARTY_EVENTS.ROOM_UPDATED, this.getRoomInfo())
+      }
+    } else if (msg.type === 'WATCH_VOICE') {
+      if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode && msg.audioB64) {
+        const room = this.activeRoom
+        const senderId = (msg.sender && msg.sender.id) || peerId
+        // Defense in depth: muted senders stop locally; host and peers also
+        // drop their chunks.
+        if (senderId && room.muted.has(senderId)) return
+        this.emit(PARTY_EVENTS.VOICE, msg)
       }
     }
   }
@@ -703,14 +1253,16 @@ class WatchPartyManager extends EventEmitter {
     try {
       const core = exchangeStore.get({ name: room.shareId })
       await core.ready()
-      // One live replication stream per peer per connection: a rejoining guest
-      // reuses the same mesh connection, and a second noise-wrapped replicate
-      // over it would corrupt the wire.
-      let stream = peerObj.partyMediaStream
-      if (!stream || stream.destroyed) {
-        stream = core.replicate(peerObj.connection, { live: true })
+      // One protomux session per peer connection (hypercore 11 multiplexes
+      // core channels on the cached session): a rejoining guest reuses the
+      // same connection, and queue-advance attaches the NEXT epoch's core to
+      // it instead of opening a second noise layer.
+      const streamKey = room.coreKey
+      if (peerObj.partyMediaStreamKey !== streamKey || !peerObj.partyMediaStream || peerObj.partyMediaStream.destroyed) {
+        const stream = core.replicate(peerObj.connection, { live: true })
         stream._watchPartyRoom = room.roomCode
         peerObj.partyMediaStream = stream
+        peerObj.partyMediaStreamKey = streamKey
         peerObj.dropStreams = peerObj.dropStreams || []
         peerObj.dropStreams.push(stream)
         this._trackMediaStream(peerId, stream)
@@ -738,6 +1290,15 @@ class WatchPartyManager extends EventEmitter {
         // Host-authority mode rides on the offer so guests know whether they
         // may drive playback ('open') or must follow the host ('host').
         controlsMode: room.controlsMode || 'host',
+        // Queue epoch: guests derive their shareId from this, so a new epoch
+        // creates a fresh transfer instead of colliding with the old file.
+        mediaEpoch: room.mediaEpoch || 1,
+        // Which peer drives playback ('host' mode) — can be promoted away
+        // from the media host.
+        playbackPeerId: room.playbackPeerId || room.hostPeerId,
+        rewindWindowSec: room.rewindWindowSec || 0,
+        subtitle: room.subtitle || null,
+        hostPositionSec: typeof room.hostPositionSec === 'number' ? room.hostPositionSec : null,
         sender: { id: room.hostPeerId, name: room.hostName }
       })
     }
@@ -753,9 +1314,10 @@ class WatchPartyManager extends EventEmitter {
     if (!room || room.isHost) return
     if (!msg || msg.roomCode !== room.roomCode) return
 
-    const shareId = `watch-${room.roomCode.toLowerCase()}`
+    const epoch = Number.isFinite(msg.mediaEpoch) && msg.mediaEpoch > 0 ? Math.floor(msg.mediaEpoch) : 1
+    const shareId = this._shareIdForEpoch(room.roomCode, epoch)
     const transferId = typeof msg.transferId === 'string' && msg.transferId ? msg.transferId : ''
-    // Only the room's own deterministic id is this party's media.
+    // Only the room's own deterministic id (for this epoch) is this party's media.
     if (transferId && transferId !== shareId) return
 
     const { filename, fileSize, coreKey } = msg
@@ -767,8 +1329,19 @@ class WatchPartyManager extends EventEmitter {
     room.filename = filename
     room.fileSize = fileSize
     room.fileType = msg.fileType || room.fileType || ''
+    room.mediaEpoch = epoch
+    room.subtitle = msg.subtitle || null
     if (msg.controlsMode === 'host' || msg.controlsMode === 'open') {
       room.controlsMode = msg.controlsMode
+    }
+    if (typeof msg.rewindWindowSec === 'number' && msg.rewindWindowSec >= 0) {
+      room.rewindWindowSec = msg.rewindWindowSec
+    }
+    if (typeof msg.hostPositionSec === 'number') {
+      room.hostPositionSec = msg.hostPositionSec
+    }
+    if (typeof msg.playbackPeerId === 'string' && msg.playbackPeerId) {
+      room.playbackPeerId = msg.playbackPeerId
     }
     // The host spoke with a VALID offer — it is definitely reachable. Clear
     // the join timeout and record host identity so getRoomInfo() is complete.
@@ -830,11 +1403,13 @@ class WatchPartyManager extends EventEmitter {
         }
         const core = exchangeStore.get(Buffer.from(coreKey, 'hex'))
         await core.ready()
-        let stream = peerObj.partyMediaStream
-        if (!stream || stream.destroyed) {
-          stream = core.replicate(peerObj.connection, { live: true })
+        // Attach the new core's channel to the existing protomux session
+        // (epoch changes reuse the connection; hypercore 11 multiplexes).
+        if (peerObj.partyMediaStreamKey !== coreKey || !peerObj.partyMediaStream || peerObj.partyMediaStream.destroyed) {
+          const stream = core.replicate(peerObj.connection, { live: true })
           stream._watchPartyRoom = room.roomCode
           peerObj.partyMediaStream = stream
+          peerObj.partyMediaStreamKey = coreKey
           peerObj.dropStreams = peerObj.dropStreams || []
           peerObj.dropStreams.push(stream)
           this._trackMediaStream(peerId, stream)
@@ -923,6 +1498,25 @@ class WatchPartyManager extends EventEmitter {
           roomCode: room.roomCode,
           title: trusted || action === 'close' ? room.title : 'Watch Party',
           hostName: trusted ? hostIdentity.name || 'Host' : undefined,
+          isPrivate: Boolean(room.isPrivate),
+          timestamp: Date.now()
+        })
+      } catch {}
+    }
+    // Relay fallback: a guest whose direct link dropped (mobile OS parked the
+    // app) only re-discovers the room — and hears 'close' — over the relay
+    // topic. Anyone receiving here already holds the room code (the topic
+    // name IS the capability), so full details are safe.
+    const relayClient = this.engine && this.engine.relayClient
+    if (relayClient && typeof relayClient.send === 'function') {
+      try {
+        relayClient.send(`p2p-watch-${room.roomCode}`, {
+          type: 'WATCH_ROOM_ANNOUNCE',
+          action,
+          roomCode: room.roomCode,
+          title: room.title,
+          hostName: hostIdentity.name || 'Host',
+          isPrivate: Boolean(room.isPrivate),
           timestamp: Date.now()
         })
       } catch {}
@@ -931,6 +1525,18 @@ class WatchPartyManager extends EventEmitter {
 
   _broadcastRoomMessage(msg) {
     this._broadcastToAllPeers(msg)
+    // Relay fallback: publish room traffic on the room's relay topic so a
+    // peer whose direct link dropped (mobile OS parked the app, network
+    // changed) still hears announcements/joins/chat/reactions. Both sides
+    // join this topic (createRoom/joinRoom); inbound relay delivery is
+    // dispatched back here through TrustManager's unmatched-relay fallthrough.
+    const code = (msg && msg.roomCode) || (this.activeRoom && this.activeRoom.roomCode)
+    const relayClient = this.engine && this.engine.relayClient
+    if (code && relayClient && typeof relayClient.send === 'function') {
+      try {
+        relayClient.send(`p2p-watch-${code}`, msg)
+      } catch {}
+    }
   }
 
   _broadcastToAllPeers(msg) {

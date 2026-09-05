@@ -2384,7 +2384,16 @@ class TransferEngine {
     const bee = await this.getBee('transfers')
     const results = []
     for await (const node of bee.createReadStream()) {
-      if (node.value && node.value.id) results.push(node.value)
+      if (node.value && node.value.id) {
+        const rec = node.value
+        // Attach the live contiguous committed prefix for in-flight receives
+        // (progressive players use it as their safe read/seek bound).
+        if (rec.direction === 'receive' && rec.status !== 'completed') {
+          const prefix = this.getCommittedPrefixBytes(rec.id)
+          if (prefix >= 0) rec.committedPrefix = prefix
+        }
+        results.push(rec)
+      }
     }
     results.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     return results
@@ -2400,8 +2409,31 @@ class TransferEngine {
     return false
   }
 
-  setPlayheadByte(transferId, byteOffset) {
+  /**
+   * Contiguous committed prefix of an in-flight receive transfer, in bytes:
+   * the length of the file region [0, prefix) that is fully downloaded,
+   * hash-verified, and written to disk. The prefetch pass commits head+tail
+   * first and a sequential sweep fills forward, so percent progress (which
+   * counts the tail) is NOT a safe seek/read bound — this prefix is.
+   * Returns -1 when the transfer has no live run (e.g. completed).
+   */
+  getCommittedPrefixBytes(transferId) {
     const info = this.runs.get(transferId)
+    if (!info || !info.core) return -1
+    try {
+      const contiguous =
+        typeof info.core.contiguousLength === 'function'
+          ? info.core.contiguousLength()
+          : 0
+      // Core block 0 is the transfer header; file data starts at core block 1.
+      const dataBlocks = Math.max(0, contiguous - 1)
+      return dataBlocks * (info.blockSize || CHUNK_SIZE)
+    } catch {
+      return -1
+    }
+  }
+
+  setPlayheadByte(transferId, byteOffset) {    const info = this.runs.get(transferId)
     if (info && info.scheduler && typeof info.scheduler.setPlayhead === 'function') {
       // info.blockSize is now set post-manifest on both receive paths, so a
       // 206 range start converts to the correct byte-based scheduler playhead.

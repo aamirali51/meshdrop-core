@@ -320,6 +320,40 @@ class TrustManager {
     } catch {}
   }
 
+  // Keep the joiner secret (and its topic membership) alive for a short grace
+  // window after pairWithCode settles, then drop both. WHY: the host's
+  // RECIPROCAL challenge races the joiner's own verification — the joiner
+  // resolves pairWithCode the instant it verifies the host's answer, and the
+  // host's counter-challenge (sent in the same handler, right behind the
+  // answer, possibly in a later relay delivery batch) needs this secret to be
+  // answerable AND a subscribed topic to arrive on. Dropping eagerly leaves
+  // the host unable to verify the joiner: every later connection dies in the
+  // 30s pairing watchdog (challenge never verified) and the pair is
+  // half-trusted forever (joiner shows paired, host keeps re-challenging).
+  softDropJoinerCode(code, keepSecretMs = 120000) {
+    if (!code) return
+    const cid = codeId(code)
+    const secret = this.pairingSecrets.get(cid)
+    if (!secret || secret.role !== 'joiner') return
+    // Deferred cleanup, and only for THIS registration: a retry of the same
+    // code overwrites pairingSecrets with a fresh secret, and the stale timer
+    // from the previous attempt must not delete it (or wipe the retry's
+    // outstanding nonces) mid-handshake. The topic leave is deferred too —
+    // leaving at settle time closes the relay socket/poll, so a host
+    // reciprocal challenge arriving in a later delivery batch would be
+    // dropped and the pair would end up half-trusted anyway.
+    const timer = setTimeout(() => {
+      if (this.pairingSecrets.get(cid) !== secret) return
+      this.pairingSecrets.delete(cid)
+      this.relayOutstanding = this.relayOutstanding.filter((o) => o.codeId !== cid)
+      try {
+        if (this.relayClient) this.relayClient.leave(`p2p-pair-${code}`)
+        if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
+      } catch {}
+    }, keepSecretMs)
+    if (timer.unref) timer.unref()
+  }
+
   // Register a code the user is pairing with (joiner side) and join its topic.
   // Returns the canonical code, or null if the format is invalid.
   registerJoinerCode(rawCode) {
@@ -382,7 +416,38 @@ class TrustManager {
     return cleanCode
   }
 
-  // MeshDrop Sites — register a VISITOR's pairing code on the HOST side so the
+  // Re-broadcast the joiner's relay pairing challenge. The initial broadcast
+  // (registerJoinerCode) fires exactly twice, in the first 600ms — if the
+  // host's relay socket is not connected yet (the host relay starts lazily on
+  // pairing intent / zero-peer fallback), those sends are lost and the pairing
+  // can then only complete via direct DHT. pairWithCode's drive loop calls
+  // this every few seconds for the whole pairing window so the relay path
+  // stays alive alongside direct attempts.
+  resendRelayChallenge(rawCode) {
+    const cleanCode = normalizePairingCode(rawCode)
+    if (!cleanCode || !this.relayClient || !this.relayClient.started) return false
+    const cid = codeId(cleanCode)
+    const secret = this.pairingSecrets.get(cid)
+    if (!secret || secret.role !== 'joiner') return false
+    if (secret.expiresAt > 0 && Date.now() >= secret.expiresAt) return false
+    this._joinPairingTopic(cleanCode)
+    const nonce = randomBytes(16)
+    this.relayOutstanding.push({ nonce, code: cleanCode, codeId: cid, sentAt: Date.now() })
+    // Outstanding nonces are answered at most once each; keep the list bounded.
+    if (this.relayOutstanding.length > 32) {
+      this.relayOutstanding.splice(0, this.relayOutstanding.length - 32)
+    }
+    try {
+      this.relayClient.send(`p2p-pair-${cleanCode}`, {
+        type: MESSAGES.PAIRING_CHALLENGE,
+        codeId: cid,
+        nonce: b4a.toString(nonce, 'hex')
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
   // host can verify that the visitor holds it (the allowlist flow). The host
   // joins the visitor's own pairing topic (which every device announces
   // permanently) and challenges; the visitor answers with mac(code, nonce); a
@@ -759,6 +824,33 @@ class TrustManager {
           }
         } catch {}
         this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
+      }
+    }
+
+    // 4. Anything else arriving on a relay topic (WATCH_* party traffic on
+    // `p2p-watch-*`/`p2p-peer-*`, etc.) is peer-protocol traffic exactly like
+    // what rides direct signaling channels. Without this fallthrough every
+    // relayed-only peer link silently dropped chat/reactions/state-sync while
+    // pairing (which IS handled above) kept working — making the party look
+    // "half alive" over relay. The engine wires onUnmatchedRelayMessage to the
+    // same dispatcher direct-channel messages go through.
+    const handledTypes = [
+      MESSAGES.PAIRING_CHALLENGE,
+      MESSAGES.PAIRING_RESP,
+      MESSAGES.HANDSHAKE,
+      'SITE_VERIFY_CHALLENGE',
+      'SITE_VERIFY_RESP'
+    ]
+    if (
+      this.onUnmatchedRelayMessage &&
+      msg &&
+      typeof msg.type === 'string' &&
+      !handledTypes.includes(msg.type)
+    ) {
+      try {
+        this.onUnmatchedRelayMessage(topic, msg, fromPeerId)
+      } catch (err) {
+        console.warn('[MeshEngine] Relay peer-message dispatch failed:', err?.message)
       }
     }
   }

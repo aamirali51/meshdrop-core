@@ -673,6 +673,17 @@ class MeshEngine extends EventEmitter {
       this.connections.refs.handleSyncVerify = (peerId, msg) => this.syncEngine.handleSyncVerify(peerId, msg)
       this.connections.refs.handleSyncVerifyResult = (peerId, msg) => this.syncEngine.handleSyncVerifyResult(peerId, msg)
       this.connections.refs.handleWatchMessage = (peerId, msg) => this.watchParty && this.watchParty.handleMessage(peerId, msg)
+      // Relay fallback: TrustManager owns relayClient.onMessage for pairing,
+      // and hands every non-pairing relay message (WATCH_* party traffic on
+      // `p2p-watch-*` / `p2p-peer-*` topics) to the SAME dispatcher direct
+      // signaling channels use. Without this, relayed-only peer links lose
+      // chat/reactions/state-sync silently while media (which has its own
+      // relay transport) keeps flowing.
+      this.trustManager.onUnmatchedRelayMessage = (topic, msg, fromPeerId) => {
+        if (this.connections && typeof this.connections.handlePeerMessage === 'function') {
+          this.connections.handlePeerMessage(fromPeerId, msg)
+        }
+      }
     }
 
     this.watchParty = new WatchPartyManager({ engine: this })
@@ -1013,12 +1024,17 @@ class MeshEngine extends EventEmitter {
         this.removeListener(EVENTS.PEER_DISCONNECTED, onDisconnected)
         this.removeListener(EVENTS.TRUST_REVOKED, onRevoked)
         this.removeListener(EVENTS.PAIRING_FAILED, onPairingFailed)
-        // A settled pairing (success OR failure) drops the joiner secret and
-        // leaves its topic. Without this a failed/abandoned pairing keeps the
-        // code registered for its full 15-min TTL and the DHT topic announced.
-        // The host code is unaffected — it is a different secret (role: 'host').
+        // A settled pairing (success OR failure) leaves the joiner's DHT/relay
+        // topic and drops the joiner secret after a short grace window.
+        // Without this a failed/abandoned pairing keeps the code registered
+        // for its full 15-min TTL and the topic announced. The secret itself
+        // must stay answerable briefly: the host's RECIPROCAL challenge races
+        // our verification (see TrustManager.softDropJoinerCode) — dropping
+        // eagerly leaves the pair half-trusted and every later connection
+        // dies in the 30s pairing watchdog. The host code is unaffected —
+        // it is a different secret (role: 'host').
         try {
-          this.trustManager.dropJoinerCode(clean)
+          this.trustManager.softDropJoinerCode(clean)
         } catch {}
         fn(value)
       }
@@ -1079,6 +1095,10 @@ class MeshEngine extends EventEmitter {
           if (this.connections && typeof this.connections.reconnectKnownPeers === 'function') {
             this.connections.reconnectKnownPeers().catch(() => {})
           }
+          // Keep the relay fallback challenge alive for the whole pairing
+          // window: the initial broadcast fires only twice (0ms + 600ms), and
+          // a host whose lazy relay socket is not up yet never hears it.
+          this.trustManager.resendRelayChallenge(clean)
         } catch {}
       }, PAIR_DRIVE_INTERVAL_MS)
       if (drive.unref) drive.unref()
@@ -2136,12 +2156,62 @@ class MeshEngine extends EventEmitter {
     return this.watchParty ? this.watchParty.listDiscoveredRooms() : []
   }
 
-  sendPartyReaction(emoji) {
-    return this.watchParty ? this.watchParty.sendReaction(emoji) : false
+  sendPartyReaction(params = {}) {
+    if (!this.watchParty) return false
+    if (typeof params === 'string') return this.watchParty.sendReaction(params)
+    return this.watchParty.sendReaction(params.emoji, params.positionSec)
   }
 
   broadcastPartyStatus(params) {
     return this.watchParty ? this.watchParty.broadcastPeerStatus(params) : false
+  }
+
+  sendPartyChat(params = {}) {
+    if (!this.watchParty) return false
+    return this.watchParty.sendChat(params.text)
+  }
+
+  getPartyChatHistory() {
+    return this.watchParty ? this.watchParty.getChatHistory() : []
+  }
+
+  moderateParty(params) {
+    if (!this.watchParty) return { success: false, error: 'no party' }
+    return this.watchParty.moderate(params || {})
+  }
+
+  setPartyRewindWindow(params = {}) {
+    if (!this.watchParty) return false
+    return this.watchParty.setRewindWindow(params.seconds)
+  }
+
+  async addPartyQueueItem(params) {
+    if (!this.watchParty) throw new Error('WatchPartyManager not initialized')
+    return this.watchParty.queueAdd(params || {})
+  }
+
+  removePartyQueueItem(params = {}) {
+    if (!this.watchParty) return { success: false }
+    return this.watchParty.queueRemove(params.index)
+  }
+
+  async playNextPartyMedia() {
+    if (!this.watchParty) throw new Error('WatchPartyManager not initialized')
+    return this.watchParty.queueNext()
+  }
+
+  async setPartySubtitle(params = {}) {
+    if (!this.watchParty) throw new Error('WatchPartyManager not initialized')
+    return this.watchParty.setSubtitle(params.subtitlePath)
+  }
+
+  getPartySubtitle() {
+    return this.watchParty ? this.watchParty.getSubtitle() : null
+  }
+
+  sendPartyVoiceChunk(params) {
+    if (!this.watchParty) return false
+    return this.watchParty.sendVoiceChunk(params || {})
   }
 
   /**
