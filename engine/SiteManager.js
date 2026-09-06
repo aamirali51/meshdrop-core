@@ -218,6 +218,22 @@ class SiteManager {
     return site || null
   }
 
+  // Audit fix F2: prune a key from EVERY site allowlist. Used when the device
+  // is removed/revoked — access used to outlive trust because this was only
+  // reachable through the per-site SITES_REMOVE_VISITOR IPC.
+  async removeVisitorEverywhere(publicKeyHex) {
+    if (!this.store) throw new Error('SiteManager not initialized')
+    const sites = await this.store.listSites()
+    let pruned = 0
+    for (const site of sites || []) {
+      if (!site || !Array.isArray(site.allowlist)) continue
+      if (!site.allowlist.some((e) => e && e.key === publicKeyHex)) continue
+      await this.store.removeFromAllowlist(site.siteId || site.id, publicKeyHex)
+      pruned++
+    }
+    return { pruned }
+  }
+
   // ─── Response handling (the MAC check that lands the key on the list) ─────
 
   async _handleVisitorResponse(peerId, msg) {

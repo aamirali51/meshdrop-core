@@ -48,6 +48,10 @@ const MESSAGES = {
   // falls back to the per-file skip handshake).
   SYNC_VERIFY: 'SYNC_VERIFY',
   SYNC_VERIFY_RESULT: 'SYNC_VERIFY_RESULT',
+  // Audit fix F1: explicit refusal for SYNC_* traffic from a lan-level
+  // (recognized but unpaired) peer, so the sender's UI can explain why sync
+  // never starts. Untrusted/unknown senders get silence — no oracle.
+  SYNC_DENIED: 'SYNC_DENIED',
   // Watch Party synchronized playback & group swarm state
   WATCH_STATE_SYNC: 'WATCH_STATE_SYNC',
   WATCH_PEER_STATUS: 'WATCH_PEER_STATUS'
@@ -84,6 +88,7 @@ const EVENTS = {
   SYNC_CONFLICT: 'sync:conflict',
   SYNC_ERROR: 'sync:error',
   SYNC_INVITE_RECEIVED: 'sync:invite:received',
+  SYNC_DENIED: 'sync:denied',
   // Sync run phase: 'analyzing' | 'transferring' | 'synced' with counters —
   // lets the UI separate file comparison from actual payload transfer.
   SYNC_PHASE: 'sync:phase',

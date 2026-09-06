@@ -529,6 +529,57 @@ class SyncEngine {
     await this._removeLibraryLocal(msg.libraryId)
   }
 
+  // ─── Audit fix F1/F2: partnership authorization & teardown ─────────────────
+
+  // Wire-level authorization binding for library-targeted SYNC_* messages:
+  // the sender must be the library's registered partner. Knowing a libraryId
+  // is NOT authorization (the gate itself lives in connections/signaling.js).
+  isLibraryPeer(libraryId, peerId) {
+    if (!libraryId || typeof libraryId !== 'string') return false
+    const lib = this.libraries.get(libraryId)
+    return !!(lib && lib.peerId && lib.peerId === peerId)
+  }
+
+  // The peer refused our SYNC_* traffic because it does not consider us paired
+  // (two-tier trust: the sender's side never confirmed pairing, or the device
+  // was removed there). Persist a blocked status so the UI can explain the
+  // break instead of spinning in waiting_peer forever.
+  async handleSyncDenied(peerId, msg) {
+    if (!msg || !msg.libraryId) return
+    const lib = this.libraries.get(msg.libraryId)
+    if (!lib || lib.peerId !== peerId) return
+    if (lib.status === 'blocked_unpaired') return
+    lib.status = 'blocked_unpaired'
+    await this._persist(lib)
+    this.sendEvent(EVENTS.SYNC_DENIED, {
+      id: lib.id,
+      libraryId: lib.id,
+      name: lib.name,
+      reason: msg.reason || 'unpaired'
+    })
+  }
+
+  // The partnership ended (this peer was removed on the other side, or the
+  // local user deleted the device). Keep the user's library record, folder
+  // config and local files — only end the sync relationship.
+  async revokePeer(peerId) {
+    for (const lib of Array.from(this.libraries.values())) {
+      if (lib.peerId !== peerId) continue
+      this._stopWatching(lib.id)
+      lib.status = 'revoked'
+      lib.paused = true
+      if (this.transferEngine?.cancelSyncTransfers) {
+        await this.transferEngine.cancelSyncTransfers(lib.id).catch(() => {})
+      }
+      await this._persist(lib)
+      this.sendEvent(EVENTS.SYNC_ERROR, {
+        id: lib.id,
+        libraryId: lib.id,
+        message: `Device removed — sync paused for "${lib.name}". Re-pair the device to resume.`
+      })
+    }
+  }
+
   listLibraries() {
     return Array.from(this.libraries.values()).map((lib) => {
       let totalSize = 0
@@ -547,7 +598,9 @@ class SyncEngine {
         localPath: lib.localPath,
         peerId: lib.peerId,
         mode: lib.mode || 'two-way',
-        status: lib.paused ? 'paused' : (this._syncingSet.has(lib.id) ? 'syncing' : lib.status || 'idle'),
+        status: lib.status === 'revoked' || lib.status === 'blocked_unpaired'
+          ? lib.status
+          : lib.paused ? 'paused' : (this._syncingSet.has(lib.id) ? 'syncing' : lib.status || 'idle'),
         phase: (lib._phase && lib._phase.phase) || 'synced',
         phaseTotal: (lib._phase && lib._phase.total) || 0,
         phaseDone: (lib._phase && lib._phase.done) || 0,

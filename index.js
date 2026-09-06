@@ -702,6 +702,7 @@ class MeshEngine extends EventEmitter {
       this.connections.refs.handleSyncRemove = (peerId, msg) => this.syncEngine.handleSyncRemove(peerId, msg)
       this.connections.refs.handleSyncVerify = (peerId, msg) => this.syncEngine.handleSyncVerify(peerId, msg)
       this.connections.refs.handleSyncVerifyResult = (peerId, msg) => this.syncEngine.handleSyncVerifyResult(peerId, msg)
+      this.connections.refs.handleSyncDenied = (peerId, msg) => this.syncEngine.handleSyncDenied(peerId, msg)
       this.connections.refs.handleWatchMessage = (peerId, msg) => this.watchParty && this.watchParty.handleMessage(peerId, msg)
     }
 
@@ -1491,7 +1492,7 @@ class MeshEngine extends EventEmitter {
   }
 
   /** Delete a paired device from persistent store, revoke its trust key, and disconnect. */
-  async removeDevice(id) {
+  async removeDevice(id, { cancelDropCodes = false } = {}) {
     if (!id || typeof id !== 'string') throw new Error('Invalid device id')
     const bee = await this.getBee('devices')
     const entry = await bee.get(id)
@@ -1501,6 +1502,34 @@ class MeshEngine extends EventEmitter {
     if (device && device.publicKey) {
       this.trustManager.removeTrustedKey(device.publicKey)
       await this.trustManager.revokeKey(device.publicKey)
+      // Audit fix F2: revocation must end every data relationship the device
+      // had, not just the trust entry. Sync partnerships: keep the user's
+      // library record, folder config and local files, but stop syncing.
+      if (this.syncEngine) {
+        await this.syncEngine.revokePeer(device.publicKey).catch((err) => {
+          console.warn('[MeshEngine] Failed to revoke sync libraries for deleted device:', err.message)
+        })
+      }
+      // Site allowlists: previously prunable only via SITES_REMOVE_VISITOR IPC
+      // — a revoked device kept browse/write access to every shared folder it
+      // was allowlisted on.
+      if (this.siteManager) {
+        try {
+          await this.siteManager.removeVisitorEverywhere(device.publicKey)
+        } catch (err) {
+          console.warn('[MeshEngine] Failed to prune site allowlists for deleted device:', err.message)
+        }
+      }
+      // Drop codes are code-knowledge, not device-bound — a code handed to the
+      // deleted device keeps working until expiry. Opt-in because the code may
+      // have been shared beyond the removed device.
+      if (cancelDropCodes) {
+        try {
+          await this.cancelActiveDropCodes()
+        } catch (err) {
+          console.warn('[MeshEngine] Failed to cancel drop codes for deleted device:', err.message)
+        }
+      }
     }
 
     try {
@@ -1513,16 +1542,27 @@ class MeshEngine extends EventEmitter {
       if (device.publicKey) {
         this.topicRegistry.leave(`p2p-node-${device.publicKey}`)
       }
+      if (device.identityKey || device.publicKey) {
+        try {
+          this.topicRegistry.leave(`p2p-peer-${device.identityKey || device.publicKey}`)
+        } catch {}
+      }
+      const targets = []
       for (const [pId, peerObj] of this.peers.entries()) {
         if (
           peerObj.device &&
           (peerObj.device.id === id || peerObj.device.publicKey === device.publicKey || pId === device.publicKey)
         ) {
-          // Tell the deleted device it was removed BEFORE destroying the
-          // connection so its UI can react immediately and its local trust in
-          // us is revoked. Fire-and-forget: the message may not flush if the
-          // transport dies first, in which case the revoked-key set on its
-          // next reconnect still refuses auto-trust.
+          targets.push(peerObj)
+        }
+      }
+      if (targets.length > 0) {
+        // Tell the deleted device it was removed BEFORE destroying the
+        // connection so its UI can react immediately and its local trust in
+        // us is revoked. Audit fix F2: give the message a bounded window to
+        // flush instead of racing the destroy — on failure we destroy anyway
+        // (the router gate is the real defense; this is UX hygiene).
+        for (const peerObj of targets) {
           try {
             if (peerObj.signaling) {
               peerObj.signaling.send({
@@ -1531,6 +1571,9 @@ class MeshEngine extends EventEmitter {
               })
             }
           } catch {}
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5000))
+        for (const peerObj of targets) {
           try {
             peerObj.connection.destroy()
           } catch {}
@@ -1540,6 +1583,23 @@ class MeshEngine extends EventEmitter {
 
     this.emit(EVENTS.PEER_DISCONNECTED, { id, publicKey: device?.publicKey })
     return { success: true, id }
+  }
+
+  // Audit fix F2 companion: cancel every still-active drop code (host side).
+  // Codes are capability knowledge, so "revoking the device" can only mean
+  // killing the codes it may have seen.
+  async cancelActiveDropCodes() {
+    const bee = await this.storage.getBee('pendingShares')
+    const now = Date.now()
+    let cancelled = 0
+    for await (const node of bee.createReadStream()) {
+      const share = node.value
+      if (!share || share.status === 'expired' || share.status === 'cancelled') continue
+      if (share.expiresAt > 0 && now >= share.expiresAt) continue
+      await this.cleanupPendingShare(share.id, 'cancelled').catch(() => {})
+      cancelled++
+    }
+    return { cancelled }
   }
 
   /**

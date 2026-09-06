@@ -157,6 +157,72 @@ function createSignaling(ctx) {
     }
   }
 
+  // ─── Audit fix F1: SYNC_* authorization gate ───────────────────────────────
+
+  // Library-targeted messages are bound to the library's registered partner.
+  // SYNC_INVITE is excluded: it carries a libraryId the sender OWNS (it is the
+  // invite itself), and the receiver never has the library yet.
+  const SYNC_LIBRARY_BOUND = new Set([
+    MESSAGES.SYNC_INDEX,
+    MESSAGES.SYNC_DELETE,
+    MESSAGES.SYNC_VERIFY,
+    MESSAGES.SYNC_VERIFY_RESULT,
+    MESSAGES.SYNC_INVITE_ACCEPT,
+    MESSAGES.SYNC_INVITE_DECLINE,
+    MESSAGES.SYNC_REMOVE
+  ])
+
+  // Rate limit for SYNC_DENIED per peer+library+type: one explanation per
+  // window, so a churning unpaired peer cannot use denials as a channel.
+  const syncDeniedLast = new Map()
+  const SYNC_DENIED_WINDOW_MS = 10 * 1000
+
+  function sendSyncDenied(peerId, msg) {
+    const libId = typeof msg.libraryId === 'string' ? msg.libraryId : ''
+    const key = `${peerId}:${msg.type}:${libId}`
+    const now = Date.now()
+    if (now - (syncDeniedLast.get(key) || 0) < SYNC_DENIED_WINDOW_MS) return
+    if (syncDeniedLast.size > 512) syncDeniedLast.clear()
+    syncDeniedLast.set(key, now)
+    try {
+      const peerObj = peers.get(peerId)
+      if (peerObj && peerObj.signaling) {
+        peerObj.signaling.send({
+          type: MESSAGES.SYNC_DENIED,
+          libraryId: libId,
+          messageType: msg.type,
+          reason: 'unpaired'
+        })
+      }
+    } catch {}
+  }
+
+  // Returns true when the message may be dispatched. Only lan-level (mode
+  // 'lan') senders get a SYNC_DENIED reply; untrusted/unknown senders get
+  // silence so the gate cannot be probed for libraryId existence.
+  function gateSyncMessage(peerId, msg) {
+    const peerObj = peers.get(peerId)
+    if (!peerObj || !peerObj.pairing || peerObj.pairing.trusted !== true) {
+      if (peerObj && peerObj.pairing && peerObj.pairing.mode === 'lan') {
+        sendSyncDenied(peerId, msg)
+      }
+      console.warn(
+        `[MeshEngine] Dropping ${msg.type} from untrusted peer ${peerId.slice(0, 12)}... (not paired)`
+      )
+      return false
+    }
+    if (SYNC_LIBRARY_BOUND.has(msg.type)) {
+      const libId = typeof msg.libraryId === 'string' ? msg.libraryId : ''
+      if (libId && engine.syncEngine && !engine.syncEngine.isLibraryPeer(libId, peerId)) {
+        console.warn(
+          `[MeshEngine] Dropping ${msg.type} for library ${libId.slice(0, 24)}... from non-partner peer ${peerId.slice(0, 12)}...`
+        )
+        return false
+      }
+    }
+    return true
+  }
+
   // Inbound message router. All message types are validated and dispatched to
   // the owning module; unknown peers only ever get pairing challenges.
   function handlePeerMessage(peerId, msg) {
@@ -164,20 +230,27 @@ function createSignaling(ctx) {
     // Two-tier trust: a lan-level peer (recognized, NOT paired) gets identity
     // exchange, watch-party existence and drop-code claims only. Data-bearing
     // families — exchange sync and shared-folder invites — stay locked until
-    // the user confirms full pairing.
+    // the user confirms full pairing. (Audit fix F1: SYNC_* enforcement moved
+    // below to gateSyncMessage, which is uniform across trust levels.)
     const lanPeerObj = peers.get(peerId)
     if (
       lanPeerObj &&
       lanPeerObj.pairing &&
       !lanPeerObj.pairing.trusted &&
       lanPeerObj.pairing.mode === 'lan' &&
-      (msg.type.startsWith('SYNC_') || msg.type === 'SITE_INVITE')
+      msg.type === 'SITE_INVITE'
     ) {
       console.warn(
         `[MeshEngine] Ignoring ${msg.type} from lan-level peer ${peerId.slice(0, 12)}... (not paired)`
       )
       return
     }
+    // Audit fix F1: SYNC_* is data-bearing. Every dispatch is gated on full
+    // pairing trust (mirroring the TRANSFER_OFFER gate above), and library-
+    // targeted messages are additionally bound to the library's registered
+    // partner — knowing a libraryId is NOT authorization. The audit repro
+    // proved a revoked device could delete owner files via ungated SYNC_INDEX.
+    if (msg.type.startsWith('SYNC_') && !gateSyncMessage(peerId, msg)) return
     if (msg.type === MESSAGES.HANDSHAKE) {
       const peerObj = peers.get(peerId)
       if (!peerObj || !peerObj.pairing) {
@@ -349,6 +422,15 @@ function createSignaling(ctx) {
       if (ctx.refs.handleSyncVerifyResult) {
         ctx.refs.handleSyncVerifyResult(peerId, msg).catch((err) => {
           console.warn('[MeshEngine] handleSyncVerifyResult failed:', err?.message)
+        })
+      }
+    } else if (msg.type === MESSAGES.SYNC_DENIED) {
+      // Audit fix F1: the partner's engine told us sync is refused because the
+      // (sender-side) peer is not paired — surface it instead of spinning in
+      // waiting_peer forever.
+      if (ctx.refs.handleSyncDenied) {
+        ctx.refs.handleSyncDenied(peerId, msg).catch((err) => {
+          console.warn('[MeshEngine] handleSyncDenied failed:', err?.message)
         })
       }
     } else if (msg.type === 'SITE_INVITE') {
