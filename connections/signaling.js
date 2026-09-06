@@ -204,21 +204,64 @@ function createSignaling(ctx) {
       // The remote host deleted this device. React immediately so the UI can
       // show "you were removed" and the local trust state is torn down —
       // otherwise the peer only discovers the deletion on its next reconnect
-      // (revoked → refused auto-trust → must re-pair).
+      // (revoked → refused auto-trust → must re-pair). The notification +
+      // persisted self-clear survive a restart (the stuck-state recovery path).
       const peerObj = peers.get(peerId)
+      const hostId = peerId
       if (peerObj) {
         try {
           if (engine.trustManager) {
-            // The host's key is no longer trusted locally. The connection is
-            // destroyed so any in-flight transfers/sync abort and park.
-            engine.trustManager.removeTrustedKey(peerId)
-            engine.trustManager.revokeKey(peerId).catch(() => {})
+            engine.trustManager.removeTrustedKey(hostId)
+            engine.trustManager.revokeKey(hostId).catch(() => {})
           }
           peerObj.connection.destroy()
         } catch {}
+      } else if (engine.trustManager) {
+        try {
+          engine.trustManager.removeTrustedKey(hostId)
+          engine.trustManager.revokeKey(hostId).catch(() => {})
+        } catch {}
       }
-      engine.emit(EVENTS.TRUST_REVOKED, { publicKey: peerId })
-      engine.emit(EVENTS.DEVICE_REMOVED, { peerId })
+      // Self-clear the host from persisted devices even when no live peer
+      // exists (already disconnected) — prevents stuck-state where only
+      // clearing app data recovers (revokedKey persists, device row keeps
+      // showing "trusted" until re-paired).
+      try {
+        engine.getBee('devices').then(async (bee) => {
+          for await (const node of bee.createReadStream()) {
+            const dev = node.value
+            if (dev && (dev.publicKey === hostId || dev.id === msg.deviceId)) {
+              await bee.del(node.key).catch(() => {})
+            }
+          }
+        }).catch(() => {})
+      } catch {}
+      // Drop stale host pairing secrets so the revoked phone doesn't keep
+      // trying to answer with the pre-rotation code (would never verify, just
+      // cycles the 30s "challenge never verified" watchdog).
+      try {
+        const tm = engine.trustManager
+        if (tm && tm.pairingSecrets) {
+          const revokedAt = tm.revokedKeys.get(hostId)
+          for (const [cid, secret] of Array.from(tm.pairingSecrets.entries())) {
+            if (revokedAt && secret.createdAt < revokedAt) {
+              tm.pairingSecrets.delete(cid)
+              try { if (engine.topicRegistry) engine.topicRegistry.leave(`p2p-pair-${secret.code}`) } catch {}
+            }
+          }
+        }
+      } catch {}
+      try {
+        if (engine.notificationStore) {
+          engine.notificationStore.addNotification(
+            'Removed by paired device',
+            'This device was removed by its host. Pair again with the current code to reconnect.',
+            'info'
+          )
+        }
+      } catch {}
+      engine.emit(EVENTS.TRUST_REVOKED, { publicKey: hostId })
+      engine.emit(EVENTS.DEVICE_REMOVED, { peerId: hostId, deviceId: msg.deviceId || null })
     } else if (msg.type === MESSAGES.TRANSFER_OFFER) {
       const peerObj = peers.get(peerId)
       // Only accept file offers from authenticated (trusted) peers. One-time

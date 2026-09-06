@@ -289,7 +289,15 @@ function createDeviceRegistry(ctx) {
             const peerTopicLabel = `p2p-peer-${dev.identityKey || dev.publicKey}`
             // Join the peer DHT topic AND attempt direct connection to the peer key
             engine.topicRegistry.ensure(peerTopicLabel, { client: true, server: true })
-            ctx.swarm.joinPeer(peerKey)
+            // Fix 4: never pick the dial target itself as its own relay.
+            // Scope _pendingDialTarget narrowly around joinPeer so pickOwnPeerRelay sees it.
+            const prevTarget = engine._pendingDialTarget
+            engine._pendingDialTarget = dev.publicKey
+            try {
+              ctx.swarm.joinPeer(peerKey)
+            } finally {
+              engine._pendingDialTarget = prevTarget
+            }
             // Never leave the flush unhandled: refreshNetwork() destroys the
             // old swarm while reconnectKnownPeers may be mid-flight, and the
             // flush rejects with ERR_SWARM_DESTROYED. An unhandled rejection

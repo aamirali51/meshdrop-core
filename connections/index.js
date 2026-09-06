@@ -115,8 +115,17 @@ function createConnections(engine) {
     try {
       // Re-join the peer key so hyperswarm re-establishes direct (LAN discovery
       // primed the direct path). The identity-topic rejoin lets it announce.
+      // Fix 4: exclude this peerId itself from own-relay candidate.
       const peerKey = Buffer.from(peerId, 'hex')
-      if (peerKey.length === 32) ctx.swarm.joinPeer(peerKey)
+      if (peerKey.length === 32) {
+        const prevTarget = engine._pendingDialTarget
+        engine._pendingDialTarget = peerId
+        try {
+          ctx.swarm.joinPeer(peerKey)
+        } finally {
+          engine._pendingDialTarget = prevTarget
+        }
+      }
       await devices.reconnectKnownPeers()
       ctx.swarm.flush().catch(() => {})
     } catch (err) {

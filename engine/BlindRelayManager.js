@@ -121,7 +121,11 @@ class BlindRelayManager {
     const remotePrefix = remoteHex.slice(0, 12)
     const start = Date.now()
     const id = `${remotePrefix}-${++this._sessionCounter}`
-    console.log(`[BlindRelay] Relay session accepted from ${remotePrefix}... (active pending cap check, paired=${isPaired})`)
+    // Phantom probes are normal on the shared-swarm-key path — every inbound
+    // connection is offered to blind-relay. Log at debug so normal peers
+    // don't spam production logs with zero-byte sessions.
+    const isDebug = process.env.MESH_DEBUG_RELAY === '1'
+    if (isDebug) console.log(`[BlindRelay] Relay dial probe from ${remotePrefix}... (paired=${isPaired})`)
 
     const session = this.relay.accept(socket, { id: socket.remotePublicKey })
 
@@ -164,9 +168,15 @@ class BlindRelayManager {
       session.off('pair', onPair)
       if (!this.sessions.has(id)) return
       const duration = Date.now() - info.start
-      const devName = this._resolveDeviceName(info.remoteKey)
-      const label = devName ? `Relaying for ${devName}` : 'unknown peer'
-      console.log(`[BlindRelay] Relay session closed ${remotePrefix}... bytes=${info.bytes} duration=${duration}ms ${label}`)
+      // Honest log: only claim "Relaying for X" when bytes flowed.
+      // Zero-byte probes log at debug as "relay dial probe (no data)".
+      if (info.bytes > 0) {
+        const devName = this._resolveDeviceName(info.remoteKey)
+        const label = devName ? `Relaying for ${devName}` : 'unknown peer'
+        console.log(`[BlindRelay] Relay session closed ${remotePrefix}... bytes=${info.bytes} duration=${duration}ms ${label}`)
+      } else if (process.env.MESH_DEBUG_RELAY === '1') {
+        console.log(`[BlindRelay] Relay dial probe (no data) closed ${remotePrefix}... duration=${duration}ms`)
+      }
       this.sessions.delete(id)
     }
     session.on('close', onClose)

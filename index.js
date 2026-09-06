@@ -89,12 +89,13 @@ const BOOTSTRAP_HOSTS = new Set([
 // canRelay is set only when the peer's relay server is actually running
 // (toggle on, BlindRelayManager listening). The lastRelayId skip rotates a
 // failed own-relay to bootstrap via hyperswarm's force-retry.
-function pickOwnPeerRelay(engine) {
+function pickOwnPeerRelay(engine, dialTargetId) {
   try {
     if (!engine || !engine.preferOwnRelay) return null
     const peers = engine.peers
     if (!peers || peers.size === 0) return null
     for (const [peerId, peerObj] of peers.entries()) {
+      if (dialTargetId && peerId === dialTargetId) continue // never relay to A through A
       const dev = peerObj && peerObj.device
       if (!dev || !dev.isOnline || !dev.isTrusted || !dev.publicKey) continue
       if (dev.canRelay !== true) continue
@@ -199,6 +200,7 @@ class MeshEngine extends EventEmitter {
     this._pendingRelayByPeer = new Map() // peerId -> { key, isOwn } — per-peer attempt tracking (C.2)
     this._pendingRelayKey = null // fallback for pre-peerInfo picker gap
     this._pendingRelayIsOwn = false
+    this._pendingDialTarget = null // fix 4: dial target excluded from own-relay candidates
 
     this.started = false
 
@@ -266,10 +268,11 @@ class MeshEngine extends EventEmitter {
     return new Hyperswarm({
       keyPair: this.noiseKeyPair,
       relayThrough: (force, s) => {
+        const dialTarget = this._pendingDialTarget || null
         // Hyperswarm calls relayThrough before peerInfo exists; the per-peer
         // slot is set after peerInfo is known. For the common path we still
         // need a global to bridge the gap — but onConnection prefers per-peer.
-        const own = pickOwnPeerRelay(this)
+        const own = pickOwnPeerRelay(this, dialTarget)
         if (own) {
           this._pendingRelayKey = own
           this._pendingRelayIsOwn = true
@@ -514,13 +517,16 @@ class MeshEngine extends EventEmitter {
       onTrustGranted: (peerId, code) => {
         const peerObj = this.peers.get(peerId)
         if (peerObj && peerObj.pairing) peerObj.pairing.code = code
-        // A HANDSHAKE that arrived while the challenge was still outstanding is
-        // applied now that trust is granted, so the connection always completes.
         this.connections.replicateExchange(peerId)
-        this.connections.flushPendingHandshake(peerId)
-        // If the handshake already completed earlier (LAN auto-trust / prior
-        // pairing), re-broadcast completion so pairWithCode gets a fresh signal.
-        this.connections.rebroadcastPeerCompletion(peerId, code)
+        // TRUST_PAIRED must emit exactly once per pairing. flushPendingHandshake
+        // (via applyHandshake) emits TRUST_PAIRED when buffered handshake exists;
+        // rebroadcastPeerCompletion emits when handshake already completed. Never both.
+        const hadPending = !!(peerObj && peerObj.pairing && peerObj.pairing.pendingHandshake)
+        if (hadPending) {
+          this.connections.flushPendingHandshake(peerId)
+        } else {
+          this.connections.rebroadcastPeerCompletion(peerId, code)
+        }
       }
     })
     // TrustManager's relay path delegates SITE_VERIFY_RESP (host side) back to
@@ -757,7 +763,13 @@ class MeshEngine extends EventEmitter {
               const peerKey = Buffer.from(key, 'hex')
               if (peerKey.length === 32) {
                 console.log(`[MeshEngine] LAN discovery -> joinPeer(${key.slice(0, 12)}...)`)
-                this.swarm.joinPeer(peerKey)
+                const prevTarget = this._pendingDialTarget
+                this._pendingDialTarget = key
+                try {
+                  this.swarm.joinPeer(peerKey)
+                } finally {
+                  this._pendingDialTarget = prevTarget
+                }
                 // The connection may already exist (e.g. via the DHT identity
                 // topic) before this announcement lands: promote it to direct
                 // trust now so autoTrustLAN still bypasses the pairing handshake.
