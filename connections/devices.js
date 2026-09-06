@@ -71,6 +71,10 @@ function createDeviceRegistry(ctx) {
     peerObj.device.isTrusted = !lanOnly
     peerObj.device.lanLevel = lanOnly
     peerObj.device.isOnline = true
+    // Capability discovery: peer's relay server running (propagated via handshake canRelay)
+    if (msg.identity && typeof msg.identity.canRelay === 'boolean') {
+      peerObj.device.canRelay = !!msg.identity.canRelay
+    }
     if (!lanOnly) {
       peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
       peerObj.pairing.complete = true

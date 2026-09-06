@@ -23,12 +23,13 @@ function createSignaling(ctx) {
     if (!peerObj.pairing.trusted && peerObj.pairing.mode !== 'lan') return
     peerObj.handshakeSent = true
     try {
+      const canRelay = !engine.isMobileRuntime && engine.relayForPairedDevices !== false && !!(engine._relayManager && engine._relayManager.isRunning())
       peerObj.signaling.send({
         type: MESSAGES.HANDSHAKE,
         protocolVersion: PROTOCOL_VERSION,
         // The peer already knows our noise key from the transport (peerInfo /
         // connection), so the identity carries only the stable device identity.
-        identity: { ...engine.deviceIdentity }
+        identity: { ...engine.deviceIdentity, canRelay }
       })
     } catch (err) {
       console.error('[MeshEngine] Failed to send HANDSHAKE:', err.message)

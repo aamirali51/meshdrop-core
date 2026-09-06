@@ -226,20 +226,22 @@ function createConnections(engine) {
       connection,
       ctx.swarm && ctx.swarm.dht,
     );
-    // Was this connection tunneled through our OWN paired desktop (the relay
-    // we chose in pickOwnPeerRelay)? The relay's identity is the peer's noise
-    // public key; when a peer connects and the remote address matches a known
-    // paired desktop's public IP, or peerInfo.forceRelaying is set and we had
-    // chosen an own-peer relay, we can label it. Best-effort: falls back to
-    // "unknown" when we can't tell.
+    // Honest label: track the relay key actually dialed per connection attempt;
+    // label "relayed via <device>" ONLY when that key is a paired peer. Never guess.
     let relayedViaOwnPeer = false;
+    let relayedViaPeerKey = null;
     try {
-      if (relayed && engine && engine._lastOwnRelayKey) {
-        // The engine records which own-peer key it last chose as relay; if
-        // this connection is relayed AND we were configured to prefer own
-        // relay, treat it as via our own peer. (The wire does not expose the
-        // relay's key post-handshake, so this is the practical signal.)
-        relayedViaOwnPeer = engine.preferOwnRelay === true;
+      if (relayed && engine && engine._lastRelayAttemptKey) {
+        const k = engine._lastRelayAttemptKey
+        const isOwn = engine._lastRelayAttemptIsOwnPeer === true
+        // Only label as via own peer if the attempted relay key is actually a paired peer.
+        if (isOwn && engine.peers && engine.peers.has(k)) {
+          relayedViaOwnPeer = true
+          relayedViaPeerKey = k
+        } else {
+          relayedViaOwnPeer = false
+          relayedViaPeerKey = null
+        }
       }
     } catch {}
 
@@ -280,6 +282,7 @@ function createConnections(engine) {
       transferMethod,
       relayed,
       relayedViaOwnPeer,
+      relayedViaPeerKey,
     };
 
     // Trust is earned: only a known trusted noise public key (direct) or a

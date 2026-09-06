@@ -13,6 +13,7 @@ const Hyperswarm = require('hyperswarm')
 const { EVENTS, MESSAGES, pairingTopic } = require('./protocol.js')
 const { generateDropCode, normalizeDropCode } = require('./crypto.js')
 const { TrustManager } = require('./engine/TrustManager.js')
+const { BlindRelayManager } = require('./engine/BlindRelayManager.js')
 const { TransferEngine } = require('./engine/TransferEngine.js')
 const { SyncEngine } = require('./engine/SyncEngine.js')
 const { WatchPartyManager, PARTY_EVENTS } = require('./engine/WatchPartyManager.js')
@@ -83,10 +84,11 @@ const BOOTSTRAP_HOSTS = new Set([
 ])
 
 // Pass 0: an online, trusted, desktop-class paired peer — our own relay.
-// Only called when preferOwnRelay is on. The peer must be a desktop (os match)
-// and its own connection must NOT already be relayed (a phone relaying through
-// a phone is pointless). Returns the peer's noise public key (hex) — the DHT
-// dials relays by key.
+// Only called when preferOwnRelay is on. The peer must be:
+//   paired + canRelay + online + not revoked + own link not itself relayed.
+// canRelay is set only when the peer's relay server is actually running
+// (toggle on, BlindRelayManager listening). The lastRelayId skip rotates a
+// failed own-relay to bootstrap via hyperswarm's force-retry.
 function pickOwnPeerRelay(engine) {
   try {
     if (!engine || !engine.preferOwnRelay) return null
@@ -95,6 +97,8 @@ function pickOwnPeerRelay(engine) {
     for (const [peerId, peerObj] of peers.entries()) {
       const dev = peerObj && peerObj.device
       if (!dev || !dev.isOnline || !dev.isTrusted || !dev.publicKey) continue
+      if (dev.canRelay !== true) continue
+      if (engine.trustManager && engine.trustManager.isRevoked(peerId)) continue
       // Desktop-class only: a phone behind cellular CGNAT is a poor relay.
       const osName = String(dev.os || '').toLowerCase()
       const isDesktop = /win|mac|darwin|linux|ubuntu|debian|fedora/.test(osName)
@@ -103,9 +107,6 @@ function pickOwnPeerRelay(engine) {
       // a loop — skip. Also skip the peer we last used as relay (rotation).
       if (dev.relayed) continue
       if (lastRelayId === peerId) continue
-      // Remember which own-peer key we chose so onConnection can label
-      // relayed links as "via your Desktop".
-      if (engine) engine._lastOwnRelayKey = peerId
       lastRelayId = peerId
       return peerId // hex noise public key — exactly what dht.connect() wants
     }
@@ -188,6 +189,13 @@ class MeshEngine extends EventEmitter {
     // going straight to the public bootstrap nodes). Only paired, trusted
     // devices ever see this node's key, so the relay is private to the mesh.
     this.preferOwnRelay = config.preferOwnRelay !== false
+    // Embedded blind-relay server: "Relay connections for my paired devices".
+    // Desktop default ON, hidden/unavailable on mobile (battery). Toggling off
+    // closes the server + sockets.
+    const isMobileRuntime = config.isMobile === true || config.platform === 'mobile'
+    this.isMobileRuntime = isMobileRuntime
+    this.relayForPairedDevices = isMobileRuntime ? false : (config.relayForPairedDevices !== false)
+    this._relayManager = null
 
     this.started = false
 
@@ -247,18 +255,29 @@ class MeshEngine extends EventEmitter {
   // Build a fresh Hyperswarm around the persistent noise keypair. Used at
   // boot and again by refreshNetwork() — the relay picker must be re-created
   // with the swarm because it binds to the new DHT node at call time.
+  // Honest label: track the relay key actually dialed per attempt so
+  // onConnection can label "relayed via <device>" ONLY when that key is a
+  // paired peer, never guess.
   _createSwarm() {
     return new Hyperswarm({
       keyPair: this.noiseKeyPair,
-      // Relay is always available as the fallback: hyperswarm tries the direct
-      // UDP holepunch first on every connection, and only uses the relay when
-      // direct fails (HOLEPUNCH_ABORTED / HOLEPUNCH_DOUBLE_RANDOMIZED_NATS /
-      // REMOTE_NOT_HOLEPUNCHABLE) — which is exactly when a relay is needed.
-      // Gating this on `dht.randomized` broke relaying entirely (that property
-      // is never set in hyperdht 6.x) and made cross-network pairing time out.
-      // Pass 0 prefers an online paired desktop (own relay, private to the
-      // mesh); Pass 1/2 fall back to public bootstrap + routing-table nodes.
-      relayThrough: (force, s) => pickOwnPeerRelay(this) || pickRelayNode(s.dht)
+      relayThrough: (force, s) => {
+        const own = pickOwnPeerRelay(this)
+        if (own) {
+          this._lastRelayAttemptKey = own
+          this._lastRelayAttemptIsOwnPeer = true
+          return own
+        }
+        const fallback = pickRelayNode(s.dht)
+        if (fallback) {
+          this._lastRelayAttemptKey = fallback
+          this._lastRelayAttemptIsOwnPeer = false
+        } else {
+          this._lastRelayAttemptKey = null
+          this._lastRelayAttemptIsOwnPeer = false
+        }
+        return fallback
+      }
     })
   }
 
@@ -361,6 +380,17 @@ class MeshEngine extends EventEmitter {
       console.warn('[MeshEngine] swarm.destroy during refresh:', err.message)
     }
     this.swarm = this._createSwarm()
+    if (this._relayManager) {
+      try { await this._relayManager.stop() } catch {}
+      this._relayManager = null
+    }
+    if (!this.isMobileRuntime && this.relayForPairedDevices !== false) {
+      try {
+        this._relayManager = new (require('./engine/BlindRelayManager.js').BlindRelayManager)(this)
+        await this._relayManager.start()
+        await this._syncRelayCapability(true)
+      } catch (err) { console.warn('[MeshEngine] BlindRelay rebuild failed:', err.message) }
+    }
     if (this.metricsCollector && typeof this.metricsCollector.rebind === 'function') {
       this.metricsCollector.rebind(this.swarm)
     }
@@ -766,6 +796,7 @@ class MeshEngine extends EventEmitter {
       // Note: old settings blobs may still carry the relay-mode / custom-relay
       // endpoint keys from the removed Cloudflare relay — intentionally ignored.
       if (s && typeof s.autoLanSwitch === 'boolean') this.autoLanSwitch = s.autoLanSwitch
+      if (s && typeof s.relayForPairedDevices === 'boolean' && !this.isMobileRuntime) this.relayForPairedDevices = s.relayForPairedDevices
     } catch {}
 
     await this.replicationScope.init()
@@ -783,6 +814,19 @@ class MeshEngine extends EventEmitter {
     await this.trustManager.loadTrustedPeerKeys()
     await this.connections.initSwarm()
     console.log('[MeshEngine] Swarm joined, listening for peers')
+
+    // Embedded blind-relay server: "Relay connections for my paired devices".
+    // Uses the engine's existing DHT node (no second DHT). Desktop ON by default.
+    if (!this.isMobileRuntime && this.relayForPairedDevices !== false) {
+      try {
+        this._relayManager = new BlindRelayManager(this)
+        await this._relayManager.start()
+        // Advertise capability to peers
+        await this._syncRelayCapability(true)
+      } catch (err) {
+        console.warn('[MeshEngine] BlindRelay start failed:', err.message)
+      }
+    }
 
     await this.connections.reconnectKnownPeers()
 
@@ -832,6 +876,10 @@ class MeshEngine extends EventEmitter {
     if (this._networkRetryTimer) {
       clearTimeout(this._networkRetryTimer)
       this._networkRetryTimer = null
+    }
+    if (this._relayManager) {
+      try { await this._relayManager.stop() } catch {}
+      this._relayManager = null
     }
     if (this.metricsCollector) this.metricsCollector.stop()
     if (this.lanDiscovery) this.lanDiscovery.stop()
@@ -1488,14 +1536,18 @@ class MeshEngine extends EventEmitter {
         autoTrustLAN: this.autoTrustLAN,
         autoLanSwitch: this.autoLanSwitch,
         preferOwnRelay: this.preferOwnRelay,
-        ...(entry?.value || {})
+        relayForPairedDevices: this.isMobileRuntime ? false : this.relayForPairedDevices,
+        ...(entry?.value || {}),
+        // Mobile never relays (battery) — enforce regardless of persisted value.
+        ...(this.isMobileRuntime ? { relayForPairedDevices: false } : {})
       }
     } catch {
       return {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
         autoLanSwitch: this.autoLanSwitch,
-        preferOwnRelay: this.preferOwnRelay
+        preferOwnRelay: this.preferOwnRelay,
+        relayForPairedDevices: this.isMobileRuntime ? false : this.relayForPairedDevices
       }
     }
   }
@@ -1559,6 +1611,54 @@ class MeshEngine extends EventEmitter {
       console.warn('[MeshEngine] setPreferOwnRelay persist failed:', err.message)
     }
     return this.preferOwnRelay
+  }
+
+  // "Relay connections for my paired devices" — desktop only, hidden on mobile.
+  async setRelayForPairedDevices(value) {
+    if (this.isMobileRuntime) {
+      console.warn('[MeshEngine] Relay server unavailable on mobile (battery)')
+      return false
+    }
+    const enable = value !== false
+    this.relayForPairedDevices = enable
+    try {
+      const bee = await this.getBee('settings')
+      const entry = await bee.get('settings')
+      await bee.put('settings', { ...(entry?.value || {}), relayForPairedDevices: enable })
+    } catch (err) {
+      console.warn('[MeshEngine] setRelayForPairedDevices persist failed:', err.message)
+    }
+    if (enable) {
+      if (!this._relayManager) this._relayManager = new BlindRelayManager(this)
+      try { await this._relayManager.start() } catch (err) { console.warn('[MeshEngine] Relay start failed:', err.message) }
+      await this._syncRelayCapability(true)
+    } else {
+      if (this._relayManager) {
+        try { await this._relayManager.stop() } catch {}
+        this._relayManager = null
+      }
+      await this._syncRelayCapability(false)
+    }
+    return this.relayForPairedDevices
+  }
+
+  getRelayStats() {
+    if (this._relayManager) return this._relayManager.getStats()
+    return { active: 0, serverActive: 0, pairings: { pending: 0, active: 0, matched: 0 }, sessions: [], maxSessions: 8, running: false }
+  }
+
+  isRelayRunning() {
+    return !!(this._relayManager && this._relayManager.isRunning())
+  }
+
+  async _syncRelayCapability(canRelay) {
+    const value = !!canRelay
+    for (const [peerId, peerObj] of this.peers.entries()) {
+      if (!peerObj || !peerObj.signaling || !peerObj.pairing || !peerObj.pairing.complete) continue
+      try {
+        peerObj.signaling.send({ type: MESSAGES.HANDSHAKE, protocolVersion: 2, identity: { ...this.deviceIdentity, canRelay: value } })
+      } catch {}
+    }
   }
 
   getStatus() {
