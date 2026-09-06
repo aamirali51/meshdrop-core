@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test-head-tail-priority.js && node test-sync-unit.js && node test-sync-e2e-matrix.js && node test-watch-party.js && node test-pairing-backoff.js && node test-sites.js && node test-sites-manager.js && node test.js",
+    "test": "node test-head-tail-priority.js && node test-sync-unit.js && node test-sync-e2e-matrix.js && node test-watch-party.js && node test-pairing-backoff.js && node test-cross-network-dht-pairing.js && node test-range-coverage.js && node test-real-core-coverage.js && node test-sites.js && node test-sites-manager.js && node test.js",
     "test:htp": "node test-head-tail-priority.js",
     "test:sites": "node test-sites.js && node test-sites-manager.js",
     "test:sites:e2e": "node test-sites-e2e.js"

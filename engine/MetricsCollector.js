@@ -120,22 +120,19 @@ class MetricsCollector {
     } catch {}
   }
 
-  // { peerCount, connected } come from the live connection registry; relayStatus
-  // reflects whether the DHT relay fallback is configured for this node.
+  // { peerCount, connected } come from the live connection registry.
   // avgLatencyMs / packetLossPercent come from the PING/PONG probe in
   // connections.js (latency is a rolling average; loss is a ping success-rate
   // proxy). All pass-through values stay null until measured.
   snapshot({
     peerCount = 0,
     connected = false,
-    relayStatus = 'Disabled',
     avgLatencyMs = null,
     packetLossPercent = null
   } = {}) {
     const maxThroughput = Math.max(this.throughputInBps, this.throughputOutBps)
     return {
       natType: null,
-      relayStatus,
       dhtNodes: this.dht && this.dht.nodes ? this.dht.nodes.length : null,
       avgLatencyMs,
       packetLossPercent,

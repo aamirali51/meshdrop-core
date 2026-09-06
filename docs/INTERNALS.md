@@ -8,8 +8,8 @@ is public, and this post links the exact modules.*
 MeshDrop has no accounts, no cloud storage, and no signaling server you can
 point at a username. Two devices find each other over the DHT, prove to each
 other that a human exchanged a code, and move bytes directly. When direct
-connectivity fails, a relay fallback steps in — and we'll be precise about
-what that relay can and cannot see, because we got (fair) criticism about it.
+connectivity fails, HyperDHT's own relaying steps in — no separate relay
+component, nothing but the DHT (see §3).
 
 ---
 
@@ -60,36 +60,37 @@ and exchange device identities directly. LAN auto-trust is **off by default**.
 One design note we're proud of: pairing **actively drives itself**. While
 `pairWithCode` is pending, the joiner re-announces challenges and re-attempts
 direct connectivity every few seconds — so one missed DHT connect or a slow
-relay hop can't stall the handshake.
+relayed hop can't stall the handshake.
 
-## 3. The relay fallback: lazy, minimized, honest
+## 3. Relaying is HyperDHT-native — there is no hosted relay
 
-This is the part that got (justified) pushback, so here's the full picture.
+An earlier design ran pairing/signaling through a hosted Cloudflare WSS/KV
+relay (`connections/relayClient.js`). That component is **gone** (removed in
+v1.0.59): there is no hosted relay, no custom relay URL, no `relayMode`.
+Everything is HyperDHT.
 
-**When it's used:** the relay exists for networks where UDP is blocked or
-NAT holepunching fails — CGNAT, some hotspots, hotspot+VPN combos. In `auto`
-mode (the default) the relay is **not** contacted at boot. It engages when:
+**Discovery + signaling:** pairing and all device discovery run **only** over
+HyperDHT topics (`p2p-pair-<code>` and the other `TopicRegistry` topics).
+`test-cross-network-dht-pairing.js` proves it: two full `MeshEngine` instances
+in separate processes — `lanDiscovery: false`, `autoTrustLAN: false` — pair
+across networks over the DHT alone, and it asserts the relay module no longer
+exists.
 
-1. the user shows pairing intent (pairing screen opened, or a code entered),
-   or
-2. the swarm has been up with **zero peers** for 30 seconds — the signature
-   of a challenged network.
+**Connectivity fallback:** when direct UDP holepunching fails (symmetric NAT,
+CGNAT, TCP-only VPNs), hyperswarm reconnects through HyperDHT's own
+`relayThrough` hook (`meshdrop-core/index.js:261`), which picks a relay **in
+this order** (`pickOwnPeerRelay` → `pickRelayNode`):
 
-`direct-only` mode never starts it; you can also point it at **your own**
-relay URL in settings.
+1. **Your own trusted desktop peer** (`preferOwnRelay`, the default): an
+   online, paired, desktop-class device acts as your relay — private to your
+   mesh, ciphertext only.
+2. **Public Holepunch bootstrap nodes** (`88.99.3.86`, `142.93.90.113`,
+   `138.68.147.8`), falling back to the longest-resident routing-table node.
 
-**What it sees:** pairing challenges sent over the relay carry only a code id
-and a nonce — **no device identity** (we stripped it after the community
-review). File bytes *never* touch the relay: transfers are direct hypercore
-replication over HyperDHT. The relay sees opaque transport frames plus
-pairing metadata (code usage, IPs, timing) — and the code topics self-expire.
+The relay just tunnels the noise stream over TCP — it cannot decrypt anything
+or forge a MAC, and file payloads are end-to-end encrypted regardless.
 
-**What it is:** a stateless Cloudflare Worker + KV. `POST /poll?topic=`
-appends a message to a per-topic list (120s TTL); `GET /poll?topic=` returns
-it. Clients poll, dedupe by message id, and verify MACs locally. The relay
-cannot decrypt anything or forge a MAC.
-
-We also back off automatically: if a peer never answers pairing challenges
+Pairing backs off automatically: if a peer never answers pairing challenges
 (nobody is pairing), automatic challenges pause (15s → 30min exponential
 ladder) instead of looping connect/destroy forever — battery and log friendly.
 
@@ -140,7 +141,7 @@ host name and room title among paired peers only.
 ## 6. The security model, honestly
 
 - **Content**: always end-to-end. Transport noise encryption + hypercore
-  payloads; the relay never sees a byte of file data.
+  payloads; even relayed links only carry ciphertext (HyperDHT `relayThrough`).
 - **Capabilities**: codes are the permission. Drop codes are one-time with
   TTL and download caps; room codes are live while the party runs; pairing
   codes are long-lived by design (that's what "pair my devices" means) and
@@ -149,10 +150,10 @@ host name and room title among paired peers only.
   peers. Claims, watch party, and pairing itself are the code-capability
   paths.
 - **Known limits we'll keep working**: the macOS builds are unsigned (you
-  need an Apple Developer account to fix properly); the fallback relay is a
-  centralized component — it's metadata-minimized and lazy, and self-hosted
-  / community relays are supported via a settings URL, but federation is
-  future work; KV-based relays are eventually consistent across regions.
+  need an Apple Developer account to fix properly). Relaying depends on
+  HyperDHT `relayThrough` — via your own paired desktop peer or the public
+  Holepunch bootstrap DHT nodes — carrying ciphertext only; there is no
+  hosted or centralized relay component anymore.
 
 ## 7. Try it
 

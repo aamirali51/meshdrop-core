@@ -12,7 +12,7 @@
 // never collide with device pairing. The host joins the visitor's pairing
 // topic purely as the rendezvous (every device announces permanently on its
 // own host-code topic) and sends SITE_VERIFY_CHALLENGE over the direct
-// signaling channel AND the relay. The visitor answers SITE_VERIFY_RESP with
+// signaling channel. The visitor answers SITE_VERIFY_RESP with
 // mac(itsCode, nonce). The host verifies the MAC and allowlists the visitor's
 // Noise key — WITHOUT granting device trust (TrustManager.handleResponse is
 // never involved; KB invariant 3 is preserved).
@@ -22,9 +22,8 @@
 // holds that matches the codeId) — no SiteManager needed on the visitor.
 
 const { createSitesStore } = require('../sites.js')
-const { normalizePairingCode, codeId, mac } = require('../crypto.js')
+const { normalizePairingCode, mac } = require('../crypto.js')
 const b4a = require('b4a')
-const crypto = require('crypto')
 
 class SiteManager {
   constructor({ engine, getBee }) {
@@ -64,23 +63,6 @@ class SiteManager {
 
   _isPendingVisitorCodeId(msg) {
     return this.pendingVisitors.has(msg && msg.codeId)
-  }
-
-  // Relay path: a visitor's SITE_VERIFY_RESP arrived via the Cloudflare relay
-  // (no direct signaling peerId). The visitor includes its noise publicKey in
-  // the response; verify the MAC by codeId and allowlist that key.
-  async handleRelayVerifyResponse(fromPeerId, msg) {
-    if (!msg || msg.type !== 'SITE_VERIFY_RESP') return
-    // The relay `fromPeerId` is unreliable — the visitor's real key is in the
-    // response body (added by handleSiteVerifyChallenge's relay send).
-    const peerKey = (typeof msg.publicKey === 'string' && msg.publicKey.length === 64)
-      ? msg.publicKey
-      : (typeof fromPeerId === 'string' && fromPeerId.length === 64 ? fromPeerId : null)
-    if (!peerKey) {
-      console.warn('[MeshEngine] SITE_VERIFY_RESP via relay without a peer key; ignored')
-      return
-    }
-    await this._handleVisitorResponse(peerKey, msg)
   }
 
   // ─── Site store passthroughs ──────────────────────────────────────────────
@@ -181,7 +163,7 @@ class SiteManager {
     }
 
     // Register the code on the HOST side (join the visitor's pairing topic as
-    // the rendezvous + bring the relay up). registerHostVerificationCode
+    // the rendezvous). registerHostVerificationCode
     // deliberately does NOT auto-answer PAIRING challenges for this code (no
     // impersonation, no accidental pairing).
     const reg = this.engine.trustManager.registerHostVerificationCode(clean)
@@ -209,7 +191,7 @@ class SiteManager {
       if (entry.timer.unref) entry.timer.unref()
 
       // Challenge the visitor with a DEDICATED SITE_VERIFY_CHALLENGE over the
-      // direct signaling channel AND the relay. This never collides with
+      // direct signaling channel. This never collides with
       // device pairing (PAIRING_CHALLENGE/RESP) — see module header.
       const challengeMsg = {
         type: 'SITE_VERIFY_CHALLENGE',
@@ -225,16 +207,6 @@ class SiteManager {
         }
       } catch (err) {
         console.warn('[MeshEngine] Failed to send site visitor challenge over DHT:', err.message)
-      }
-      // Relay broadcast (best-effort; the visitor answers on whichever path it
-      // received the challenge on).
-      try {
-        if (this.engine.relayClient) {
-          this.engine.relayClient.start()
-          this.engine.relayClient.send(`p2p-pair-${clean}`, challengeMsg)
-        }
-      } catch (err) {
-        console.warn('[MeshEngine] Failed to send site visitor challenge over relay:', err.message)
       }
     })
   }
@@ -321,11 +293,6 @@ class SiteManager {
       if (peer && peer.signaling) {
         const inv = await this._invitePayload(pending.siteId)
         peer.signaling.send(inv)
-      }
-      // Also via relay so a not-yet-connected visitor gets it
-      if (this.engine.relayClient) {
-        const inv = await this._invitePayload(pending.siteId)
-        this.engine.relayClient.send(`p2p-peer-${peerId}`, inv)
       }
     } catch {}
     if (this.engine.notificationStore) this.engine.notificationStore.addNotification('Shared Folder', `Someone shared "${(await this.store.getSite(pending.siteId))?.name || 'a folder'}" with you`, 'info')

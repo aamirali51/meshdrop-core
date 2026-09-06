@@ -42,7 +42,7 @@ function makeCore({ totalBlocks, failAfter = Infinity, delayMs = 0 } = {}) {
   return {
     order,
     get gets() { return gets },
-    async get(coreIndex, opts = {}) {
+    async get(coreIndex) {
       order.push(coreIndex)
       gets++
       if (delayMs) await new Promise((r) => setTimeout(r, delayMs))
@@ -83,10 +83,6 @@ function verify(coreIndex, block, blocks) {
 }
 
 async function main() {
-  const TMP = []
-  const run = (name, fn) => TMP.push({ name, fn })
-  // (tests are executed inline below)
-
   // ── 1. Scheduler honors an explicit priority queue before the sweep ──────
   {
     const total = 1000
@@ -288,8 +284,6 @@ async function main() {
     )
   }
 
-  const failed = TMP.length ? 0 : 0
-  void failed
   const totalPassed = passed
   console.log(`\nHEAD/TAIL PRIORITY: ${totalPassed} checks passed`)
   if (process.exitCode) console.log('  (failures above)')

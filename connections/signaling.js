@@ -14,11 +14,13 @@ const { getTransferMethod } = require('./util.js')
 function createSignaling(ctx) {
   const { engine, peers, activeClaims } = ctx
 
-  // Send our identity to a peer we already trust. Never called for untrusted peers.
+  // Send our identity to a peer we already trust, or one recognized at the
+  // lan level (identity exchange is the one capability lan grants).
   function sendHandshake(peerId) {
     const peerObj = peers.get(peerId)
     if (!peerObj || !peerObj.signaling || peerObj.handshakeSent) return
-    if (!engine.deviceIdentity || !peerObj.pairing || !peerObj.pairing.trusted) return
+    if (!engine.deviceIdentity || !peerObj.pairing) return
+    if (!peerObj.pairing.trusted && peerObj.pairing.mode !== 'lan') return
     peerObj.handshakeSent = true
     try {
       peerObj.signaling.send({
@@ -52,7 +54,7 @@ function createSignaling(ctx) {
     if (engine.trustManager) engine.trustManager.handleResponse(peerId, msg)
   }
 
-  function setupPeerSignaling(connection, peerId, { directTrusted = false } = {}) {
+  function setupPeerSignaling(connection, peerId) {
     const mux = Protomux.isProtomux(connection) ? connection : Protomux.from(connection)
     const pendingQueue = []
     let signalMessage = null
@@ -64,7 +66,9 @@ function createSignaling(ctx) {
         console.log(`[MeshEngine] Signaling channel opened with ${peerId.slice(0, 12)}...`)
         const peerObj = peers.get(peerId)
         if (peerObj && peerObj.pairing) {
-          if (peerObj.pairing.trusted) {
+          if (peerObj.pairing.trusted || peerObj.pairing.mode === 'lan') {
+            // Paired peers get the handshake; lan-level peers get identity
+            // exchange only (the one capability the lan tier grants).
             sendHandshake(peerId)
           } else if (engine && typeof engine.isSiteSessionPeer === 'function' && engine.isSiteSessionPeer(peerId)) {
             // Site-session peer (allowlist-authenticated visitor/host, not
@@ -130,7 +134,7 @@ function createSignaling(ctx) {
     const maybeSendHandshakeOrChallenges = (peerId) => {
       const peerObj = peers.get(peerId)
       if (!peerObj || !peerObj.pairing) return
-      if (peerObj.pairing.trusted) sendHandshake(peerId)
+      if (peerObj.pairing.trusted || peerObj.pairing.mode === 'lan') sendHandshake(peerId)
       else if (isSitePeer(peerId)) return // site session — no auto pairing challenges
       else sendPairingChallenges(peerId)
     }
@@ -156,13 +160,33 @@ function createSignaling(ctx) {
   // the owning module; unknown peers only ever get pairing challenges.
   function handlePeerMessage(peerId, msg) {
     if (!msg || typeof msg.type !== 'string') return
+    // Two-tier trust: a lan-level peer (recognized, NOT paired) gets identity
+    // exchange, watch-party existence and drop-code claims only. Data-bearing
+    // families — exchange sync and shared-folder invites — stay locked until
+    // the user confirms full pairing.
+    const lanPeerObj = peers.get(peerId)
+    if (
+      lanPeerObj &&
+      lanPeerObj.pairing &&
+      !lanPeerObj.pairing.trusted &&
+      lanPeerObj.pairing.mode === 'lan' &&
+      (msg.type.startsWith('SYNC_') || msg.type === 'SITE_INVITE')
+    ) {
+      console.warn(
+        `[MeshEngine] Ignoring ${msg.type} from lan-level peer ${peerId.slice(0, 12)}... (not paired)`
+      )
+      return
+    }
     if (msg.type === MESSAGES.HANDSHAKE) {
       const peerObj = peers.get(peerId)
       if (!peerObj || !peerObj.pairing) {
         console.warn(`[MeshEngine] Ignoring HANDSHAKE from unknown peer ${peerId.slice(0, 12)}...`)
         return
       }
-      if (!peerObj.pairing.trusted || engine.trustManager.isRevoked(peerId)) {
+      if (
+        (!peerObj.pairing.trusted && peerObj.pairing.mode !== 'lan') ||
+        engine.trustManager.isRevoked(peerId)
+      ) {
         // The peer may have verified OUR pairing response before we verified
         // theirs, or it sent a handshake because it still holds old trust while
         // we revoked it. Buffer it: the handshake is applied the moment our

@@ -30,7 +30,7 @@ function makeSide(id, name) {
   // Control-plane tests skip real media staging: fake a coreKey so
   // createRoom passes its playable-source check (64 hex chars).
   engine.transferEngine = {
-    stageDrop: async (p) => ({
+    stageDrop: async () => ({
       coreKey: Buffer.alloc(32, 7).toString('hex'),
       manifestHash: 'fake',
       checksum: 'fake'
@@ -116,8 +116,6 @@ async function main() {
       type: 'WATCH_STATE_SYNC', roomCode: room.roomCode, action: 'play',
       positionSec: 42, sender: { id: 'guest-2', name: 'Guest' }
     })
-    let guestGotSync = false
-    guest.wp.on(PARTY_EVENTS.STATE_SYNC, () => { guestGotSync = true })
     // And guest rejects third-party sync (sender is neither master nor host)
     host.wp.handleMessage('intruder', {
       type: 'WATCH_STATE_SYNC', roomCode: room.roomCode, action: 'play',

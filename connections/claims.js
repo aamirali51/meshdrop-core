@@ -218,8 +218,6 @@ function createClaims(ctx) {
     const peerObj = peers.get(peerId)
     if (!peerObj) throw new Error('Sender is no longer connected')
 
-    const isGroup = offer.isGroupDrop === true || (code && code.includes('GRP'))
-
     if (code) {
       activeClaims.delete(code)
       // NOTE: the drop topic stays joined — once this claim completes, this

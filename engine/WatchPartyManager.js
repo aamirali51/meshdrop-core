@@ -3,7 +3,6 @@
 const { path, fsp, EventEmitter } = require('../compat.js')
 const { generateDropCode } = require('../crypto')
 const { EVENTS } = require('../protocol.js')
-const { MESSAGES } = require('../connections/signaling')
 const { STATUS } = require('./transfer/constants.js')
 
 const PARTY_EVENTS = {
@@ -226,11 +225,6 @@ class WatchPartyManager extends EventEmitter {
       if (this.engine && this.engine.topicRegistry) {
         this.engine.topicRegistry.join(topic, { client: true, server: true })
       }
-      // Host side mirrors the guest: room traffic must also flow over the
-      // relay topic for peers without a direct link.
-      if (this.engine && this.engine.relayClient) {
-        this.engine.relayClient.join(topic)
-      }
 
       const room = {
         roomCode,
@@ -336,11 +330,6 @@ class WatchPartyManager extends EventEmitter {
       if (this.engine.topicRegistry) {
         this.engine.topicRegistry.join(topic, { client: true, server: true })
       }
-      // Also join the room topic on the relay so a guest whose direct link is
-      // gone (mobile OS parked the app) still reaches the host.
-      if (this.engine.relayClient) {
-        this.engine.relayClient.join(topic)
-      }
 
       const myIdentity = this.engine.storage?.getDeviceIdentity?.() || { name: 'Peer Device' }
 
@@ -392,7 +381,7 @@ class WatchPartyManager extends EventEmitter {
     })
   }
 
-  _autoLeaveStaleRoom(room, reason) {
+  _autoLeaveStaleRoom(room) {
     if (this.activeRoom !== room) return
     const prev = room
     this._teardownRoomState(prev)
@@ -646,7 +635,7 @@ class WatchPartyManager extends EventEmitter {
   }
 
   _appendChat(room, msg) {
-    // Room traffic now rides both direct and relay paths; the same message
+    // The same message
     // can legitimately arrive twice. messageId is the dedup capability.
     if (msg.messageId && room.chatLog.some((m) => m && m.messageId === msg.messageId)) return
     room.chatLog.push(msg)
@@ -985,9 +974,9 @@ class WatchPartyManager extends EventEmitter {
         // If we're a guest in the room whose host just closed it, leave.
         this._handleHostClosed(msg.roomCode)
       } else if (msg.roomCode && msg.title) {
-        // A guest already in this room is hearing the host over the relay —
+        // A guest already in this room is still hearing the host —
         // count it as host activity so the silence watchdog never drops a
-        // room whose direct link died but whose relay heartbeat still flows.
+        // room whose direct link merely stuttered.
         if (this.activeRoom && !this.activeRoom.isHost && this.activeRoom.roomCode === msg.roomCode) {
           this.activeRoom._hostHeardAt = Date.now()
         }
@@ -1106,7 +1095,7 @@ class WatchPartyManager extends EventEmitter {
         const room = this.activeRoom
         const masterId = room.playbackPeerId || room.hostPeerId
         const senderId = (msg.sender && msg.sender.id) || peerId
-        // The host spoke — a relayed guest must not be watchdog-dropped while
+        // The host spoke — a guest must not be watchdog-dropped while
         // its state-sync heartbeat keeps arriving.
         if (!room.isHost && senderId === (room.hostPeerId || masterId)) {
           room._hostHeardAt = Date.now()
@@ -1146,7 +1135,7 @@ class WatchPartyManager extends EventEmitter {
       }
     } else if (msg.type === 'WATCH_REACTION') {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode) {
-        // Room traffic rides both direct and relay paths — the same reaction
+        // Room traffic can be duplicated across peers — the same reaction
         // arrives twice. Dedup on reactionId so the UI pops it once.
         if (msg.reactionId) {
           const rid = msg.reactionId
@@ -1163,7 +1152,7 @@ class WatchPartyManager extends EventEmitter {
       if (this.activeRoom && this.activeRoom.roomCode === msg.roomCode && msg.text) {
         // Both sides log received messages; the host's log additionally feeds
         // the late-joiner history replay. _appendChat dedups by messageId —
-        // the same message can arrive over both the direct and relay paths —
+        // the same message can arrive more than once —
         // and a duplicate must not re-emit to the UI either.
         const seen = this.activeRoom.chatLog.some((m) => m && m.messageId && m.messageId === msg.messageId)
         this._appendChat(this.activeRoom, msg)
@@ -1503,40 +1492,10 @@ class WatchPartyManager extends EventEmitter {
         })
       } catch {}
     }
-    // Relay fallback: a guest whose direct link dropped (mobile OS parked the
-    // app) only re-discovers the room — and hears 'close' — over the relay
-    // topic. Anyone receiving here already holds the room code (the topic
-    // name IS the capability), so full details are safe.
-    const relayClient = this.engine && this.engine.relayClient
-    if (relayClient && typeof relayClient.send === 'function') {
-      try {
-        relayClient.send(`p2p-watch-${room.roomCode}`, {
-          type: 'WATCH_ROOM_ANNOUNCE',
-          action,
-          roomCode: room.roomCode,
-          title: room.title,
-          hostName: hostIdentity.name || 'Host',
-          isPrivate: Boolean(room.isPrivate),
-          timestamp: Date.now()
-        })
-      } catch {}
-    }
   }
 
   _broadcastRoomMessage(msg) {
     this._broadcastToAllPeers(msg)
-    // Relay fallback: publish room traffic on the room's relay topic so a
-    // peer whose direct link dropped (mobile OS parked the app, network
-    // changed) still hears announcements/joins/chat/reactions. Both sides
-    // join this topic (createRoom/joinRoom); inbound relay delivery is
-    // dispatched back here through TrustManager's unmatched-relay fallthrough.
-    const code = (msg && msg.roomCode) || (this.activeRoom && this.activeRoom.roomCode)
-    const relayClient = this.engine && this.engine.relayClient
-    if (code && relayClient && typeof relayClient.send === 'function') {
-      try {
-        relayClient.send(`p2p-watch-${code}`, msg)
-      } catch {}
-    }
   }
 
   _broadcastToAllPeers(msg) {

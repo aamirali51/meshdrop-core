@@ -100,7 +100,6 @@ async function runChild(role, config) {
   })
 
   await engine.start()
-  engine.setPairingIntent(true)
   send({ type: 'ready', identity: engine.getIdentity() })
   await new Promise(() => {})
 }
@@ -210,7 +209,6 @@ async function main() {
     stranger = new Child('stranger', [path.join(tmpRoot, 'stranger', 'storage'), path.join(tmpRoot, 'stranger', 'dl'), 'Stranger'])
     const strangerReady = await stranger.waitFor((m) => m.type === 'ready', STEP_TIMEOUT_MS, 'stranger ready')
     ok('stranger ready', !!strangerReady)
-    const strangerIdentity = strangerReady.identity
 
     // 1. Host publishes a site over the drive folder.
     console.log('[test] host publishes site...')

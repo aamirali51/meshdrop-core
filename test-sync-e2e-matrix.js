@@ -16,7 +16,7 @@ const path = require('path')
 
 const { SyncEngine } = require('./engine/SyncEngine.js')
 const { fsp, path: p } = require('./compat.js')
-const { MESSAGES, EVENTS } = require('./protocol.js')
+const { MESSAGES } = require('./protocol.js')
 
 let passed = 0
 let failed = 0
@@ -141,7 +141,6 @@ async function runAllTests() {
             // Deliver to desktop folder
             const destFile = path.join(desktopFolder, params.syncRelPath)
             await fsp.writeFile(destFile, await fsp.readFile(params.filePath))
-            const st = await fsp.stat(destFile)
             // Stamp sender mtime
             await fsp.utimes(destFile, new Date(params.syncMtimeMs), new Date(params.syncMtimeMs))
 

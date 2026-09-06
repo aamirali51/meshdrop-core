@@ -208,13 +208,13 @@ class LanDiscovery {
     for (const target of targets) {
       try {
         this.socket.send(buf, 0, buf.length, this.port, target)
-      } catch (err) {
+      } catch {
         // Silently skip unrouteable target interfaces
       }
     }
   }
 
-  _handleMessage(msg, rinfo) {
+  _handleMessage(msg) {
     if (!this.started || msg.length > MAX_MESSAGE_SIZE) return
     let ann = null
     try {

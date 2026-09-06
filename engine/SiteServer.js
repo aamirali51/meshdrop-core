@@ -398,7 +398,7 @@ class SiteServer {
     if (!(await this._canWrite(ctx.site.siteId, peerId))) { this._sendTo(peerId, { type: 'SITE_MKDIR_RES', siteId: ctx.site.siteId, ok: false, error: 'read-only' }); return }
     const abs = resolveSitePath(ctx.site.root, msg.path)
     if (!abs) { this._sendTo(peerId, { type: 'SITE_MKDIR_RES', siteId: ctx.site.siteId, ok: false, error: 'invalid-path' }); return }
-    try { await fsp.mkdir(abs, { recursive: true }); this._sendTo(peerId, { type: 'SITE_MKDIR_RES', siteId: ctx.site.siteId, ok: true, path: msg.path }) } catch (e) { this._sendTo(peerId, { type: 'SITE_MKDIR_RES', siteId: ctx.site.siteId, ok: false, error: 'mkdir-failed' }) }
+    try { await fsp.mkdir(abs, { recursive: true }); this._sendTo(peerId, { type: 'SITE_MKDIR_RES', siteId: ctx.site.siteId, ok: true, path: msg.path }) } catch { this._sendTo(peerId, { type: 'SITE_MKDIR_RES', siteId: ctx.site.siteId, ok: false, error: 'mkdir-failed' }) }
   }
 
   async _handleDelete(peerId, msg) {
@@ -408,7 +408,7 @@ class SiteServer {
     const abs = resolveSitePath(ctx.site.root, msg.path)
     if (!abs) { this._sendTo(peerId, { type: 'SITE_DELETE_RES', siteId: ctx.site.siteId, ok: false, error: 'invalid-path' }); return }
     if (abs === ctx.site.root) { this._sendTo(peerId, { type: 'SITE_DELETE_RES', siteId: ctx.site.siteId, ok: false, error: 'invalid-path' }); return }
-    try { await fsp.rm(abs, { recursive: true, force: true }); this._sendTo(peerId, { type: 'SITE_DELETE_RES', siteId: ctx.site.siteId, ok: true, path: msg.path }) } catch (e) { this._sendTo(peerId, { type: 'SITE_DELETE_RES', siteId: ctx.site.siteId, ok: false, error: 'delete-failed' }) }
+    try { await fsp.rm(abs, { recursive: true, force: true }); this._sendTo(peerId, { type: 'SITE_DELETE_RES', siteId: ctx.site.siteId, ok: true, path: msg.path }) } catch { this._sendTo(peerId, { type: 'SITE_DELETE_RES', siteId: ctx.site.siteId, ok: false, error: 'delete-failed' }) }
   }
 
   _sendTo(peerId, msg) {

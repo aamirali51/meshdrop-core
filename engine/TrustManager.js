@@ -28,7 +28,6 @@ class TrustManager {
     computeTopicHash,
     swarm,
     topicRegistry,
-    relayClient,
     getPeers,
     sendHandshake,
     emit,
@@ -42,7 +41,6 @@ class TrustManager {
     this.computeTopicHash = computeTopicHash
     this.swarm = swarm
     this.topicRegistry = topicRegistry
-    this.relayClient = relayClient || null
     this.getPeers = getPeers // () => Map<peerId, peerObj>
     this.sendHandshake = sendHandshake // (peerId) => void
     this.emit = emit || (() => {}) // (event, data) => void — engine EventEmitter
@@ -56,7 +54,6 @@ class TrustManager {
     this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
     this.revokedKeys = new Map() // hex noise public key -> revokedAt ms; refused until a fresh pairing
     this.pairingCodePromise = null // single-flight guard for concurrent code fetches
-    this.relayOutstanding = [] // { nonce, code, codeId, sentAt }
     // Failed-MAC lockout: per-key consecutive bad-MAC counter. Repeated wrong
     // answers (brute-force attempt, stale code) push the peer into an
     // exponential backoff instead of letting it reconnect and retry forever.
@@ -69,12 +66,6 @@ class TrustManager {
     // user intent (a code entered) or incoming challenge we can actually
     // answer, so explicit pairing is never blocked.
     this.unansweredPairings = new Map() // hex noise public key -> { count, suppressUntil }
-
-    if (this.relayClient) {
-      this.relayClient.onMessage = (topic, msg, fromPeerId) => {
-        this.handleRelayMessage(topic, msg, fromPeerId)
-      }
-    }
   }
 
   // Hydrate the revoked-key set (deleted devices awaiting re-pairing). Must
@@ -313,20 +304,18 @@ class TrustManager {
     const secret = this.pairingSecrets.get(cid)
     if (!secret || secret.role !== 'joiner') return
     this.pairingSecrets.delete(cid)
-    this.relayOutstanding = this.relayOutstanding.filter((o) => o.codeId !== cid)
     try {
-      if (this.relayClient) this.relayClient.leave(`p2p-pair-${code}`)
       if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
     } catch {}
   }
 
-  // Keep the joiner secret (and its topic membership) alive for a short grace
-  // window after pairWithCode settles, then drop both. WHY: the host's
+  // Keep the joiner secret (and its DHT topic membership) alive for a short
+  // grace window after pairWithCode settles, then drop both. WHY: the host's
   // RECIPROCAL challenge races the joiner's own verification — the joiner
   // resolves pairWithCode the instant it verifies the host's answer, and the
   // host's counter-challenge (sent in the same handler, right behind the
-  // answer, possibly in a later relay delivery batch) needs this secret to be
-  // answerable AND a subscribed topic to arrive on. Dropping eagerly leaves
+  // answer, possibly arriving in a later delivery batch on the connection)
+  // needs this secret to be answerable. Dropping eagerly leaves
   // the host unable to verify the joiner: every later connection dies in the
   // 30s pairing watchdog (challenge never verified) and the pair is
   // half-trusted forever (joiner shows paired, host keeps re-challenging).
@@ -338,16 +327,13 @@ class TrustManager {
     // Deferred cleanup, and only for THIS registration: a retry of the same
     // code overwrites pairingSecrets with a fresh secret, and the stale timer
     // from the previous attempt must not delete it (or wipe the retry's
-    // outstanding nonces) mid-handshake. The topic leave is deferred too —
-    // leaving at settle time closes the relay socket/poll, so a host
-    // reciprocal challenge arriving in a later delivery batch would be
-    // dropped and the pair would end up half-trusted anyway.
+    // outstanding nonces) mid-handshake. The topic leave is deferred too, so
+    // a host reciprocal challenge arriving in a later delivery batch is not
+    // dropped and the pair does not end up half-trusted anyway.
     const timer = setTimeout(() => {
       if (this.pairingSecrets.get(cid) !== secret) return
       this.pairingSecrets.delete(cid)
-      this.relayOutstanding = this.relayOutstanding.filter((o) => o.codeId !== cid)
       try {
-        if (this.relayClient) this.relayClient.leave(`p2p-pair-${code}`)
         if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
       } catch {}
     }, keepSecretMs)
@@ -386,68 +372,9 @@ class TrustManager {
     // probe them so the host can identify itself without a fresh handshake.
     this._probeTrustedPeers(cleanCode, cid, trustedIds)
 
-    // Broadcast challenge via Cloudflare WSS Relay immediately for Port 443 fallback.
-    // Joiner intent: the user just entered a code — bring the relay up right
-    // away so the challenge reaches the host even in lazy-'auto' mode.
-    const relayNonce = randomBytes(16)
-    this.relayOutstanding.push({ nonce: relayNonce, code: cleanCode, codeId: cid, sentAt: now })
-    if (this.relayClient) {
-      this.relayClient.start()
-      // NOTE: no device identity here on purpose — the relay is metadata
-      // untrusted. The host answers with its identity only after proving it
-      // holds the code, and the code topic itself is the capability.
-      this.relayClient.send(`p2p-pair-${cleanCode}`, {
-        type: MESSAGES.PAIRING_CHALLENGE,
-        codeId: cid,
-        nonce: b4a.toString(relayNonce, 'hex')
-      })
-      // Send again shortly in case the remote host's WebSocket connection just opened
-      setTimeout(() => {
-        if (this.pairingSecrets.has(cid) && this.relayClient) {
-          this.relayClient.send(`p2p-pair-${cleanCode}`, {
-            type: MESSAGES.PAIRING_CHALLENGE,
-            codeId: cid,
-            nonce: b4a.toString(relayNonce, 'hex')
-          })
-        }
-      }, 600)
-    }
-
     return cleanCode
   }
 
-  // Re-broadcast the joiner's relay pairing challenge. The initial broadcast
-  // (registerJoinerCode) fires exactly twice, in the first 600ms — if the
-  // host's relay socket is not connected yet (the host relay starts lazily on
-  // pairing intent / zero-peer fallback), those sends are lost and the pairing
-  // can then only complete via direct DHT. pairWithCode's drive loop calls
-  // this every few seconds for the whole pairing window so the relay path
-  // stays alive alongside direct attempts.
-  resendRelayChallenge(rawCode) {
-    const cleanCode = normalizePairingCode(rawCode)
-    if (!cleanCode || !this.relayClient || !this.relayClient.started) return false
-    const cid = codeId(cleanCode)
-    const secret = this.pairingSecrets.get(cid)
-    if (!secret || secret.role !== 'joiner') return false
-    if (secret.expiresAt > 0 && Date.now() >= secret.expiresAt) return false
-    this._joinPairingTopic(cleanCode)
-    const nonce = randomBytes(16)
-    this.relayOutstanding.push({ nonce, code: cleanCode, codeId: cid, sentAt: Date.now() })
-    // Outstanding nonces are answered at most once each; keep the list bounded.
-    if (this.relayOutstanding.length > 32) {
-      this.relayOutstanding.splice(0, this.relayOutstanding.length - 32)
-    }
-    try {
-      this.relayClient.send(`p2p-pair-${cleanCode}`, {
-        type: MESSAGES.PAIRING_CHALLENGE,
-        codeId: cid,
-        nonce: b4a.toString(nonce, 'hex')
-      })
-      return true
-    } catch {
-      return false
-    }
-  }
   // host can verify that the visitor holds it (the allowlist flow). The host
   // joins the visitor's own pairing topic (which every device announces
   // permanently) and challenges; the visitor answers with mac(code, nonce); a
@@ -469,10 +396,6 @@ class TrustManager {
     const cid = codeId(cleanCode)
     const topic = `p2p-pair-${cleanCode}`
     this._joinPairingTopic(cleanCode)
-    // Host-side verification intent: bring the relay up right away so the
-    // challenge reaches the visitor even in lazy-'auto' mode (same as pairing
-    // intent does for a joiner).
-    if (this.relayClient) this.relayClient.start()
     const nonce = randomBytes(16)
     const challenge = { codeId: cid, nonce: b4a.toString(nonce, 'hex') }
     return { code: cleanCode, codeId: cid, topic, challenge, nonce: challenge.nonce }
@@ -484,7 +407,6 @@ class TrustManager {
   leaveHostVerificationCode(code) {
     if (!code) return
     try {
-      if (this.relayClient) this.relayClient.leave(`p2p-pair-${code}`)
       if (this.topicRegistry) this.topicRegistry.leave(`p2p-pair-${code}`)
     } catch {}
   }
@@ -549,6 +471,9 @@ class TrustManager {
   sendChallengesToAll({ force = false } = {}) {
     for (const [peerId, peerObj] of this.getPeers().entries()) {
       if (!peerObj || !peerObj.signaling || !peerObj.pairing) continue
+      // Lan-level peers are recognized, not paired: they never receive pairing
+      // challenges (answering pairing codes is NOT a lan capability).
+      if (peerObj.pairing.mode === 'lan' && !peerObj.pairing.trusted) continue
       // Flush any pending challenges that arrived before we registered a matching code
       if (peerObj.pairing.pendingChallenges && peerObj.pairing.pendingChallenges.length > 0) {
         const pending = peerObj.pairing.pendingChallenges
@@ -589,269 +514,11 @@ class TrustManager {
 
   _joinPairingTopic(code) {
     const label = `p2p-pair-${code}`
-    if (this.relayClient) this.relayClient.join(label)
     if (this.topicRegistry) this.topicRegistry.ensure(label, { client: true, server: true })
     else {
       const topicHash = this.computeTopicHash(label)
       this.swarm.join(topicHash, { client: true, server: true })
       this.swarm.flush().catch(() => {})
-    }
-  }
-
-  // Handle messages received over the Cloudflare Port 443 WSS Relay
-  handleRelayMessage(topic, msg, fromPeerId) {
-    if (!msg || typeof msg !== 'object') return
-
-    // MeshDrop Sites allowlist verification over the relay:
-    //  - A host's SITE_VERIFY_CHALLENGE reaches the visitor here; answer it.
-    //  - A visitor's SITE_VERIFY_RESP reaches the host here; hand it to the
-    //    SiteManager hook (the same MAC verification as the direct path).
-    if (msg.type === 'SITE_VERIFY_CHALLENGE') {
-      if (this.relayClient) {
-        this.handleSiteVerifyChallenge((resp) => this.relayClient.send(topic, resp), msg, true)
-      }
-      return
-    }
-    if (msg.type === 'SITE_VERIFY_RESP') {
-      // The host's SiteManager verifies + allowlists (same MAC check as the
-      // direct path). The engine wires this.siteManager.
-      if (this.siteManager && typeof this.siteManager.handleRelayVerifyResponse === 'function') {
-        this.siteManager.handleRelayVerifyResponse(fromPeerId, msg).catch((err) => {
-          console.warn('[MeshEngine] Relay SITE_VERIFY_RESP handling failed:', err.message)
-        })
-      }
-      return
-    }
-
-    // 1. Inbound Pairing Challenge from Joiner via WSS relay
-    if (msg.type === MESSAGES.PAIRING_CHALLENGE) {
-      if (typeof msg.codeId !== 'string' || typeof msg.nonce !== 'string') return
-      const secret = this.pairingSecrets.get(msg.codeId)
-      if (!secret || (secret.expiresAt > 0 && Date.now() >= secret.expiresAt)) return
-
-      const nonceBuf = b4a.from(msg.nonce, 'hex')
-      if (nonceBuf.length !== 16) return
-      const signature = mac(secret.code, nonceBuf)
-      const myIdentity = this.getDeviceIdentity ? this.getDeviceIdentity() : {}
-
-      console.log(`[MeshEngine] Answering PAIRING_CHALLENGE via Cloudflare WSS Relay for topic: ${topic}`)
-      if (this.relayClient) {
-        this.relayClient.send(topic, {
-          type: MESSAGES.PAIRING_RESP,
-          nonce: msg.nonce,
-          mac: b4a.toString(signature, 'hex'),
-          identity: {
-            ...myIdentity,
-            publicKey: this.getPeerId ? this.getPeerId() : ''
-          }
-        })
-
-        // Reciprocate over the relay so trust completes on BOTH sides: our
-        // answer alone only satisfies the challenger. The peer here proved
-        // knowledge of the code topic — clear any unanswered-pairing
-        // suppression (this is pairing activity we can complete) and challenge
-        // them back; only a peer that genuinely holds the code can answer.
-        // Skipped once the peer is already trusted (no ping-pong).
-        const peerPubKey =
-          typeof fromPeerId === 'string' && fromPeerId.length === 64 ? fromPeerId : ''
-        this.unansweredPairings.delete(peerPubKey)
-        if (peerPubKey && !this.isTrustedPublicKey(peerPubKey)) {
-          const myNonce = randomBytes(16)
-          this.relayOutstanding.push({
-            nonce: myNonce,
-            code: secret.code,
-            codeId: secret.codeId,
-            sentAt: Date.now()
-          })
-          this.relayClient.send(topic, {
-            type: MESSAGES.PAIRING_CHALLENGE,
-            codeId: secret.codeId,
-            nonce: b4a.toString(myNonce, 'hex')
-          })
-        }
-      }
-      return
-    }
-
-    // 2. Inbound Pairing Response from Host via WSS relay
-    if (msg.type === MESSAGES.PAIRING_RESP) {
-      if (typeof msg.nonce !== 'string' || typeof msg.mac !== 'string') return
-      const idx = this.relayOutstanding.findIndex((o) => b4a.toString(o.nonce, 'hex') === msg.nonce)
-      if (idx === -1) return
-      const outstanding = this.relayOutstanding[idx]
-      const expected = b4a.toString(mac(outstanding.code, outstanding.nonce), 'hex')
-      if (msg.mac !== expected) {
-        console.warn('[MeshEngine] Relay pairing challenge FAILED: MAC mismatch')
-        this.emit('pairing:failed', { peerId: fromPeerId || 'relay', reason: 'mac_mismatch', codeId: outstanding.codeId })
-        return
-      }
-
-      this.relayOutstanding.splice(idx, 1)
-      console.log(`[MeshEngine] Pairing challenge VERIFIED via Cloudflare WSS Relay (${outstanding.code})`)
-
-      const peerIdentity = msg.identity || {}
-      const targetPublicKey = peerIdentity.publicKey || fromPeerId || `relay-${Date.now()}`
-      const deviceId = peerIdentity.id || (targetPublicKey ? targetPublicKey.slice(0, 16) : 'remote-device')
-      const nowIso = new Date().toISOString()
-
-      // A relay pairing is the mobile app's fallback path when direct DHT
-      // connectivity fails, so it is exercised on first pairing and on every
-      // reconnect after a phone app update. Presence: the peer has no socket
-      // and no close event — isOnline is derived from relay-liveness freshness,
-      // so the persisted row must never carry a stale "true" (which would keep
-      // the device green in the desktop list forever).
-      const remoteDevice = {
-        id: deviceId,
-        publicKey: targetPublicKey,
-        name: peerIdentity.name || 'Remote Peer',
-        os: peerIdentity.os || 'Unknown',
-        osVersion: peerIdentity.osVersion || '',
-        avatar: peerIdentity.avatar || '',
-        isTrusted: true,
-        isEncrypted: true,
-        isOnline: false,
-        lastSeen: nowIso,
-        relayLastSeen: nowIso,
-        transferMethod: 'relay',
-        relayed: true,
-        pairedVia: (this.getDeviceIdentity ? this.getDeviceIdentity().id : null) || null,
-        trustedAt: nowIso
-      }
-
-      if (targetPublicKey && targetPublicKey.length === 64) {
-        this.addTrustedKey(targetPublicKey)
-        this.unrevokeKey(targetPublicKey)
-      }
-
-      // Persist in device bee
-      this.getBee('devices')
-        .then(async (bee) => {
-          // Preserve a user's custom rename across relay reconnects (the
-          // "renamed phone resets to 'MeshDrop Mobile'" bug).
-          const existing = await bee.get(deviceId).catch(() => null)
-          const prev = (existing && existing.value) || null
-          if (prev) {
-            if (prev.customName) remoteDevice.name = prev.customName
-            remoteDevice.customName = prev.customName || ''
-            if (!prev.customName) remoteDevice.lastReportedName = peerIdentity.name || ''
-            remoteDevice.avatar = prev.avatar || remoteDevice.avatar
-            remoteDevice.trustedAt = prev.trustedAt || remoteDevice.trustedAt
-            remoteDevice.pairedVia = prev.pairedVia || remoteDevice.pairedVia
-          } else {
-            remoteDevice.customName = ''
-            remoteDevice.lastReportedName = remoteDevice.name || ''
-          }
-          await bee.put(deviceId, remoteDevice)
-        })
-        .catch(() => {})
-
-      // Send reciprocal handshake info back via relay
-      if (this.relayClient) {
-        const myIdentity = this.getDeviceIdentity ? this.getDeviceIdentity() : {}
-        this.relayClient.send(topic, {
-          type: MESSAGES.HANDSHAKE,
-          identity: {
-            ...myIdentity,
-            publicKey: this.getPeerId ? this.getPeerId() : ''
-          }
-        })
-      }
-
-      this.onTrustGranted(targetPublicKey, outstanding.code)
-      this.emit(EVENTS.TRUST_PAIRED, { peer: remoteDevice, code: outstanding.code })
-      // The relay pair is verified and live right now — nudge the engine's
-      // relay-presence clock so a just-paired device can never read as stale.
-      try {
-        const dev = this.getPeers().get(targetPublicKey)?.device
-        if (dev && typeof dev.isOnline === 'boolean' && dev.relayed) {
-          if (this.engine && typeof this.engine.touchPresence === 'function') this.engine.touchPresence(dev)
-        }
-      } catch {}
-      this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
-      return
-    }
-
-    // 3. Reciprocal Handshake via WSS relay
-    if (msg.type === MESSAGES.HANDSHAKE && msg.identity) {
-      const peerIdentity = msg.identity
-      const targetPublicKey = peerIdentity.publicKey || fromPeerId
-      if (targetPublicKey && this.isTrustedPublicKey(targetPublicKey)) {
-        const deviceId = peerIdentity.id || targetPublicKey.slice(0, 16)
-        const nowIso = new Date().toISOString()
-        // This path re-fires on every relay reconnect (e.g. after a phone app
-        // update). Presence is derived from relay-liveness freshness, never
-        // from the persisted row — the row must not carry stale "true".
-        const remoteDevice = {
-          id: deviceId,
-          publicKey: targetPublicKey,
-          name: peerIdentity.name || 'Remote Peer',
-          os: peerIdentity.os || 'Unknown',
-          osVersion: peerIdentity.osVersion || '',
-          avatar: peerIdentity.avatar || '',
-          isTrusted: true,
-          isOnline: false,
-          lastSeen: nowIso,
-          relayLastSeen: nowIso,
-          transferMethod: 'relay',
-          relayed: true,
-          trustedAt: new Date().toISOString()
-        }
-        // Preserve a user's custom rename across relay reconnects, and carry
-        // the earlier pairing metadata (pairedVia, avatar) forward.
-        this.getBee('devices')
-          .then(async (bee) => {
-            const existing = await bee.get(deviceId).catch(() => null)
-            const prev = (existing && existing.value) || null
-            if (prev) {
-              if (prev.customName) remoteDevice.name = prev.customName
-              remoteDevice.customName = prev.customName || ''
-              if (!prev.customName) remoteDevice.lastReportedName = peerIdentity.name || ''
-              remoteDevice.pairedVia = prev.pairedVia || remoteDevice.pairedVia
-              remoteDevice.avatar = prev.avatar || remoteDevice.avatar
-              remoteDevice.trustedAt = prev.trustedAt || remoteDevice.trustedAt
-            } else {
-              remoteDevice.customName = ''
-              remoteDevice.lastReportedName = remoteDevice.name || ''
-            }
-            await bee.put(deviceId, remoteDevice)
-          })
-          .catch(() => {})
-        // The relay peer is verified and live right now — nudge relay-presence
-        // so the desktop list does not flip it to offline on the next refresh.
-        try {
-          if (this.engine && typeof this.engine.touchPresence === 'function') {
-            this.engine.touchPresence(remoteDevice)
-          }
-        } catch {}
-        this.emit(EVENTS.PEER_CONNECTED, remoteDevice)
-      }
-    }
-
-    // 4. Anything else arriving on a relay topic (WATCH_* party traffic on
-    // `p2p-watch-*`/`p2p-peer-*`, etc.) is peer-protocol traffic exactly like
-    // what rides direct signaling channels. Without this fallthrough every
-    // relayed-only peer link silently dropped chat/reactions/state-sync while
-    // pairing (which IS handled above) kept working — making the party look
-    // "half alive" over relay. The engine wires onUnmatchedRelayMessage to the
-    // same dispatcher direct-channel messages go through.
-    const handledTypes = [
-      MESSAGES.PAIRING_CHALLENGE,
-      MESSAGES.PAIRING_RESP,
-      MESSAGES.HANDSHAKE,
-      'SITE_VERIFY_CHALLENGE',
-      'SITE_VERIFY_RESP'
-    ]
-    if (
-      this.onUnmatchedRelayMessage &&
-      msg &&
-      typeof msg.type === 'string' &&
-      !handledTypes.includes(msg.type)
-    ) {
-      try {
-        this.onUnmatchedRelayMessage(topic, msg, fromPeerId)
-      } catch (err) {
-        console.warn('[MeshEngine] Relay peer-message dispatch failed:', err?.message)
-      }
     }
   }
 
@@ -965,6 +632,9 @@ class TrustManager {
     const peerObj = this.getPeers().get(peerId)
     if (!peerObj || !peerObj.signaling || !peerObj.pairing) return
     if (peerObj.pairing.trusted && !this.isRevoked(peerId)) return
+    // Lan-level peers are never challenged: pairing requires the explicit
+    // confirm prompt, and answering pairing codes is NOT a lan capability.
+    if (peerObj.pairing.mode === 'lan' && !peerObj.pairing.trusted) return
     // A peer that just failed a MAC verification is in exponential backoff —
     // do not re-challenge it until the lockout expires.
     if (this._isPairingLocked(peerId)) return
@@ -1006,6 +676,11 @@ class TrustManager {
     if (!peerObj || !peerObj.pairing) {
       return
     }
+    // Lan-level peers are recognized, not paired. Never answer their pairing
+    // challenges: answering would complete THEIR side of a pairing the local
+    // user has not confirmed, and would arm the watchdog against a
+    // connection that is supposed to stay open at the lan tier.
+    if (peerObj.pairing.mode === 'lan' && !peerObj.pairing.trusted) return
     // A revoked (deleted) peer's challenge is left unanswered UNLESS we have an
     // active matching secret registered (e.g. user explicitly entered the code to
     // re-pair). Re-admission happens on OUR challenge to it (handleResponse).

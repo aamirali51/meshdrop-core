@@ -21,7 +21,7 @@ const PING_WINDOW = 20 // rolling outcomes / RTT samples kept per peer
 const MAX_MISSED_PONGS = 3 // consecutive lost PONGs → connection is destroyed
 
 function createKeepAlive(ctx) {
-  const { engine, peers } = ctx
+  const { peers } = ctx
 
   function ensurePingState(peerObj) {
     if (peerObj.pings) return
@@ -86,7 +86,7 @@ function createKeepAlive(ctx) {
       peerObj.pings.outstanding.set(id, { sentAt, timer })
       try {
         peerObj.signaling.send({ type: MESSAGES.PING, id, sentAt })
-      } catch (err) {
+      } catch {
         const entry = peerObj.pings.outstanding.get(id)
         if (entry) {
           clearTimeout(entry.timer)

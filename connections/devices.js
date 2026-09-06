@@ -13,11 +13,16 @@ function createDeviceRegistry(ctx) {
 
   // Apply a verified peer's identity handshake: fill in device metadata, mark
   // the pairing complete, persist the device, and emit paired/connected
-  // events. Only ever called once the peer's pairing is trusted (directly on
-  // receipt, or deferred from the buffer once our challenge verifies).
+  // events. Only ever called once the peer is at least LAN-recognized
+  // (identity exchange + display) or fully trusted.
   async function applyHandshake(peerId, msg) {
     const peerObj = peers.get(peerId)
-    if (!peerObj || !peerObj.pairing || !peerObj.pairing.trusted) return
+    if (!peerObj || !peerObj.pairing) return
+    // Two-tier trust: a 'lan' peer may exchange identity (display purposes
+    // only) but is not paired. Everything below the matrix grants lan peers a
+    // display row with isTrusted=false and no paired capabilities.
+    const lanOnly = !peerObj.pairing.trusted && peerObj.pairing.mode === 'lan'
+    if (!peerObj.pairing.trusted && !lanOnly) return
     // A revoked key must never complete a handshake, even on a connection that
     // predates the revocation (delete raced an in-flight handshake).
     if (engine.trustManager.isRevoked(peerId)) {
@@ -63,11 +68,14 @@ function createDeviceRegistry(ctx) {
     peerObj.device.identityKey = msg.identity.publicKey || '' // identity core key: used for topic discovery
     peerObj.device.name = msg.identity.name || peerObj.device.name
     peerObj.device.os = msg.identity.os || peerObj.device.os
-    peerObj.device.isTrusted = true
+    peerObj.device.isTrusted = !lanOnly
+    peerObj.device.lanLevel = lanOnly
     peerObj.device.isOnline = true
-    peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
+    if (!lanOnly) {
+      peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
+      peerObj.pairing.complete = true
+    }
     peerObj.device.lastSeen = new Date().toISOString()
-    peerObj.pairing.complete = true
     // Belt-and-suspenders: TrustManager clears its watchdog on challenge
     // verification; also drop any stale timer now that the handshake has
     // completed so the connection can never be killed by a leftover one.
@@ -114,7 +122,20 @@ function createDeviceRegistry(ctx) {
     } catch (err) {
       console.error('[MeshEngine] Failed to save device to bee:', err)
     }
-    engine.trustManager.addTrustedKey(peerId)
+    if (!lanOnly) engine.trustManager.addTrustedKey(peerId)
+
+    if (lanOnly) {
+      // LAN-level identity is now known: (re)fire the detection prompt with
+      // the real device name. No paired/connected events — a lan peer is
+      // displayed, but nothing downstream may treat it as paired.
+      engine.emit(EVENTS.DEVICE_DETECTED_LAN, {
+        peerId,
+        publicKey: peerId,
+        id: peerObj.device.id,
+        name: peerObj.device.name,
+      })
+      return
+    }
 
     engine.emit(EVENTS.TRUST_PAIRED, { peer: peerObj.device, code: peerObj.pairing.code })
     engine.emit(EVENTS.PEER_CONNECTED, peerObj.device)
@@ -126,10 +147,14 @@ function createDeviceRegistry(ctx) {
   // peer.
   function flushPendingHandshake(peerId) {
     const peerObj = peers.get(peerId)
-    if (!peerObj || !peerObj.pairing || !peerObj.pairing.trusted) return
-    if (!peerObj.pairing.pendingHandshake) return
-    const msg = peerObj.pairing.pendingHandshake
-    peerObj.pairing.pendingHandshake = null
+    if (!peerObj || !peerObj.pairing) return
+    const p = peerObj.pairing
+    // Applies once the peer is paired OR merely LAN-recognized (identity
+    // exchange is granted at the lan level).
+    if (!p.trusted && p.mode !== 'lan') return
+    if (!p.pendingHandshake) return
+    const msg = p.pendingHandshake
+    p.pendingHandshake = null
     applyHandshake(peerId, msg)
   }
 
@@ -148,31 +173,94 @@ function createDeviceRegistry(ctx) {
   // A LAN announcement can land AFTER the connection formed (discovery is
   // asynchronous and the connection may have come via the DHT identity topic).
   // onConnection can therefore not be the only place autoTrustLAN is honored:
-  // promote a still-pairing peer to direct trust the moment it is discovered
-  // on the local network, bypassing the challenge-response handshake entirely.
+  // recognize a still-pairing peer at the LAN level the moment it is
+  // discovered on the local network. LAN-level grants identity exchange +
+  // display ONLY — replication, transfer offers, pairing-code answering and
+  // relay eligibility stay locked until the user explicitly confirms pairing
+  // (confirmLanPeer). Revoked peers are never recognized at any level.
   async function maybeAutoTrustLanPeer(peerId) {
     const peerObj = peers.get(peerId)
     if (!peerObj || !peerObj.pairing || peerObj.pairing.trusted) return
-    if (peerObj.pairing.mode !== 'pairing') return
     if (engine.trustManager.isRevoked(peerId)) return // deleted devices never auto-trust
+    if (peerObj.pairing.mode !== 'pairing' && peerObj.pairing.mode !== 'lan') return
     if (!(await engine.getAutoTrustLAN())) return
+    const wasPairing = peerObj.pairing.mode === 'pairing'
+    if (wasPairing) {
+      peerObj.pairing.mode = 'lan'
+      // Drop any watchdog the challenge phase armed; a lan peer gets none.
+      if (peerObj.pairing.timeout) {
+        clearTimeout(peerObj.pairing.timeout)
+        peerObj.pairing.timeout = null
+      }
+      peers.set(peerId, peerObj)
+      console.log(
+        `[MeshEngine] LAN peer ${peerId.slice(0, 12)}... recognized at 'lan' level (autoTrustLAN enabled) — pairing requires user confirmation`
+      )
+    }
+    // Identity exchange is allowed at lan level; replication is NOT.
+    ctx.refs.sendHandshake(peerId)
+    // The peer may already have sent its HANDSHAKE while we were still pairing.
+    flushPendingHandshake(peerId)
+    // Surface the one-tap confirm. Emitted again from applyHandshake once the
+    // handshake supplies the real device name; the renderer keys on publicKey.
+    engine.emit(EVENTS.DEVICE_DETECTED_LAN, {
+      peerId,
+      publicKey: peerId,
+      id: peerObj.device && peerObj.device.id,
+      name: peerObj.device && peerObj.device.name,
+    })
+  }
+
+  // Explicit user confirmation (the "Device detected on your network — pair?"
+  // prompt): promote a lan-level peer to full pairing. This is the ONLY path
+  // from lan to paired — no timeout, no re-announcement, no code answer can
+  // get here without this call.
+  async function confirmLanPeer(peerKey) {
+    const peerId = typeof peerKey === 'string' ? peerKey : ''
+    const peerObj = peers.get(peerId)
+    if (!peerObj || !peerObj.pairing) {
+      throw new Error('Device is not connected right now.')
+    }
+    if (engine.trustManager.isRevoked(peerId)) {
+      throw new Error('This device was removed and cannot be re-trusted from the prompt.')
+    }
+    if (peerObj.pairing.trusted) return peerObj.device // already paired
     peerObj.pairing.mode = 'direct'
     peerObj.pairing.trusted = true
     peerObj.device.isTrusted = true
+    peerObj.device.lanLevel = false
     peerObj.device.trustedAt = peerObj.device.trustedAt || new Date().toISOString()
-    // Drop any watchdog the challenge phase armed; a direct peer needs none.
     if (peerObj.pairing.timeout) {
       clearTimeout(peerObj.pairing.timeout)
       peerObj.pairing.timeout = null
     }
     peers.set(peerId, peerObj)
     console.log(
-      `[MeshEngine] Auto-trusting LAN peer ${peerId.slice(0, 12)}... (late LAN discovery, autoTrustLAN enabled)`
+      `[MeshEngine] LAN peer ${peerId.slice(0, 12)}... confirmed by user — promoted to paired`
     )
+    engine.trustManager.addTrustedKey(peerId)
     ctx.refs.sendHandshake(peerId)
     ctx.refs.replicateExchange(peerId)
-    // The peer may already have sent its HANDSHAKE while we were still pairing.
     flushPendingHandshake(peerId)
+    // Persist the paired state (applyHandshake persisted a lan-only row).
+    try {
+      const bee = await engine.getBee('devices')
+      const existing = await bee.get(peerObj.device.id).catch(() => null)
+      const prev = (existing && existing.value) || null
+      if (prev) {
+        await bee.put(peerObj.device.id, {
+          ...prev,
+          isTrusted: true,
+          trustedAt: peerObj.device.trustedAt,
+          lanLevel: false,
+        })
+      }
+    } catch (err) {
+      console.warn('[MeshEngine] Failed to persist LAN pairing confirmation:', err.message)
+    }
+    engine.emit(EVENTS.TRUST_PAIRED, { peer: peerObj.device, code: peerObj.pairing.code })
+    engine.emit(EVENTS.PEER_CONNECTED, peerObj.device)
+    return peerObj.device
   }
 
   async function reconnectKnownPeers() {
@@ -223,6 +311,7 @@ function createDeviceRegistry(ctx) {
     flushPendingHandshake,
     rebroadcastPeerCompletion,
     maybeAutoTrustLanPeer,
+    confirmLanPeer,
     reconnectKnownPeers
   }
 }

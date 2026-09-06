@@ -8,7 +8,7 @@
 
 const b4a = require('b4a')
 const { sha256 } = require('../../crypto.js')
-const { CHUNK_SIZE, MANIFEST_V, sleep } = require('./constants.js')
+const { CHUNK_SIZE, MANIFEST_V } = require('./constants.js')
 
 function getFileType(filename) {
   const ext = String(filename || '')
@@ -244,7 +244,7 @@ async function computePlayableWatermark({ filePath, fsp, fileSize }) {
     } finally {
       await fd.close().catch(() => {})
     }
-  } catch (err) {
+  } catch {
     return null
   }
 }

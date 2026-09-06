@@ -11,7 +11,6 @@
 const { EVENTS, MESSAGES } = require('../protocol.js')
 const {
   DEFAULT_SCAN_INTERVAL_MS,
-  MAX_LIBRARY_FILES,
   DEFAULT_VERIFY_TIMEOUT_MS,
   MAX_VERIFY_FILES,
   VERIFY_TOLERANCE_MS,
@@ -969,7 +968,7 @@ class SyncEngine {
     this.sendEvent(EVENTS.SYNC_PHASE, { id: lib.id, phase, ...extra })
   }
 
-  _finishRound(lib, { pushed = 0, skipped = 0 } = {}) {
+  _finishRound(lib, { pushed = 0 } = {}) {
     lib._phasePending = 0
     lib._phaseDone = 0
     lib._phase = { phase: 'synced', total: 0, done: 0 }
@@ -1208,7 +1207,7 @@ class SyncEngine {
         const trashDest = this.path.join(trashDir, `${Date.now().toString(36)}_${this.path.basename(safe)}`)
         try {
           await this.fsp.rename(targetFile, trashDest)
-        } catch (renameErr) {
+        } catch {
           try {
             await this.fsp.copyFile(targetFile, trashDest)
             await this.fsp.unlink(targetFile)

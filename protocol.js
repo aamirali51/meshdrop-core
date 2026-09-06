@@ -60,6 +60,10 @@ const EVENTS = {
   PEER_DISCONNECTED: 'peer:disconnected',
   TRUST_PAIRED: 'trust:paired',
   TRUST_REVOKED: 'trust:revoked',
+  // Two-tier trust: a peer heard on the LAN (autoTrustLAN enabled) is
+  // recognized at the 'lan' level only — identity exchange + display. This
+  // event asks the user to explicitly confirm full pairing.
+  DEVICE_DETECTED_LAN: 'device:detected:lan',
   PAIRING_FAILED: 'pairing:failed',
   DEVICE_REMOVED: 'device:removed',
   TRANSFER_OFFER: 'transfer:offer',

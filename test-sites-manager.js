@@ -82,7 +82,6 @@ function makeEngine({ getBee }) {
     getBee,
     trustManager: fakeTrustManager,
     peers: new Map(),
-    relayClient: null,
     emit,
     on,
     connections: {
@@ -169,7 +168,7 @@ async function run() {
   })
   try {
     await addP2
-  } catch (err) {
+  } catch {
     rejected = true
   }
   assert.strictEqual(rejected, true, 'bad MAC rejects the add')

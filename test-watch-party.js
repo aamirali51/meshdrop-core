@@ -356,7 +356,7 @@ async function runAllTests() {
     let stagingFailed = false
     try {
       await host9.watchParty.createRoom({ title: 'Nine', filePath: path.join(tmpRoot, 'does-not-exist.mp4') })
-    } catch (err) {
+    } catch {
       stagingFailed = true
     }
     assert('createRoom rejected for unreadable media', stagingFailed === true)

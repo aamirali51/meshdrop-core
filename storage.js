@@ -6,7 +6,7 @@
 // Storage roots come from the engine config (storageDir) — never from an
 // Electron app.getPath() default.
 
-const { path, fsp, isBare } = require('./compat.js')
+const { path, isBare } = require('./compat.js')
 
 // Android FUSE storage (Android 11+; CalyxOS, stock) does not support flock —
 // fd-lock's tryLock returns false and hypercore-storage throws
@@ -78,7 +78,7 @@ const Hyperbee = require('hyperbee')
 const hcrypto = require('hypercore-crypto')
 const { deriveDeviceId } = require('./crypto.js')
 
-function createStorage({ storageDir, downloadsDir, deviceName }) {
+function createStorage({ storageDir, downloadsDir }) {
   // Private metadata store (identity, devices, history, settings). NEVER
   // replicated. Only the exchange store is exposed to authenticated peers.
   let store = new Corestore(path.join(storageDir, 'corestore'))

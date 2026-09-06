@@ -18,7 +18,6 @@ const { SyncEngine } = require('./engine/SyncEngine.js')
 const { WatchPartyManager, PARTY_EVENTS } = require('./engine/WatchPartyManager.js')
 const { SiteManager } = require('./engine/SiteManager.js')
 const { SiteServer } = require('./engine/SiteServer.js')
-const { SiteVisitor } = require('./engine/SiteVisitor.js')
 const MetricsCollector = require('./engine/MetricsCollector.js')
 const TopicRegistry = require('./engine/TopicRegistry.js')
 const NotificationStore = require('./engine/NotificationStore.js')
@@ -27,11 +26,9 @@ const LanDiscovery = require('./engine/LanDiscovery.js')
 const { loadOrCreateNoiseKeypair } = require('./noiseKeypair.js')
 const { createStorage } = require('./storage.js')
 const { createConnections, getTransferMethod } = require('./connections/index.js')
-const { RelayClient } = require('./connections/relayClient.js')
 
 const PAIR_WAIT_TIMEOUT = 60 * 1000 // max time pairWithCode waits for verification
 const PAIR_DRIVE_INTERVAL_MS = 5 * 1000 // pairWithCode re-announces challenges + reconnects on this cadence
-const RELAY_FALLBACK_MS = 30 * 1000 // 'auto': relay engages after this long with zero direct peers
 const EXPIRATION_INTERVAL_MS = 10 * 1000
 // A paired device that last proved it was alive longer ago than this is shown
 // offline. Proven presence is a live authenticated peer (connections/index.js)
@@ -177,9 +174,10 @@ class MeshEngine extends EventEmitter {
     this.downloadsDir = config.downloadsDir || path.join(config.storageDir, 'downloads')
     this.deviceName = config.deviceName || os.hostname()
     this.autoAcceptOffers = config.autoAcceptOffers === true
-    // Security default: NEVER auto-trust LAN peers. A device must complete the
-    // pairing handshake (prove knowledge of the MD- code) to be trusted — LAN
-    // discovery only helps the connection establish, it grants no trust.
+    // Two-tier trust: autoTrustLAN never grants pairing. Enabled, it only
+    // recognizes peers heard on the local network at the "lan" level
+    // (identity exchange + display) and fires the device-detected-on-lan
+    // confirm prompt; full pairing requires explicit user confirmation.
     this.autoTrustLAN = config.autoTrustLAN === true
     // Auto-switch a relayed peer onto a direct LAN connection when the LAN
     // discovery hears that peer on the local network (default ON).
@@ -214,16 +212,6 @@ class MeshEngine extends EventEmitter {
     this.siteManager = null
     this.siteServer = null
     this.siteVisitor = null
-    this.relayMode = config.relayMode || 'auto' // 'auto' | 'relay-primary' | 'direct-only'
-    this.customRelayUrl = config.customRelayUrl || config.relayUrl || ''
-    this.relayClient = new RelayClient({
-      relayUrl: this.customRelayUrl,
-      mode: this.relayMode,
-      // Injected HTTP transport for runtimes without global fetch/WebSocket
-      // (the Android Bare worklet proxies relay requests through the RN
-      // bridge). Null on desktop — the global fetch/WS path is used.
-      http: config.relayHttp || null
-    })
     this.expirationTimer = null
     // Presence bookkeeping. This engine's own identity id (filled at
     // start() from storage.setDeviceInfo) so stop() can mark devices we
@@ -479,7 +467,6 @@ class MeshEngine extends EventEmitter {
       computeTopicHash: this.storage.computeTopicHash,
       swarm: this.swarm,
       topicRegistry: this.topicRegistry,
-      relayClient: this.relayClient,
       getPeers: () => this.peers,
       sendHandshake: (peerId) => this.connections.sendHandshake(peerId),
       emit: (event, data) => this.emit(event, data),
@@ -673,17 +660,6 @@ class MeshEngine extends EventEmitter {
       this.connections.refs.handleSyncVerify = (peerId, msg) => this.syncEngine.handleSyncVerify(peerId, msg)
       this.connections.refs.handleSyncVerifyResult = (peerId, msg) => this.syncEngine.handleSyncVerifyResult(peerId, msg)
       this.connections.refs.handleWatchMessage = (peerId, msg) => this.watchParty && this.watchParty.handleMessage(peerId, msg)
-      // Relay fallback: TrustManager owns relayClient.onMessage for pairing,
-      // and hands every non-pairing relay message (WATCH_* party traffic on
-      // `p2p-watch-*` / `p2p-peer-*` topics) to the SAME dispatcher direct
-      // signaling channels use. Without this, relayed-only peer links lose
-      // chat/reactions/state-sync silently while media (which has its own
-      // relay transport) keeps flowing.
-      this.trustManager.onUnmatchedRelayMessage = (topic, msg, fromPeerId) => {
-        if (this.connections && typeof this.connections.handlePeerMessage === 'function') {
-          this.connections.handlePeerMessage(fromPeerId, msg)
-        }
-      }
     }
 
     this.watchParty = new WatchPartyManager({ engine: this })
@@ -787,14 +763,8 @@ class MeshEngine extends EventEmitter {
       if (s && typeof s.autoTrustLAN === 'boolean') this.autoTrustLAN = s.autoTrustLAN
       if (s && typeof s.autoAcceptOffers === 'boolean') this.autoAcceptOffers = s.autoAcceptOffers
       if (s && typeof s.preferOwnRelay === 'boolean') this.preferOwnRelay = s.preferOwnRelay
-      if (s && typeof s.relayMode === 'string') {
-        this.relayMode = s.relayMode
-        if (this.relayClient) this.relayClient.setMode(s.relayMode)
-      }
-      if (s && typeof s.customRelayUrl === 'string') {
-        this.customRelayUrl = s.customRelayUrl
-        if (this.relayClient) this.relayClient.setRelayUrl(s.customRelayUrl)
-      }
+      // Note: old settings blobs may still carry the relay-mode / custom-relay
+      // endpoint keys from the removed Cloudflare relay — intentionally ignored.
       if (s && typeof s.autoLanSwitch === 'boolean') this.autoLanSwitch = s.autoLanSwitch
     } catch {}
 
@@ -832,20 +802,6 @@ class MeshEngine extends EventEmitter {
     if (this.expirationTimer.unref) this.expirationTimer.unref()
 
     this.started = true
-    if (this.relayClient) {
-      this.relayClient.setPeerId(this.peerId)
-      if (this.relayMode === 'relay-primary') {
-        this.relayClient.start()
-      } else if (this.relayMode === 'auto') {
-        // Privacy default: the relay is a FALLBACK for networks where direct
-        // DHT connectivity fails — not an always-on phone-home. It engages
-        // on pairing intent (setPairingIntent — pairing screen open / code
-        // entered, which also starts it from TrustManager.registerJoinerCode)
-        // or when the swarm has run with zero peers, the signature of a
-        // challenged network. 'direct-only' never starts it.
-        this._armRelayFallback()
-      }
-    }
     console.log('[MeshEngine] ready')
     return this
   }
@@ -854,11 +810,6 @@ class MeshEngine extends EventEmitter {
     if (!this.started) return
     this.started = false
     console.log('[MeshEngine] stopping...')
-    if (this.relayClient) this.relayClient.stop()
-    if (this._relayFallbackTimer) {
-      clearTimeout(this._relayFallbackTimer)
-      this._relayFallbackTimer = null
-    }
     // Stop the unref'd maintenance intervals (reconnectKnownPeers, sendPings)
     // so they never touch the stores while we tear down below.
     if (this.connections && typeof this.connections.teardown === 'function') {
@@ -1015,10 +966,13 @@ class MeshEngine extends EventEmitter {
       let settled = false
       let gotPairingFailure = false
       let drive = null
+      let timer = null
+      let backstop = null
       const finish = (fn, value) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        if (timer) clearTimeout(timer)
+        if (backstop) clearTimeout(backstop)
         if (drive) clearInterval(drive)
         this.removeListener(EVENTS.TRUST_PAIRED, onPaired)
         this.removeListener(EVENTS.PEER_DISCONNECTED, onDisconnected)
@@ -1072,36 +1026,49 @@ class MeshEngine extends EventEmitter {
         finish(reject, new Error('The host removed this device. Pair again with the current code.'))
         void publicKey
       }
-      const timer = setTimeout(() => {
-        finish(
-          reject,
-          new Error(
-            gotPairingFailure
-              ? 'Pairing failed — the code was rejected by the host.'
-              : `Pairing timed out after ${timeoutMs}ms — is the host online and is the code correct?`
+      // Arms the pairing window + drive loop. Deferred until DHT readiness:
+      // a slow first-boot bootstrap must not burn the pairing budget before
+      // the joiner could even discover the host's pairing topic.
+      const armWindow = () => {
+        if (settled || timer || drive) return
+        timer = setTimeout(() => {
+          finish(
+            reject,
+            new Error(
+              gotPairingFailure
+                ? 'Pairing failed — the code was rejected by the host.'
+                : 'Couldn\'t reach the other device. Make sure both devices are online and not on a restricted network.'
+            )
           )
-        )
-      }, timeoutMs)
-      if (timer.unref) timer.unref()
-      // Actively DRIVE the pairing instead of waiting passively: re-announce
-      // our challenge to every connected peer and re-attempt direct
-      // connectivity to the host. One missed DHT connect or a suppressed
-      // first challenge must not stall the whole pairing — this is what makes
-      // re-pairing after deletion robust against relay/DHT flakiness.
-      drive = setInterval(() => {
-        if (settled) return
-        try {
-          this.trustManager.sendChallengesToAll({ force: true })
-          if (this.connections && typeof this.connections.reconnectKnownPeers === 'function') {
-            this.connections.reconnectKnownPeers().catch(() => {})
-          }
-          // Keep the relay fallback challenge alive for the whole pairing
-          // window: the initial broadcast fires only twice (0ms + 600ms), and
-          // a host whose lazy relay socket is not up yet never hears it.
-          this.trustManager.resendRelayChallenge(clean)
-        } catch {}
-      }, PAIR_DRIVE_INTERVAL_MS)
-      if (drive.unref) drive.unref()
+        }, timeoutMs)
+        if (timer.unref) timer.unref()
+        // Actively DRIVE the pairing instead of waiting passively: re-announce
+        // our challenge to every connected peer and re-attempt direct
+        // connectivity to the host. One missed DHT connect or a suppressed
+        // first challenge must not stall the whole pairing — this is what makes
+        // re-pairing after deletion robust against DHT flakiness.
+        drive = setInterval(() => {
+          if (settled) return
+          try {
+            this.trustManager.sendChallengesToAll({ force: true })
+            if (this.connections && typeof this.connections.reconnectKnownPeers === 'function') {
+              this.connections.reconnectKnownPeers().catch(() => {})
+            }
+          } catch {}
+        }, PAIR_DRIVE_INTERVAL_MS)
+        if (drive.unref) drive.unref()
+      }
+      // Gate the window on the SAME readiness signal initSwarm awaits
+      // (ctx.swarm.dht.ready()). Backstop arms the window anyway if the DHT
+      // never becomes ready, so pairing always terminates with the same
+      // user-facing error instead of hanging forever.
+      if (this.swarm && this.swarm.dht) {
+        this.swarm.dht.ready().then(armWindow, armWindow)
+        backstop = setTimeout(armWindow, timeoutMs)
+        if (backstop.unref) backstop.unref()
+      } else {
+        armWindow()
+      }
       this.on(EVENTS.TRUST_PAIRED, onPaired)
       this.on(EVENTS.PEER_DISCONNECTED, onDisconnected)
       this.on(EVENTS.TRUST_REVOKED, onRevoked)
@@ -1255,7 +1222,7 @@ class MeshEngine extends EventEmitter {
         }
       }
       const syncBee = await this.storage.getBee('sync')
-      for await (const node of syncBee.createReadStream()) counts.syncLibraries++
+      for await (const entry of syncBee.createReadStream()) { if (entry) counts.syncLibraries++ }
     } catch {}
     let sizeBytes = 0
     try {
@@ -1521,8 +1488,6 @@ class MeshEngine extends EventEmitter {
         autoTrustLAN: this.autoTrustLAN,
         autoLanSwitch: this.autoLanSwitch,
         preferOwnRelay: this.preferOwnRelay,
-        relayMode: this.relayMode,
-        customRelayUrl: this.customRelayUrl,
         ...(entry?.value || {})
       }
     } catch {
@@ -1530,9 +1495,7 @@ class MeshEngine extends EventEmitter {
         autoAcceptOffers: this.autoAcceptOffers,
         autoTrustLAN: this.autoTrustLAN,
         autoLanSwitch: this.autoLanSwitch,
-        preferOwnRelay: this.preferOwnRelay,
-        relayMode: this.relayMode,
-        customRelayUrl: this.customRelayUrl
+        preferOwnRelay: this.preferOwnRelay
       }
     }
   }
@@ -1598,76 +1561,6 @@ class MeshEngine extends EventEmitter {
     return this.preferOwnRelay
   }
 
-  /**
-   * Set relay transport strategy: 'auto' | 'relay-primary' | 'direct-only' (persisted).
-   */
-  async setRelayMode(mode) {
-    if (!['auto', 'relay-primary', 'direct-only'].includes(mode)) {
-      mode = 'auto'
-    }
-    this.relayMode = mode
-    if (this.relayClient) {
-      this.relayClient.setMode(mode)
-    }
-    try {
-      const bee = await this.getBee('settings')
-      const entry = await bee.get('settings')
-      await bee.put('settings', { ...(entry?.value || {}), relayMode: this.relayMode })
-    } catch (err) {
-      console.warn('[MeshEngine] setRelayMode persist failed:', err.message)
-    }
-    return this.relayMode
-  }
-
-  /**
-   * Set custom Cloudflare / WSS relay worker URL (persisted).
-   */
-  async setCustomRelayUrl(url) {
-    this.customRelayUrl = typeof url === 'string' ? url.trim() : ''
-    if (this.relayClient) {
-      this.relayClient.setRelayUrl(this.customRelayUrl)
-    }
-    try {
-      const bee = await this.getBee('settings')
-      const entry = await bee.get('settings')
-      await bee.put('settings', { ...(entry?.value || {}), customRelayUrl: this.customRelayUrl })
-    } catch (err) {
-      console.warn('[MeshEngine] setCustomRelayUrl persist failed:', err.message)
-    }
-    return this.customRelayUrl
-  }
-
-  // ─── Relay availability (privacy: the relay is a fallback, not a beacon) ──
-
-  // Arm the connectivity fallback: in 'auto' mode the relay starts only when
-  // the swarm has been up with ZERO peers for the fallback window — the
-  // signature of a network where direct DHT connectivity cannot work.
-  _armRelayFallback() {
-    if (this._relayFallbackTimer) return
-    this._relayFallbackTimer = setTimeout(() => {
-      this._relayFallbackTimer = null
-      if (!this.started || this.relayMode === 'direct-only') return
-      if (this.peers.size > 0) return // direct connectivity works — stay quiet
-      console.log('[MeshEngine] No direct peers — enabling relay fallback')
-      this.relayClient.start()
-    }, RELAY_FALLBACK_MS)
-    if (this._relayFallbackTimer.unref) this._relayFallbackTimer.unref()
-  }
-
-  /**
-   * Signal pairing intent (pairing screen opened on this device). In 'auto'
-   * mode this brings the relay up immediately so a remote device on a
-   * challenged network can reach us for pairing. Sticky: closing the screen
-   * does not yank the relay out from under an in-flight pairing.
-   */
-  setPairingIntent(active = true) {
-    this._pairingIntent = !!active
-    if (this._pairingIntent && this.started && this.relayClient && this.relayMode !== 'direct-only') {
-      this.relayClient.start()
-    }
-    return this._pairingIntent
-  }
-
   getStatus() {
     return this.connections.getConnectionStatus()
   }
@@ -1677,7 +1570,6 @@ class MeshEngine extends EventEmitter {
     if (!this.metricsCollector || !this.connections) {
       return {
         natType: null,
-        relayStatus: 'Disabled',
         dhtNodes: null,
         avgLatencyMs: null,
         packetLossPercent: null,
@@ -1700,7 +1592,6 @@ class MeshEngine extends EventEmitter {
     return this.metricsCollector.snapshot({
       peerCount: count,
       connected,
-      relayStatus: 'Enabled',
       avgLatencyMs: this.connections.getPeerLatency(),
       packetLossPercent: this.connections.getPacketLoss()
     })
@@ -1717,6 +1608,12 @@ class MeshEngine extends EventEmitter {
 
   async getAutoTrustLAN() {
     return this.autoTrustLAN
+  }
+
+  // Explicit user confirmation of the device-detected-on-lan prompt: promote
+  // a lan-level peer to full pairing. See connections/devices.js.
+  async confirmLanPair(peerKey) {
+    return this.connections.confirmLanPeer(peerKey)
   }
 
   async cleanupPendingShare(id, newStatus = 'cancelled') {

@@ -243,30 +243,24 @@ function createConnections(engine) {
       }
     } catch {}
 
-    // Trust is earned: a previously verified trusted key always wins. Otherwise
-    // honor the autoTrustLAN preference: peers discovered on the local network
-    // (explicit LAN-discovery signal, or a private-range remote address) are
-    // trusted immediately without any challenge-response handshake.
+    // Trust is earned: a previously verified trusted key always wins. With the
+    // two-tier trust model, autoTrustLAN no longer grants trust: a peer heard
+    // on the local network (explicit LAN-discovery signal, or a private-range
+    // remote address) is only recognized at the "lan" level — identity
+    // exchange + display. Full pairing requires the user's explicit
+    // confirmation via the device-detected-on-lan prompt (confirmLanPeer).
     const lanDiscovered =
       engine.lanDiscovery &&
       typeof engine.lanDiscovery.has === "function" &&
       engine.lanDiscovery.has(peerId);
-    let directTrusted = engine.trustManager.isTrustedPublicKey(peerId);
-    if (
-      !revokedPeer &&
+    const directTrusted = engine.trustManager.isTrustedPublicKey(peerId);
+    const lanRecognized =
       !directTrusted &&
+      !revokedPeer &&
       (await engine.getAutoTrustLAN()) &&
-      (transferMethod === "lan" || lanDiscovered)
-    ) {
-      directTrusted = true;
-      console.log(
-        `[MeshEngine] Auto-trusting LAN peer ${peerId.slice(0, 12)}... (autoTrustLAN enabled)`,
-      );
-    }
+      (transferMethod === "lan" || lanDiscovered);
 
-    const signalingApi = signaling.setupPeerSignaling(connection, peerId, {
-      directTrusted,
-    });
+    const signalingApi = signaling.setupPeerSignaling(connection, peerId);
     // NOTE: the private metadata store is NEVER replicated here. The exchange
     // store (file cores only) is replicated once the peer is authenticated.
 
@@ -278,6 +272,7 @@ function createConnections(engine) {
       osVersion: "",
       avatar: "",
       isTrusted: directTrusted,
+      lanLevel: !directTrusted && lanRecognized,
       isEncrypted: true,
       isOnline: true,
       lastSeen: new Date().toISOString(),
@@ -287,15 +282,15 @@ function createConnections(engine) {
       relayedViaOwnPeer,
     };
 
-    // Trust is earned: only a known trusted noise public key (direct), a
-    // successful pairing challenge (pairing), or the autoTrustLAN preference
-    // for LAN peers ever sets isTrusted = true.
+    // Trust is earned: only a known trusted noise public key (direct) or a
+    // successful pairing challenge (pairing) ever sets isTrusted = true. The
+    // autoTrustLAN preference only yields the "lan" recognition level.
     // `timeout` is owned by TrustManager's watchdog: it is armed only when a
     // PAIRING_CHALLENGE is sent/received and cleared on verification — it
     // must NOT start at connection open, otherwise a slow code typist loses
     // the race to the timer.
     const pairing = {
-      mode: directTrusted ? "direct" : "pairing",
+      mode: directTrusted ? "direct" : lanRecognized ? "lan" : "pairing",
       trusted: directTrusted,
       complete: false,
       outstanding: [], // { nonce, code, codeId }
@@ -315,6 +310,18 @@ function createConnections(engine) {
 
     if (directTrusted) {
       replicateExchange(peerId);
+    } else if (lanRecognized) {
+      // Two-tier trust: recognized on the LAN, not paired. Ask the user to
+      // confirm; the handshake exchange fills in the device name.
+      console.log(
+        `[MeshEngine] LAN peer ${peerId.slice(0, 12)}... recognized at 'lan' level (autoTrustLAN enabled) — pairing requires user confirmation`,
+      );
+      engine.emit(EVENTS.DEVICE_DETECTED_LAN, {
+        peerId,
+        publicKey: peerId,
+        id: null,
+        name: null,
+      });
     }
   }
 
@@ -448,6 +455,7 @@ function createConnections(engine) {
     setupPeerSignaling: signaling.setupPeerSignaling,
     sendHandshake: signaling.sendHandshake,
     replicateExchange,
+    confirmLanPeer: devices.confirmLanPeer,
     sendPairingChallenges: signaling.sendPairingChallenges,
     handlePeerMessage: signaling.handlePeerMessage,
     // First-chance inbound interceptor, consulted by signaling.js before the

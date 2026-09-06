@@ -186,7 +186,7 @@ class TransferEngine {
   // reconnected). Called by MeshEngine.refreshNetwork() before it rebuilds.
   onNetworkChanged() {
     const paused = []
-    for (const [id, info] of this.runs.entries()) {
+    for (const [, info] of this.runs.entries()) {
       if (info && info.scheduler && typeof info.scheduler.pause === 'function') {
         info.scheduler.pause()
         paused.push(info.scheduler)
@@ -764,7 +764,6 @@ class TransferEngine {
     // same protocol+id is not created within a microtask. The real handlers are
     // attached when the transfer starts (see _runReceiveSync). If the offer is
     // rejected below, the channel is closed again.
-    let syncChan = null
     if ((isSyncOffer || isStreamOffer) && offer.senderPeerId) {
       const peerObj = this.getPeers().get(offer.senderPeerId)
       if (peerObj && peerObj.connection) {
@@ -778,7 +777,6 @@ class TransferEngine {
           onError: (err) => { if (reg.error) reg.error(err) }
         })
         if (chan) {
-          syncChan = chan
           this._syncChannels.set(transferId, { chan, reg })
         }
       }
@@ -2116,7 +2114,7 @@ class TransferEngine {
     }
   }
 
-  async _failOrInterrupt(transfer, err, isInterrupt, { info, bytesWritten }) {
+  async _failOrInterrupt(transfer, err, isInterrupt, { bytesWritten }) {
     this._noteTerminal()
     const id = transfer.id
     const msg = String(err?.message || err)
@@ -2443,6 +2441,118 @@ class TransferEngine {
       return true
     }
     return false
+  }
+
+  // ── Streaming coverage primitives (webdav 206 range gating) ──────────────
+  // Coverage truth is the hypercore bitfield: it survives an engine restart,
+  // while the scheduler's completed Set and the LRU block cache do not — so a
+  // resumed transfer must never be judged "covered" from those.
+  // Byte↔block mapping: manifest block m covers bytes [m*blockSize,
+  // (m+1)*blockSize) and lives at core index m+1 (block 0 is the manifest).
+
+  _streamCoverageInfo(transferId) {
+    const info = this.runs.get(transferId)
+    if (!info) return null
+    const blockSize = info.blockSize || CHUNK_SIZE
+    const record = info.record || {}
+    const fileSize = Number.isFinite(record.fileSize) ? record.fileSize
+      : (info.manifest && Number.isFinite(info.manifest.fileSize) ? info.manifest.fileSize : 0)
+    if (!(blockSize > 0) || !(fileSize > 0)) return null
+    const blockCount = info.blockCount || Math.ceil(fileSize / blockSize)
+    return { info, blockSize, fileSize, blockCount }
+  }
+
+  /**
+   * Highest byte E such that [byteStart, E] is fully covered by verified
+   * blocks, or null when byteStart itself is uncovered. `byteEnd` caps the
+   * scan (callers pass the requested range end); omit it to scan to EOF.
+   * On the sync/stream path (no hypercore) blocks arrive strictly in order,
+   * so coverage is the contiguous prefix [0, receivedBlocks*blockSize).
+   * NOTE: hypercore's has() is async (returns a Promise) — every call must
+   * be awaited or a Promise would be truthy/negated incorrectly and holes
+   * would read as covered.
+   */
+  async coveredThrough(transferId, byteStart, byteEnd = null) {
+    const cov = this._streamCoverageInfo(transferId)
+    if (!cov) return null
+    const { info, blockSize, fileSize } = cov
+    if (!Number.isInteger(byteStart) || byteStart < 0 || byteStart >= fileSize) return null
+    const limit = Number.isInteger(byteEnd) && byteEnd >= byteStart
+      ? Math.min(byteEnd, fileSize - 1)
+      : fileSize - 1
+    const startBlock = Math.floor(byteStart / blockSize)
+    const lastBlock = Math.floor(limit / blockSize)
+
+    if (info.core && typeof info.core.has === 'function') {
+      try {
+        if (!(await info.core.has(startBlock + 1))) return null
+        let b = startBlock
+        while (b < lastBlock && (await info.core.has(b + 2))) b++
+        // The final block may be partial; clamp to the real file size.
+        const coveredEnd = Math.min((b + 1) * blockSize, fileSize) - 1
+        return Math.min(coveredEnd, limit)
+      } catch {
+        return null
+      }
+    }
+
+    // Sync/stream path: sequential in-order receive ⇒ contiguous prefix.
+    const coveredBlocks = info.receivedBlocks || 0
+    if (startBlock >= coveredBlocks) return null
+    const coveredEnd = Math.min(coveredBlocks * blockSize, fileSize) - 1
+    return Math.min(coveredEnd, limit)
+  }
+
+  /**
+   * Resolves with coveredThrough(transferId, byteStart) once covered, or null
+   * after timeoutMs. Polls the bitfield; no LRU/scheduler state involved.
+   */
+  async waitForRange(transferId, byteStart, timeoutMs = 10000) {
+    const deadline = Date.now() + Math.max(0, timeoutMs)
+    let through = await this.coveredThrough(transferId, byteStart)
+    while (through === null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50))
+      through = await this.coveredThrough(transferId, byteStart)
+    }
+    return through
+  }
+
+  /**
+   * Push the blocks spanning [byteStart, byteEnd] onto the scheduler's
+   * explicit priority list (the seek-jump path). Blocks already in the
+   * bitfield are skipped; a scheduler whose completed Set claims a block the
+   * bitfield lacks gets that stale entry dropped and the block re-queued.
+   * Resolves with the number of blocks actually queued.
+   */
+  async prioritizeRange(transferId, byteStart, byteEnd = null) {
+    const cov = this._streamCoverageInfo(transferId)
+    if (!cov) return 0
+    const { info, blockSize, fileSize } = cov
+    const limit = Number.isInteger(byteEnd) && byteEnd >= byteStart
+      ? Math.min(byteEnd, fileSize - 1)
+      : Math.min(fileSize - 1, byteStart + 16 * blockSize - 1)
+    const startBlock = Math.floor(byteStart / blockSize)
+    const lastBlock = Math.floor(limit / blockSize)
+    const scheduler = info.scheduler
+    let queued = 0
+    // Bound the priority queue: a full-file request on a huge transfer must
+    // not enqueue every block ahead of the sequential sweep. (Per call —
+    // repeated requests keep converging via player re-requests.)
+    const MAX_PRIORITY_PER_CALL = 512
+    for (let b = startBlock; b <= lastBlock && queued < MAX_PRIORITY_PER_CALL; b++) {
+      const coreIndex = b + 1
+      let have = false
+      try { have = info.core ? Boolean(await info.core.has(coreIndex)) : false } catch {}
+      if (have) continue
+      if (!scheduler || typeof scheduler.enqueuePriority !== 'function') continue
+      // Stale completed entry (bitfield disagrees): drop it so enqueuePriority
+      // actually re-queues the block instead of silently ignoring it.
+      if (scheduler.completed && scheduler.completed.has(coreIndex)) {
+        scheduler.completed.delete(coreIndex)
+      }
+      if (scheduler.enqueuePriority(coreIndex)) queued++
+    }
+    return queued
   }
 
   async delete(transferId) {
