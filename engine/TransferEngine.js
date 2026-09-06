@@ -1319,6 +1319,27 @@ class TransferEngine {
     return candidate
   }
 
+  // Audit fix #4: displace the live two-way copy into .meshdrop-trash with a
+  // conflict-<relpath>-<devicePrefix>-<ts> name, and drop a .meta.json sidecar
+  // recording the original live path so a crash between the displacement and
+  // the incoming rename is self-healing (SyncEngine._recoverDisplacedTrash).
+  // Returns the trash path; the caller is responsible for restore-on-failure.
+  async _displaceForSync(transfer, destPath) {
+    const { fsp, path } = this
+    const trashDir = path.join(transfer.baseDir || path.dirname(destPath), '.meshdrop-trash')
+    await fsp.mkdir(trashDir, { recursive: true })
+    const rel = transfer.syncRelPath || path.basename(destPath)
+    const safeRel = String(rel).replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80)
+    const trashName = `conflict-${safeRel}-${String(transfer.peerId || 'remote').slice(0, 8)}-${Date.now().toString(36)}`
+    const trashPath = path.join(trashDir, trashName)
+    await fsp.rename(destPath, trashPath)
+    await fsp.writeFile(
+      `${trashPath}.meta.json`,
+      JSON.stringify({ destPath, libraryId: transfer.syncLibraryId || null, transferId: transfer.id, ts: Date.now() })
+    ).catch(() => {})
+    return trashPath
+  }
+
   async _exists(p) {
     try {
       await this.fsp.stat(p)
@@ -2026,23 +2047,51 @@ class TransferEngine {
       //  - push / receive_only (single-owner backup): the owner's copy always
       //    wins, the receiver is a pure sink — replace unconditionally.
       //  - two-way (bidirectional mirror): a differing local file is a
-      //    concurrent-edit conflict. Preserve the local copy in .meshdrop-trash
-      //    BEFORE overwriting so the losing edit is never silently destroyed
-      //    (Last-Write-Wins by completion order, but recoverable).
+      //    concurrent-edit conflict. Displace the local copy into
+      //    .meshdrop-trash BEFORE overwriting so the losing edit is never
+      //    silently destroyed.
+      // Audit fix #4: displacement is RECOVERABLE, not best-effort. The old
+      // code trashed the live file and only then renamed staging into place —
+      // an interruption between the two left the file nowhere (reproduced
+      // twice under connection churn). Order is now:
+      //   1. rename displaced existing → .meshdrop-trash/conflict-<rel>-<ts>
+      //      (a <trashName>.meta.json sidecar records the original live path)
+      //   2. rename staging → final
+      //   3. if (2) fails or throws, the displaced copy is moved BACK.
+      // Only a successful (2) leaves the displaced copy in trash, and the meta
+      // sidecar lets startup recovery heal a crash between (1) and (2).
+      // Guarantee: at every moment the content exists at the live path OR at a
+      // known trash path.
       const syncMode = transfer.syncLibraryId ? this.getSyncMode(transfer.syncLibraryId) : null
       const existing = await fsp.stat(destPath).then(() => true).catch(() => false)
       if (syncMode === 'two-way' && existing) {
+        let displacedPath = null
         try {
-          const trashDir = path.join(transfer.baseDir || path.dirname(destPath), '.meshdrop-trash')
-          await fsp.mkdir(trashDir, { recursive: true })
-          const trashName = `${Date.now().toString(36)}_${path.basename(destPath)}`
-          await fsp.rename(destPath, path.join(trashDir, trashName))
+          displacedPath = await this._displaceForSync(transfer, destPath)
         } catch (err) {
           // Trash move failed (locked file, cross-device) — fall back to the
           // old overwrite rather than failing the whole transfer.
           console.warn('[TransferEngine] two-way conflict trash failed, overwriting:', err.message)
           await fsp.rm(destPath, { force: true }).catch(() => {})
         }
+        try {
+          await fsp.rename(stagingPath, finalPath)
+        } catch (err) {
+          if (displacedPath) {
+            const metaPath = `${displacedPath}.meta.json`
+            try {
+              await fsp.rename(displacedPath, destPath)
+              displacedPath = null
+              await fsp.rm(metaPath, { force: true }).catch(() => {})
+              console.warn('[TransferEngine] incoming rename failed — displaced copy restored to live path:', err.message)
+            } catch (restoreErr) {
+              console.error(`[TransferEngine] incoming rename failed AND restore failed — displaced copy remains at ${displacedPath}: ${restoreErr.message}`)
+            }
+          }
+          throw err
+        }
+        // Incoming rename succeeded: loser stays in trash; drop the restore marker.
+        if (displacedPath) await fsp.rm(`${displacedPath}.meta.json`, { force: true }).catch(() => {})
       } else {
         await fsp.rm(destPath, { force: true }).catch(() => {})
       }

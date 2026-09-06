@@ -7,6 +7,10 @@ const MAX_LIBRARY_FILES = 50000
 const CONFLICT_TOLERANCE_MS = 3000
 const VERIFY_TOLERANCE_MS = 1500
 const DEFAULT_VERIFY_TIMEOUT_MS = 15000
+// Audit fix #9a: .meshdrop-trash entries older than this are purged on engine
+// start and every 24h. Overridable via the settings bee key 'trashRetentionDays'.
+const DEFAULT_TRASH_RETENTION_DAYS = 30
+const TRASH_MAINTENANCE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const MAX_VERIFY_FILES = 4000
 const MAX_CONCURRENT_TRANSFERS = 4
 
@@ -95,6 +99,8 @@ module.exports = {
   CONFLICT_TOLERANCE_MS,
   VERIFY_TOLERANCE_MS,
   DEFAULT_VERIFY_TIMEOUT_MS,
+  DEFAULT_TRASH_RETENTION_DAYS,
+  TRASH_MAINTENANCE_INTERVAL_MS,
   MAX_VERIFY_FILES,
   MAX_CONCURRENT_TRANSFERS,
   IGNORED_NAMES,

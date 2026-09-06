@@ -15,6 +15,8 @@ const {
   MAX_VERIFY_FILES,
   VERIFY_TOLERANCE_MS,
   safeRelPath,
+  DEFAULT_TRASH_RETENTION_DAYS,
+  TRASH_MAINTENANCE_INTERVAL_MS,
   indexToArray,
   indexFromArray
 } = require('./sync/SyncConstants.js')
@@ -71,6 +73,13 @@ class SyncEngine {
     this.timer = setInterval(() => this.tick().catch(() => {}), this.scanIntervalMs)
     if (this.timer && this.timer.unref) this.timer.unref()
     console.log(`[SyncEngine] Initialized with ${this.libraries.size} sync library/libraries`)
+    // Audit fixes #4/#9a: heal crash-interrupted displacements and purge aged
+    // trash at startup, then daily.
+    this._trashMaintenance().catch((err) => {
+      console.warn('[SyncEngine] trash maintenance failed:', err.message)
+    })
+    this._trashTimer = setInterval(() => this._trashMaintenance().catch(() => {}), TRASH_MAINTENANCE_INTERVAL_MS)
+    if (this._trashTimer && this._trashTimer.unref) this._trashTimer.unref()
   }
 
   async stop() {
@@ -78,10 +87,121 @@ class SyncEngine {
       clearInterval(this.timer)
       this.timer = null
     }
+    if (this._trashTimer) {
+      clearInterval(this._trashTimer)
+      this._trashTimer = null
+    }
     for (const lib of this.libraries.values()) {
       this._stopWatching(lib.id)
     }
     this._syncingSet.clear()
+  }
+
+  // ─── Audit fixes #4/#9a: trash recovery & retention ─────────────────────────
+
+  // Two jobs over every library's .meshdrop-trash root (the only MeshDrop-owned
+  // trash locations):
+  //  1. Recovery: a `conflict-…<ts>.meta.json` sidecar with no live file at its
+  //     recorded destPath means a crash raced the two-rename receive (fix #4).
+  //     Move the displaced copy back to the live path. If the live path exists
+  //     (incoming rename won), just drop the stale sidecar.
+  //  2. Retention: delete trash entries (and sidecars) whose mtime is older
+  //     than trashRetentionDays — 30 by default, configurable via the settings
+  //     bee key `trashRetentionDays`. Age is the only rule; names are not
+  //     interpreted beyond the sidecar suffix.
+  async _trashMaintenance() {
+    let retentionDays = DEFAULT_TRASH_RETENTION_DAYS
+    try {
+      const sbee = await this._getBee('settings')
+      const entry = await sbee.get('settings').catch(() => null)
+      const s = entry && entry.value
+      if (s && Number.isFinite(Number(s.trashRetentionDays)) && Number(s.trashRetentionDays) >= 1) {
+        retentionDays = Number(s.trashRetentionDays)
+      }
+    } catch {}
+    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+    let purged = 0
+    let freedBytes = 0
+    let restored = 0
+    for (const lib of this.libraries.values()) {
+      if (!lib.localPath) continue
+      const trashDir = this.path.join(lib.localPath, '.meshdrop-trash')
+      let names = []
+      try {
+        names = await this.fsp.readdir(trashDir)
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        const entryPath = this.path.join(trashDir, name)
+        try {
+          if (name.endsWith('.meta.json')) {
+            // Fix #4 crash recovery marker.
+            const restored1 = await this._recoverDisplaced(trashDir, name)
+            if (restored1) restored++
+            else if (Date.now() - (await this._mtimeOf(entryPath)) > cutoff) {
+              const sz = await this._sizeOf(entryPath)
+              await this.fsp.rm(entryPath, { force: true })
+              purged++
+              freedBytes += sz
+            }
+            continue
+          }
+          const st = await this.fsp.stat(entryPath).catch(() => null)
+          if (!st) continue
+          if (st.mtimeMs < cutoff) {
+            purged++
+            freedBytes += Number(st.size) || 0
+            await this.fsp.rm(entryPath, { force: true, recursive: true })
+          }
+        } catch {}
+      }
+    }
+    if (purged > 0 || restored > 0) {
+      console.log(
+        `[SyncEngine] trash maintenance: purged ${purged} entr(ies) (${(freedBytes / 1024 / 1024).toFixed(1)} MB freed, retention ${retentionDays}d), restored ${restored} displaced file(s)`
+      )
+    }
+  }
+
+  // Audit fix #4: heal one displacement sidecar. Returns true when the
+  // displaced copy was restored to the live path.
+  async _recoverDisplaced(trashDir, metaName) {
+    try {
+      const raw = await this.fsp.readFile(this.path.join(trashDir, metaName), 'utf8')
+      const meta = JSON.parse(raw)
+      if (!meta || !meta.destPath) return false
+      const displacedPath = this.path.join(trashDir, metaName.replace(/\.meta\.json$/, ''))
+      const displacedExists = await this.fsp.stat(displacedPath).then(() => true).catch(() => false)
+      const liveExists = await this.fsp.stat(meta.destPath).then(() => true).catch(() => false)
+      if (liveExists) {
+        // Incoming rename won before the crash — the loser legitimately stays
+        // in trash. Drop the stale marker.
+        await this.fsp.rm(this.path.join(trashDir, metaName), { force: true })
+        return false
+      }
+      if (!displacedExists) {
+        await this.fsp.rm(this.path.join(trashDir, metaName), { force: true })
+        return false
+      }
+      await this.fsp.mkdir(this.path.dirname(meta.destPath), { recursive: true })
+      await this.fsp.rename(displacedPath, meta.destPath)
+      await this.fsp.rm(this.path.join(trashDir, metaName), { force: true })
+      console.warn(`[SyncEngine] recovered displaced file from trash: ${meta.destPath}`)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async _mtimeOf(p) {
+    const st = await this.fsp.stat(p).catch(() => null)
+    return st ? st.mtimeMs : 0
+  }
+
+  async _sizeOf(p) {
+    const st = await this.fsp.stat(p).catch(() => null)
+    return st ? Number(st.size) || 0 : 0
   }
 
   async loadLibraries() {
@@ -830,12 +950,38 @@ class SyncEngine {
     const baseline = useSent ? lib.sentIndex || {} : lib.remoteIndex || {}
 
     // Pure 3-way reconciliation
-    const { toPush, toPull, toDeleteLocal, toDeleteRemote } = Reconciler.reconcile({
+    const { toPush, toPull, toDeleteLocal, toDeleteRemote, conflicts } = Reconciler.reconcile({
       localIndex: lib.index || {},
       baseline,
       remoteIndex: lib.remoteIndex || {},
       mode: lib.mode
     })
+
+    // Audit fix #2: surface concurrent-edit resolutions. The reconciler's
+    // conflicts array was declared but never populated before; each entry is a
+    // within-tolerance edit the deterministic tie-break has now resolved (both
+    // devices converge on the same winner; the loser is preserved in
+    // .meshdrop-trash/conflict-…). Deduped per rel+winner while the conflict
+    // state persists in the indices.
+    if (conflicts && conflicts.length > 0 && lib.mode === 'two-way') {
+      if (!lib._conflictNotified) lib._conflictNotified = new Set()
+      for (const c of conflicts) {
+        const key = `${c.rel}:${c.winner}`
+        if (lib._conflictNotified.has(key)) continue
+        lib._conflictNotified.add(key)
+        this.sendEvent(EVENTS.SYNC_CONFLICT, {
+          id: lib.id,
+          libraryId: lib.id,
+          rel: c.rel,
+          relPath: c.rel,
+          winner: c.winner,
+          localSig: c.localSig,
+          remoteSig: c.remoteSig,
+          ts: c.ts,
+          message: `Conflict resolved on ${c.rel} — both versions kept, ${c.winner === 'local' ? 'your' : 'the remote'} version applied.`
+        })
+      }
+    }
 
     // Fix #1: if remote has files we've never seen, nudge the remote by sending our own index.
     // The remote's handleSyncIndex → _diffAndPush will then push the missing files to us.
@@ -1295,6 +1441,30 @@ class SyncEngine {
       if (!r || !r.deleted) continue
       const local = lib.index && lib.index[rel]
       if (local && !local.deleted) {
+        // Audit fix #5: restore the delete-then-modify guard the fast path used
+        // to bypass (Reconciler's "local edit wins" rule). If the live local
+        // file differs from the last-synced baseline, the peer's tombstone is
+        // honored (our index records the delete so we don't re-offer it) but
+        // the newer local work is NOT destroyed — the reconciler pushes it
+        // back instead. Nothing lands in .meshdrop-trash for a skipped delete.
+        const baseline = await this._deleteBaseline(lib, rel, r)
+        const abs = this.path.join(lib.localPath, rel)
+        const modified = await this._localModifiedSinceBaseline(abs, baseline)
+        if (modified) {
+          console.log(`[SyncEngine] delete-then-modify guard: local copy of "${rel}" differs from last-synced baseline — keeping local, honoring remote tombstone`)
+          lib.index[rel] = { ...local, deleted: true, pendingConflictPush: true }
+          this.sendEvent(EVENTS.SYNC_CONFLICT, {
+            id: lib.id,
+            libraryId: lib.id,
+            rel,
+            winner: 'local',
+            localSig: local.sig || `${local.size}-${local.mtimeMs}`,
+            remoteSig: r.sig || '',
+            ts: Date.now(),
+            message: `Delete/edit conflict on ${rel} — your newer version was kept and will be re-shared.`
+          })
+          continue
+        }
         // Fix #9: pass skipPersist=true — we do a single _persist after the loop
         await this._deleteLocal(lib, rel, { skipPersist: true })
         anyDeleted = true
@@ -1303,6 +1473,36 @@ class SyncEngine {
     // Fix #9: one config persist for the whole batch instead of N
     if (anyDeleted) await this._persist(lib)
   }
+
+  // Audit fix #5: resolve the last-synced baseline for a path — the delivered
+  // snapshot if we received the file, else the peer's pre-delete sig carried
+  // in its tombstone. null means "cannot prove what was last synced".
+  async _deleteBaseline(lib, rel, tombstone) {
+    try {
+      const bee = await this._getBee('sync')
+      const node = await bee.get(`delivered/${lib.id}/${safeRelPath(rel)}`).catch(() => null)
+      const del = node && node.value
+      if (del && del.size > 0) return { size: del.size, mtimeMs: del.mtimeMs }
+    } catch {}
+    if (tombstone && tombstone.sig && typeof tombstone.sig === 'string') {
+      const m = tombstone.sig.match(/^(\d+)-(\d+(?:\.\d+)?)$/)
+      if (m) return { size: Number(m[1]), mtimeMs: Number(m[2]) }
+    }
+    return null
+  }
+
+  // Audit fix #5: compare the live file against a baseline using the Scanner
+  // sig convention (size + mtimeMs) with a small tolerance for filesystem
+  // timestamp rounding. Returns true when the file cannot be proven identical
+  // to the baseline (including "no baseline available").
+  async _localModifiedSinceBaseline(abs, baseline) {
+    if (!baseline || !(baseline.size > 0)) return true
+    const st = await this.fsp.stat(abs).then((s) => s).catch(() => null)
+    if (!st) return false // file already gone — nothing to guard
+    if (Number(st.size) !== Number(baseline.size)) return true
+    return Math.abs(Number(st.mtimeMs) - Number(baseline.mtimeMs)) > VERIFY_TOLERANCE_MS
+  }
+
 
   async handleSyncDelete(peerId, msg) {
     if (!msg || !msg.libraryId) return

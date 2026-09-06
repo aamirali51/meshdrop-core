@@ -57,14 +57,43 @@ class Reconciler {
             toPush.push(rel)
           } else if (remoteEntry.mtimeMs > localEntry.mtimeMs + CONFLICT_TOLERANCE_MS) {
             // Remote is newer -> receiver pulls or waits for remote push
+          } else if ((localEntry.sig || '') === (remoteEntry.sig || '')) {
+            // Same version on both sides (mtime within tolerance but identical
+            // content) — nothing to do.
+          } else {
+            // Audit fix #2: concurrent edit within the mtime tolerance. The old
+            // code resolved to NOTHING here — both devices kept their own
+            // version silently, forever (empirically reproduced: two edits 1ms
+            // apart diverged permanently with no event). Resolve so both sides
+            // converge on the SAME winner: later mtime wins; a tie inside the
+            // tolerance is broken by the lexicographically greater authorKey —
+            // a pure function of the two index entries, so each side computes
+            // the same verdict independently. The loser's copy is displaced to
+            // .meshdrop-trash/conflict-… by the receiver's two-way receive
+            // path (TransferEngine._displaceForSync — recoverable).
+            const localTiebreak = `${localEntry.mtimeMs}|${localEntry.authorKey || ''}`
+            const remoteTiebreak = `${remoteEntry.mtimeMs}|${remoteEntry.authorKey || ''}`
+            const localWins = localTiebreak >= remoteTiebreak
+            if (localWins) toPush.push(rel)
+            conflicts.push({
+              rel,
+              winner: localWins ? 'local' : 'remote',
+              localSig: localEntry.sig || `${localEntry.size || 0}-${localEntry.mtimeMs || 0}`,
+              remoteSig: remoteEntry.sig || `${remoteEntry.size || 0}-${remoteEntry.mtimeMs || 0}`,
+              ts: Date.now()
+            })
           }
         } else if (remoteEntry.deleted) {
-          // Remote marked deleted
-          if (remoteEntry.mtimeMs >= localEntry.mtimeMs - CONFLICT_TOLERANCE_MS || (baseEntry && baseEntry.sig === localEntry.sig)) {
-            // Remote deletion is current -> apply delete locally
+          // Remote marked deleted. Audit fix #5: a tombstone may only destroy
+          // the local copy when the local file is UNCHANGED since the last
+          // sync (sig still matches the baseline's pre-delete sig). Mtime
+          // comparison cannot prove that — an edit made before the peer's
+          // delete but learned about later must survive and be pushed back.
+          if (baseEntry && baseEntry.sig === localEntry.sig) {
+            // Local unchanged since last sync -> pure remote-intent delete.
             toDeleteLocal.push(rel)
           } else {
-            // Local was modified strictly after remote deletion -> local edit wins
+            // Local differs from baseline (or no baseline) -> local edit wins.
             toPush.push(rel)
           }
         }
