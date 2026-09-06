@@ -1345,16 +1345,15 @@ class SyncEngine {
     if (!lib || lib.mode !== 'two-way') return
 
     const incoming = indexFromArray(msg.entries)
-    const merged = { ...(lib.remoteIndex || {}), ...incoming }
-
-    // Fix #4: prune stale deleted entries the remote no longer advertises.
-    // If a key is deleted=true in the merged map but the remote's fresh index doesn't mention it
-    // at all, the remote has already GC'd it — remove it so we don't re-delete a local file.
-    for (const rel of Object.keys(merged)) {
-      if (merged[rel] && merged[rel].deleted && incoming[rel] === undefined) {
-        delete merged[rel]
-      }
-    }
+    // Correctness fix (churn heal): the wire contract is that SYNC_INDEX
+    // carries the sender's FULL index (indexToArray). The old merge
+    // ({...remote, ...incoming}) preserved stale entries the remote no longer
+    // advertises — e.g. an optimistic baseline for a push killed mid-transfer —
+    // which made the heal pass a no-op: the sender believed the receiver still
+    // held files it had lost and never re-pushed them. Authoritative replace:
+    // the remote's index is the whole truth about the remote. (Subsumes the
+    // old deleted-entry prune below, which only handled the deleted case.)
+    const merged = { ...incoming }
 
     if (JSON.stringify(merged) !== JSON.stringify(lib.remoteIndex)) {
       lib.remoteIndex = merged
