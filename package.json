@@ -30,6 +30,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "blind-relay": "^1.6.1",
     "compact-encoding": "^3.0.0",
     "corestore": "^7.9.1",
     "hyperbee": "^2.27.3",
