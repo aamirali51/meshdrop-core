@@ -226,22 +226,24 @@ function createConnections(engine) {
       connection,
       ctx.swarm && ctx.swarm.dht,
     );
-    // Honest label: track the relay key actually dialed per connection attempt;
-    // label "relayed via <device>" ONLY when that key is a paired peer. Never guess.
+    // Honest label (C.2): per-peer attempt tracking — the relay key for THIS
+    // peerId is stored on its pending entry by the relayThrough picker.
+    // Label "relayed via <device>" ONLY when that key is a paired peer. Never guess.
     let relayedViaOwnPeer = false;
     let relayedViaPeerKey = null;
     try {
-      if (relayed && engine && engine._lastRelayAttemptKey) {
-        const k = engine._lastRelayAttemptKey
-        const isOwn = engine._lastRelayAttemptIsOwnPeer === true
-        // Only label as via own peer if the attempted relay key is actually a paired peer.
-        if (isOwn && engine.peers && engine.peers.has(k)) {
+      if (relayed) {
+        const pending = engine._pendingRelayByPeer && engine._pendingRelayByPeer.get(peerId)
+        const k = pending ? pending.key : (engine._pendingRelayKey || null)
+        const isOwn = pending ? !!pending.isOwn : (engine._pendingRelayIsOwn === true)
+        if (k && isOwn && engine.peers && engine.peers.has(k)) {
           relayedViaOwnPeer = true
           relayedViaPeerKey = k
         } else {
           relayedViaOwnPeer = false
           relayedViaPeerKey = null
         }
+        if (pending && engine._pendingRelayByPeer) engine._pendingRelayByPeer.delete(peerId)
       }
     } catch {}
 

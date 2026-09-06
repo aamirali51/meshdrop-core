@@ -196,6 +196,9 @@ class MeshEngine extends EventEmitter {
     this.isMobileRuntime = isMobileRuntime
     this.relayForPairedDevices = isMobileRuntime ? false : (config.relayForPairedDevices !== false)
     this._relayManager = null
+    this._pendingRelayByPeer = new Map() // peerId -> { key, isOwn } — per-peer attempt tracking (C.2)
+    this._pendingRelayKey = null // fallback for pre-peerInfo picker gap
+    this._pendingRelayIsOwn = false
 
     this.started = false
 
@@ -255,26 +258,30 @@ class MeshEngine extends EventEmitter {
   // Build a fresh Hyperswarm around the persistent noise keypair. Used at
   // boot and again by refreshNetwork() — the relay picker must be re-created
   // with the swarm because it binds to the new DHT node at call time.
-  // Honest label: track the relay key actually dialed per attempt so
-  // onConnection can label "relayed via <device>" ONLY when that key is a
-  // paired peer, never guess.
+  // Per-peer relay attempt tracking (C.2): the attempt's relay key is stored
+  // on the originating peer's map entry so concurrent connects don't race a
+  // single engine field. The honest label in onConnection reads back the
+  // attempt that belongs to that peerId.
   _createSwarm() {
     return new Hyperswarm({
       keyPair: this.noiseKeyPair,
       relayThrough: (force, s) => {
+        // Hyperswarm calls relayThrough before peerInfo exists; the per-peer
+        // slot is set after peerInfo is known. For the common path we still
+        // need a global to bridge the gap — but onConnection prefers per-peer.
         const own = pickOwnPeerRelay(this)
         if (own) {
-          this._lastRelayAttemptKey = own
-          this._lastRelayAttemptIsOwnPeer = true
+          this._pendingRelayKey = own
+          this._pendingRelayIsOwn = true
           return own
         }
         const fallback = pickRelayNode(s.dht)
         if (fallback) {
-          this._lastRelayAttemptKey = fallback
-          this._lastRelayAttemptIsOwnPeer = false
+          this._pendingRelayKey = fallback
+          this._pendingRelayIsOwn = false
         } else {
-          this._lastRelayAttemptKey = null
-          this._lastRelayAttemptIsOwnPeer = false
+          this._pendingRelayKey = null
+          this._pendingRelayIsOwn = false
         }
         return fallback
       }

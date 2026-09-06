@@ -3,6 +3,7 @@
 const BlindRelay = require('blind-relay')
 
 const MAX_RELAY_SESSIONS = 8
+const UNPAIRED_IDLE_TIMEOUT_MS = 10 * 1000
 
 class BlindRelayManager {
   constructor(engine) {
@@ -10,12 +11,12 @@ class BlindRelayManager {
     this.relay = null
     this.dhtServer = null
     this.enabled = false
-    this.sessions = new Map()
+    this.sessions = new Map() // id -> { remoteKey, start, bytes, session, paired, idleTimer }
     this._sessionCounter = 0
   }
 
   isRunning() {
-    return this.enabled && (!!this.dhtServer || !!this._onSwarmConnection)
+    return this.enabled && !!this._onSwarmConnection
   }
 
   getStats() {
@@ -28,7 +29,7 @@ class BlindRelayManager {
       const remote = info.remoteKey || 'unknown'
       const device = this._resolveDeviceName(remote)
       const label = device ? `Relaying for ${device}` : 'unknown peer'
-      list.push({ id, remoteKey: remote, remotePrefix: remote.slice(0, 12), deviceName: device || null, label, durationMs: Date.now() - info.start, bytes: info.bytes })
+      list.push({ id, remoteKey: remote, remotePrefix: remote.slice(0, 12), deviceName: device || null, label, durationMs: Date.now() - info.start, bytes: info.bytes, paired: !!info.paired })
     }
     return { active, serverActive, pairings, sessions: list, maxSessions: MAX_RELAY_SESSIONS, running: this.isRunning() }
   }
@@ -41,6 +42,14 @@ class BlindRelayManager {
       }
       return null
     } catch { return null }
+  }
+
+  _isPairedPeerKey(hex) {
+    if (!hex || hex === 'unknown' || hex.length !== 64) return false
+    try {
+      const peerObj = this.engine.peers.get(hex)
+      return !!(peerObj && peerObj.device && peerObj.device.isTrusted)
+    } catch { return false }
   }
 
   async start() {
@@ -58,53 +67,102 @@ class BlindRelayManager {
 
     this.enabled = true
 
-    let useSharedPath = false
-    try {
-      this.dhtServer = dht.createServer((socket) => this._handleRelaySocket(socket))
-      await this.dhtServer.listen(this.engine.swarm.keyPair)
-      console.log(`[BlindRelay] Relay server listening on ${this.engine.swarm.keyPair.publicKey.toString('hex').slice(0, 12)}... (dedicated HyperDHT server)`)
-    } catch (err) {
-      if (/KEYPAIR_ALREADY_USED|ALREADY_LISTENING/i.test(String(err.message))) {
-        useSharedPath = true
-        this.dhtServer = null
-        console.log('[BlindRelay] Relay sharing swarm server (single DHT key) — attaching to swarm connections')
-      } else {
-        console.warn('[BlindRelay] Failed to start dedicated relay server:', err.message)
-        useSharedPath = true
-      }
-    }
-
-    if (useSharedPath) {
-      this._onSwarmConnection = (socket) => this._handleRelaySocket(socket)
-      this.engine.swarm.on('connection', this._onSwarmConnection)
-      this.dhtServer = { _shared: true, close: async () => { try { this.engine.swarm.off('connection', this._onSwarmConnection) } catch {} } }
-    }
+    // The swarm always owns the keyPair by construction (Hyperswarm creates a
+    // HyperDHT server on the keyPair at construction). Trying a dedicated
+    // dht.createServer on that key will always throw KEYPAIR_ALREADY_USED,
+    // so we go straight to the live path: share the swarm's single DHT key.
+    this._onSwarmConnection = (socket) => this._handleRelaySocket(socket)
+    this.engine.swarm.on('connection', this._onSwarmConnection)
+    this.dhtServer = { _shared: true, close: async () => { try { this.engine.swarm.off('connection', this._onSwarmConnection) } catch {} } }
+    console.log('[BlindRelay] Relay sharing swarm server (single DHT key) — attaching to swarm connections')
 
     console.log('[BlindRelay] Relay for paired devices ENABLED (cap 8 sessions)')
   }
 
   _handleRelaySocket(socket) {
     if (!this.enabled || !this.relay) return
-    const active = this.relay.stats.sessions.active
-    if (active >= MAX_RELAY_SESSIONS) {
-      const remote = socket.remotePublicKey ? Buffer.from(socket.remotePublicKey).toString('hex').slice(0, 12) : 'unknown'
-      console.warn(`[BlindRelay] Session cap reached (${active}/${MAX_RELAY_SESSIONS}) — rejecting relay socket from ${remote}...`)
-      try { socket.destroy() } catch {}
-      return
-    }
     const remoteHex = socket.remotePublicKey ? Buffer.from(socket.remotePublicKey).toString('hex') : 'unknown'
+    const isPaired = this._isPairedPeerKey(remoteHex)
+    const active = this.relay.stats.sessions.active
+
+    if (active >= MAX_RELAY_SESSIONS) {
+      if (isPaired) {
+        // Paired preemption: cap is full, but this is a paired device — destroy
+        // the oldest unknown-peer session to admit it. Prevents strangers from
+        // starving paired devices.
+        let victimId = null
+        let victimStart = Infinity
+        for (const [id, info] of this.sessions.entries()) {
+          if (!info.paired && info.start < victimStart) {
+            victimId = id
+            victimStart = info.start
+          }
+        }
+        if (victimId) {
+          const victim = this.sessions.get(victimId)
+          console.warn(`[BlindRelay] Cap full (8/8) — evicting oldest unknown peer ${victim.remoteKey.slice(0, 12)}... to admit paired ${remoteHex.slice(0, 12)}...`)
+          try { victim.session.destroy() } catch {}
+          try { if (victim.idleTimer) clearTimeout(victim.idleTimer) } catch {}
+          this.sessions.delete(victimId)
+        } else {
+          const remote = remoteHex.slice(0, 12)
+          console.warn(`[BlindRelay] Session cap reached (8/8) — rejecting relay socket from ${remote}... (all sessions are paired)`)
+          try { socket.destroy() } catch {}
+          return
+        }
+      } else {
+        const remote = remoteHex.slice(0, 12)
+        console.warn(`[BlindRelay] Session cap reached (8/8) — rejecting relay socket from ${remote}...`)
+        try { socket.destroy() } catch {}
+        return
+      }
+    }
+
     const remotePrefix = remoteHex.slice(0, 12)
     const start = Date.now()
     const id = `${remotePrefix}-${++this._sessionCounter}`
-    console.log(`[BlindRelay] Relay session accepted from ${remotePrefix}... (active ${active + 1}/${MAX_RELAY_SESSIONS})`)
+    console.log(`[BlindRelay] Relay session accepted from ${remotePrefix}... (active pending cap check, paired=${isPaired})`)
 
     const session = this.relay.accept(socket, { id: socket.remotePublicKey })
 
-    this.sessions.set(id, { remoteKey: remoteHex, start, bytes: 0, session })
+    const info = { remoteKey: remoteHex, start, bytes: 0, session, paired: isPaired, idleTimer: null }
+    this.sessions.set(id, info)
+
+    const clearIdle = () => { if (info.idleTimer) { clearTimeout(info.idleTimer); info.idleTimer = null } }
+
+    // Idle/unpaired guard: a relay socket that hasn't completed its token pair
+    // within UNPAIRED_IDLE_TIMEOUT_MS is destroyed (strangers cannot idle-hold
+    // slots). Paired peers clear the timer on pair.
+    if (!isPaired) {
+      info.idleTimer = setTimeout(() => {
+        if (!this.sessions.has(id)) return
+        // If still unpaired (no links, no pairing activity), destroy
+        try {
+          const hasLinks = session._links && session._links.size > 0
+          const hasPairing = session._pairing && session._pairing.size > 0
+          if (!hasLinks && !hasPairing) {
+            console.warn(`[BlindRelay] Idle unpaired session ${remotePrefix}... timed out (${UNPAIRED_IDLE_TIMEOUT_MS}ms) — destroying`)
+            try { session.destroy() } catch {}
+            try { socket.destroy() } catch {}
+            this.sessions.delete(id)
+          }
+        } catch {}
+      }, UNPAIRED_IDLE_TIMEOUT_MS)
+      if (info.idleTimer.unref) info.idleTimer.unref()
+    }
+
+    const onPair = () => {
+      // Token pair completed — this session is now active relay, cancel idle timer
+      clearIdle()
+      info.paired = true
+    }
+    // Blind-relay emits 'pair' on successful token match — use to clear idle guard
+    session.on('pair', onPair)
 
     const onClose = () => {
-      const info = this.sessions.get(id)
-      if (!info) return
+      clearIdle()
+      session.off('pair', onPair)
+      if (!this.sessions.has(id)) return
       const duration = Date.now() - info.start
       const devName = this._resolveDeviceName(info.remoteKey)
       const label = devName ? `Relaying for ${devName}` : 'unknown peer'
@@ -116,13 +174,21 @@ class BlindRelayManager {
       console.warn(`[BlindRelay] Relay session error ${remotePrefix}...:`, err.message)
     })
 
+    // Shared-path idle heuristic: if this socket never sends a blind-relay pair,
+    // it is a normal peer connection — remove from relay accounting after 3s
+    // (but the idle guard above already covers unpaired strangers; this is for
+    // normal peers that just look like relay sessions at first).
     setTimeout(() => {
-      const info = this.sessions.get(id)
-      if (!info) return
+      if (!this.sessions.has(id)) return
       try {
         if (session._pairing && session._pairing.size === 0 && session._links && session._links.size === 0) {
-          this.sessions.delete(id)
-          session.removeListener('close', onClose)
+          if (!info.paired) {
+            // Normal peer, not a relay client — stop counting it
+            this.sessions.delete(id)
+            clearIdle()
+            session.removeListener('close', onClose)
+            session.off('pair', onPair)
+          }
         }
       } catch {}
     }, 3000).unref?.()
@@ -133,15 +199,12 @@ class BlindRelayManager {
     this.enabled = false
     console.log('[BlindRelay] Relay for paired devices DISABLING — closing server + sockets')
     for (const [, info] of this.sessions.entries()) {
+      try { if (info.idleTimer) clearTimeout(info.idleTimer) } catch {}
       try { info.session.destroy() } catch {}
     }
     this.sessions.clear()
     if (this.dhtServer) {
-      if (this.dhtServer._shared) {
-        try { this.engine.swarm.off('connection', this._onSwarmConnection) } catch {}
-      } else {
-        try { await this.dhtServer.close() } catch {}
-      }
+      try { this.engine.swarm.off('connection', this._onSwarmConnection) } catch {}
       this.dhtServer = null
     }
     this._onSwarmConnection = null
@@ -153,4 +216,4 @@ class BlindRelayManager {
   }
 }
 
-module.exports = { BlindRelayManager, MAX_RELAY_SESSIONS }
+module.exports = { BlindRelayManager, MAX_RELAY_SESSIONS, UNPAIRED_IDLE_TIMEOUT_MS }
