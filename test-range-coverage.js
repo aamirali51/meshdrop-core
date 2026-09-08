@@ -119,7 +119,7 @@ function request(port, range) {
       host: '127.0.0.1',
       port,
       path: `/stream/transfer?id=${ID}&path=${encodeURIComponent(stagedPath)}`,
-      headers: range ? { Range: range } : {}
+      headers: Object.assign({ 'X-MeshDrop-Token': webdav.getWebDAVToken() }, range ? { Range: range } : {})
     }, (res) => {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
@@ -277,8 +277,10 @@ async function main() {
 
   // ── 6. REAL hypercore regression: async has() semantics + core.clear hole ─
   // The fake above is promise-based to mirror this, but this section pins the
-  // behavior to the actual installed hypercore permanently.
-  const Hypercore = require('../meshdrop-app/node_modules/hypercore')
+  // behavior to the actual installed hypercore permanently. Resolves from the
+  // core tree itself (meshdrop-core/node_modules) — this package used to reach
+  // into ../meshdrop-app/node_modules, which the app no longer ships.
+  const Hypercore = require('hypercore')
   const realDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meshdrop-realcore-'))
   const realCore = new Hypercore(realDir)
   await realCore.ready()

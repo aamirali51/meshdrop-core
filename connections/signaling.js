@@ -77,6 +77,8 @@ function createSignaling(ctx) {
             // allowlist is the auth, and a pairing challenge would arm the
             // watchdog and kill the session.
             console.log(`[MeshEngine] Skipping pairing challenge for site-session peer ${peerId.slice(0, 12)}...`)
+          } else if (engine && typeof engine.isTunnelCodePeer === 'function' && engine.isTunnelCodePeer(peerId)) {
+            console.log(`[MeshEngine] Skipping pairing challenge for tunnel-code peer ${peerId.slice(0, 12)}...`)
           } else {
             sendPairingChallenges(peerId)
           }
@@ -132,11 +134,14 @@ function createSignaling(ctx) {
     // Retry sending handshake/challenges after open tick to handle async channel ready states
     const isSitePeer = (peerId) =>
       engine && typeof engine.isSiteSessionPeer === 'function' && engine.isSiteSessionPeer(peerId)
+    const isTunnelPeer = (peerId) =>
+      engine && typeof engine.isTunnelCodePeer === 'function' && engine.isTunnelCodePeer(peerId)
     const maybeSendHandshakeOrChallenges = (peerId) => {
       const peerObj = peers.get(peerId)
       if (!peerObj || !peerObj.pairing) return
       if (peerObj.pairing.trusted || peerObj.pairing.mode === 'lan') sendHandshake(peerId)
       else if (isSitePeer(peerId)) return // site session — no auto pairing challenges
+      else if (isTunnelPeer(peerId)) return // tunnel code session — allowlist/code auth, not pairing
       else sendPairingChallenges(peerId)
     }
     setTimeout(() => maybeSendHandshakeOrChallenges(peerId), 150)
@@ -335,6 +340,47 @@ function createSignaling(ctx) {
       } catch {}
       engine.emit(EVENTS.TRUST_REVOKED, { publicKey: hostId })
       engine.emit(EVENTS.DEVICE_REMOVED, { peerId: hostId, deviceId: msg.deviceId || null })
+    } else if (msg.type === MESSAGES.DEVICE_UPDATED) {
+      // A connected peer renamed a device identity. If we store a row for the
+      // same identity (we paired with it too) adopt the canonical name —
+      // customName otherwise survives reconnects unchanged, so this stays in
+      // sync with the renaming machine's row. When no row exists here (the
+      // renamed device itself is the common case) just surface the event.
+      const upDeviceId = msg.deviceId
+      const upName = msg.customName || msg.name || ''
+      if (upDeviceId && upName) {
+        try {
+          engine.getBee('devices').then(async (bee) => {
+            try {
+              const row = await bee.get(upDeviceId).catch(() => null)
+              if (row && row.value && (row.value.customName || '') !== upName) {
+                // We store this identity too (paired with it): adopt the
+                // canonical name like the renaming machine did.
+                const prev = row.value
+                const adopted = {
+                  ...prev,
+                  name: upName,
+                  customName: upName,
+                  lastReportedName: prev.lastReportedName || prev.name || ''
+                }
+                await bee.put(upDeviceId, adopted)
+                engine.emit(EVENTS.DEVICE_UPDATED, { id: upDeviceId, ...adopted, renamedBy: peerId })
+              } else {
+                // No row here, or it already carries that name — the renamed
+                // device itself is the common case. Still surface the event so
+                // the renderer refreshes; nothing is stored, nothing loops.
+                engine.emit(EVENTS.DEVICE_UPDATED, {
+                  id: upDeviceId,
+                  publicKey: msg.publicKey || null,
+                  name: upName,
+                  customName: msg.customName || '',
+                  renamedBy: peerId
+                })
+              }
+            } catch {}
+          }).catch(() => {})
+        } catch {}
+      }
     } else if (msg.type === MESSAGES.TRANSFER_OFFER) {
       const peerObj = peers.get(peerId)
       // Only accept file offers from authenticated (trusted) peers. One-time
@@ -441,6 +487,8 @@ function createSignaling(ctx) {
       engine.getBee('visitedSites').then((bee) => bee.put(msg.siteId || msg.code, inv)).catch(() => {})
       if (engine.notificationStore) engine.notificationStore.addNotification('Shared Folder Received', `"${msg.name || 'A folder'}" shared with you · code ${msg.code || ''}`, 'info')
       engine.emit(EVENTS.SITE_INVITE_RECEIVED || 'site:invite:received', inv)
+    } else if (msg.type?.startsWith?.('TUNNEL_')) {
+      if (engine.tunnelManager) engine.tunnelManager.handleMessage(peerId, msg)
     } else if (msg.type?.startsWith?.('SITE_')) {
       if (ctx.refs.handleSiteMessage) {
         ctx.refs.handleSiteMessage(peerId, msg)

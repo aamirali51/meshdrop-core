@@ -10,7 +10,7 @@
 const { EventEmitter, path, os, fs, fsp } = require('./compat.js')
 const Hyperswarm = require('hyperswarm')
 
-const { EVENTS, MESSAGES, pairingTopic } = require('./protocol.js')
+const { EVENTS, MESSAGES, pairingTopic, TOPIC_PREFIXES } = require('./protocol.js')
 const { generateDropCode, normalizeDropCode } = require('./crypto.js')
 const { TrustManager } = require('./engine/TrustManager.js')
 const { BlindRelayManager } = require('./engine/BlindRelayManager.js')
@@ -19,6 +19,7 @@ const { SyncEngine } = require('./engine/SyncEngine.js')
 const { WatchPartyManager, PARTY_EVENTS } = require('./engine/WatchPartyManager.js')
 const { SiteManager } = require('./engine/SiteManager.js')
 const { SiteServer } = require('./engine/SiteServer.js')
+const { TunnelManager } = require('./engine/TunnelManager.js')
 const MetricsCollector = require('./engine/MetricsCollector.js')
 const TopicRegistry = require('./engine/TopicRegistry.js')
 const NotificationStore = require('./engine/NotificationStore.js')
@@ -206,6 +207,7 @@ class MeshEngine extends EventEmitter {
 
     // Mutable engine state (mirrors the old worker's shared `ctx`)
     this.peers = new Map() // peerId (noise pubkey hex) -> { connection, device, signaling, transferMethod, pairing }
+    this.peerTopics = new Map() // peerId -> Set<topic label> — per-connection topic attribution (populated/removed by connections/index.js)
     this.activeClaims = new Set() // drop codes currently being claimed
     this.activeClaimOptions = new Map() // drop code -> options ({ interactive: true })
     this.interactiveClaims = config.interactiveClaims === true
@@ -225,6 +227,7 @@ class MeshEngine extends EventEmitter {
     this.siteManager = null
     this.siteServer = null
     this.siteVisitor = null
+    this.tunnelManager = null
     this.expirationTimer = null
     // Presence bookkeeping. This engine's own identity id (filled at
     // start() from storage.setDeviceInfo) so stop() can mark devices we
@@ -514,6 +517,7 @@ class MeshEngine extends EventEmitter {
       getDeviceIdentity: () => this.storage.getDeviceIdentity(),
       getPeerId: () => this.peerId,
       isSiteSessionPeer: (peerId) => this.isSiteSessionPeer(peerId),
+      isTunnelCodePeer: (peerId) => this.isTunnelCodePeer(peerId),
       onTrustGranted: (peerId, code) => {
         const peerObj = this.peers.get(peerId)
         if (peerObj && peerObj.pairing) peerObj.pairing.code = code
@@ -719,6 +723,12 @@ class MeshEngine extends EventEmitter {
     this.siteServer = new SiteServer({ engine: this })
     const SiteVisitorCtor = require('./engine/SiteVisitor.js').SiteVisitor
     this.siteVisitor = new SiteVisitorCtor({ engine: this })
+    this.tunnelManager = new TunnelManager({ engine: this })
+    // Re-emit tunnel events on the engine so app/ipc can listen in one place
+    this.tunnelManager.on('tunnel:offer', (d) => this.emit(EVENTS.TUNNEL_OFFER, d))
+    this.tunnelManager.on('tunnel:opened', (d) => this.emit(EVENTS.TUNNEL_OPENED, d))
+    this.tunnelManager.on('tunnel:closed', (d) => this.emit(EVENTS.TUNNEL_CLOSED, d))
+    this.tunnelManager.on('tunnel:error', (d) => this.emit(EVENTS.TUNNEL_ERROR, d))
     this.connections.refs.handleSiteMessage = (peerId, msg) => {
       // SITE_VERIFY_CHALLENGE (a host verifying a visitor's code for an
       // allowlist) is answered here by the visitor — a pure capability proof,
@@ -862,6 +872,8 @@ class MeshEngine extends EventEmitter {
     // ("already added folder won't open after restart").
     await this.restorePublishedSites()
 
+    if (this.tunnelManager) await this.tunnelManager.restoreTunnelCodes().catch(()=>{})
+
     this.expirationTimer = setInterval(() => this.checkPendingExpirations(), EXPIRATION_INTERVAL_MS)
     if (this.expirationTimer.unref) this.expirationTimer.unref()
 
@@ -914,6 +926,9 @@ class MeshEngine extends EventEmitter {
     }
     if (this.siteVisitor && typeof this.siteVisitor.stop === 'function') {
       await this.siteVisitor.stop()
+    }
+    if (this.tunnelManager && typeof this.tunnelManager.stop === 'function') {
+      await this.tunnelManager.stop()
     }
     if (this.syncEngine) await this.syncEngine.stop()
     if (this.transferEngine) await this.transferEngine.shutdown()
@@ -1487,6 +1502,26 @@ class MeshEngine extends EventEmitter {
       }
     }
 
+    // Renaming is a mesh-wide canonical-name change for that device identity:
+    // tell every connected peer so their stored row for the same identity
+    // (keyed by the same stable id/publicKey) adopts the new name. Peers that
+    // never met the device no-op on receipt; the renamed device itself emits
+    // the frame without storing (it has no row for itself). No rebroadcast on
+    // the receiving side, so this cannot loop.
+    for (const [, peerObj] of this.peers.entries()) {
+      if (!peerObj.signaling) continue
+      try {
+        peerObj.signaling.send({
+          type: MESSAGES.DEVICE_UPDATED,
+          deviceId: id,
+          publicKey: updated.publicKey || null,
+          name: cleanName,
+          customName: cleanName,
+          lastReportedName: prevReported
+        })
+      } catch {}
+    }
+
     this.emit(EVENTS.DEVICE_UPDATED, updated)
     return updated
   }
@@ -1807,6 +1842,13 @@ class MeshEngine extends EventEmitter {
       if (share.code) {
         try {
           this.topicRegistry.leave(`p2p-file-${share.code}`)
+        } catch {}
+      }
+      // Expiry is host-side truth discovered by a sweep (timer or listing) —
+      // surface it so the UI can react without polling.
+      if (newStatus === 'expired') {
+        try {
+          this.emit(EVENTS.PENDING_SHARE_EXPIRED, { ...share })
         } catch {}
       }
       return share
@@ -2600,7 +2642,73 @@ class MeshEngine extends EventEmitter {
         if (v.hostPeerId === peerId) return true
       }
     }
+    // Tunnel peers are always paired (Tier 1 is paired-only) — no pairing suppression needed,
+    // but returning false keeps the trust path explicit.
     return false
+  }
+
+  // True only when THIS connection's topic attribution says the peer is on a
+  // tunnel-code topic (p2p-tunnel-<code>). Attribution comes from peerInfo
+  // topics at connection time (connections/index.js) plus the code-protocol
+  // handshakes TunnelManager observes (CLAIM/OFFER) — never from existence of
+  // shares/joins, so unrelated peers on other topics pair normally while a
+  // code is live. Labels are removed when the connection closes.
+  isTunnelCodePeer(peerId) {
+    if (!peerId) return false
+    const labels = this.peerTopics && this.peerTopics.get(peerId)
+    if (!labels || labels.size === 0) return false
+    for (const label of labels) {
+      if (label && label.startsWith(TOPIC_PREFIXES.TUNNEL)) return true
+    }
+    return false
+  }
+
+  // ─── Tunnel (Holesail-style) ──────────────────────────────────────────
+  // Tier1 paired TCP/UDP + Tier2 ephemeral code (TUNNEL-XXXX) — both stream over
+  // noise-encrypted HyperDHT connections via meshdrop-tunnel-v1 (same relay/LAN
+  // path as the rest of the mesh). Tier2 codes are like DROP-XXXX: one-time
+  // capability, DHT topic p2p-tunnel-<code>, no pairing required.
+  async createTunnel(params) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.createTunnel(params)
+  }
+
+  async acceptTunnel(tunnelId, opts) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.acceptTunnel(tunnelId, opts || {})
+  }
+
+  async rejectTunnel(tunnelId, reason) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.rejectTunnel(tunnelId, reason)
+  }
+
+  async closeTunnel(tunnelId, reason) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.closeTunnel(tunnelId, reason)
+  }
+
+  // Tier2: host a port behind a one-time code, and join via code (no pairing)
+  async createTunnelCode(params) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.createTunnelCode(params)
+  }
+  async joinTunnelCode(code) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.joinTunnelCode(code)
+  }
+  async cancelTunnelCode(codeOrId) {
+    if (!this.tunnelManager) throw new Error('TunnelManager not initialized')
+    return this.tunnelManager.cancelTunnelCode(codeOrId)
+  }
+  listTunnelCodes() {
+    if (!this.tunnelManager) return []
+    return this.tunnelManager.listTunnelCodes()
+  }
+
+  listTunnels() {
+    if (!this.tunnelManager) return []
+    return this.tunnelManager.listTunnels()
   }
 }
 

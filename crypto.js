@@ -134,6 +134,27 @@ function normalizeDropCode(raw) {
   return isGroup ? `DROP-GRP-${body}` : `DROP-${body}`
 }
 
+const TUNNEL_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const TUNNEL_GROUP_SIZE = 4
+const TUNNEL_GROUPS = 2
+const TUNNEL_LENGTH = TUNNEL_GROUPS * TUNNEL_GROUP_SIZE
+
+function generateTunnelCode(){
+  const bytes = randomBytes(TUNNEL_LENGTH)
+  let code=''
+  for(let i=0;i<TUNNEL_LENGTH;i++) code+=TUNNEL_ALPHABET[bytes[i]%32]
+  const body=code.slice(0,TUNNEL_GROUP_SIZE)+'-'+code.slice(TUNNEL_GROUP_SIZE)
+  return `TUNNEL-${body}`
+}
+function normalizeTunnelCode(raw){
+  if(typeof raw!=='string') return null
+  let clean=raw.trim().toUpperCase().replace(/[^A-Z0-9]/g,'')
+  if(clean.startsWith('TUNNEL')) clean=clean.slice(6)
+  if(clean.length!==TUNNEL_LENGTH) return null
+  const body=clean.slice(0,TUNNEL_GROUP_SIZE)+'-'+clean.slice(TUNNEL_GROUP_SIZE)
+  return `TUNNEL-${body}`
+}
+
 module.exports = {
   randomBytes,
   mac,
@@ -149,5 +170,9 @@ module.exports = {
   generateDropCode,
   normalizeDropCode,
   DROP_ALPHABET,
-  DROP_LENGTH
+  DROP_LENGTH,
+  generateTunnelCode,
+  normalizeTunnelCode,
+  TUNNEL_ALPHABET,
+  TUNNEL_LENGTH
 }

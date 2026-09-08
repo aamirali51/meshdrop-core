@@ -35,7 +35,8 @@ class TrustManager {
     onTrustGranted,
     getDeviceIdentity,
     getPeerId,
-    isSiteSessionPeer
+    isSiteSessionPeer,
+    isTunnelCodePeer
   }) {
     this.getBee = getBee
     this.computeTopicHash = computeTopicHash
@@ -50,6 +51,7 @@ class TrustManager {
     this.getPeerId = getPeerId || (() => '')
     this.engine = null // wired to the owning MeshEngine after construction
     this.isSiteSessionPeer = isSiteSessionPeer || (() => false) // () => bool
+    this.isTunnelCodePeer = isTunnelCodePeer || (() => false) // () => bool
     this.pairingSecrets = new Map() // codeId -> { code, role, createdAt, expiresAt, codeId }
     this.trustedPeerKeys = new Set() // hex noise public keys currently trusted
     this.revokedKeys = new Map() // hex noise public key -> revokedAt ms; refused until a fresh pairing
@@ -557,6 +559,9 @@ class TrustManager {
     const peerObj = this.getPeers().get(peerId)
     if (!peerObj || !peerObj.pairing) return
     if (peerObj.pairing.trusted || peerObj.pairing.complete) return
+    // Tunnel-code peers are code-authenticated, never paired — a challenge can
+    // only have raced their topic attribution, so no watchdog is armed at all.
+    if (this.isTunnelCodePeer && this.isTunnelCodePeer(peerId)) return
     if (peerObj.pairing.timeout) clearTimeout(peerObj.pairing.timeout)
     // Network-transition awareness: when the swarm is being rebuilt (Wi-Fi →
     // cellular, router swap), the challenge/response legitimately takes longer
@@ -572,6 +577,11 @@ class TrustManager {
       // Site-session peers (allowlist-authenticated, never paired) must not be
       // killed by the pairing watchdog — their connection is the site session.
       if (this.isSiteSessionPeer && this.isSiteSessionPeer(peerId)) return
+      // Tunnel-code peers likewise: the code is the auth. A challenge that went
+      // out before topic attribution landed (or was answered by neither side)
+      // must never kill a live tunnel link — attribution is definitive by the
+      // time PAIRING_TIMEOUT elapses.
+      if (this.isTunnelCodePeer && this.isTunnelCodePeer(peerId)) return
       console.warn(
         `[MeshEngine] Pairing timed out for ${peerId.slice(0, 12)}... (challenge never verified)`
       )

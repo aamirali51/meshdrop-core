@@ -44,6 +44,61 @@ function createConnections(engine) {
   const claims = createClaims(ctx);
   const devices = createDeviceRegistry(ctx);
 
+  // Per-connection topic attribution: map the connection's Hyperswarm topics
+  // (raw 32-byte topic hashes on peerInfo) back to the labels we joined them
+  // under, via the registry's topicHex -> label map, and record the labels on
+  // engine.peerTopics for this peer. Hyperswarm only populates peerInfo.topics
+  // on the side whose own lookups discovered the peer, and it appends to the
+  // SAME peerInfo object in place as lookups land — an existing connection
+  // gains a new topic whenever either side joins a shared one. So a one-shot
+  // read at connection open would snapshot labels too early (a second code
+  // joined minutes later would never be attributed); a lightweight sweep
+  // re-reads every live peer's topics for the life of the connection. Labels
+  // are deleted on connection close so a stale entry can never suppress
+  // pairing forever.
+  function attributePeerTopics(peerId, peerInfo) {
+    if (!engine.peerTopics || !peerInfo || !peerInfo.topics || !peerInfo.topics.length) return
+    if (!ctx.peers.has(peerId)) return // connection already closed — never resurrect labels
+    const registry = engine.topicRegistry
+    if (!registry || typeof registry.labelFor !== "function") return
+    let set = engine.peerTopics.get(peerId)
+    for (const topic of peerInfo.topics) {
+      const label = registry.labelFor(topic) // hex-encodes Buffers internally — keys stay hex
+      if (!label) continue
+      if (!set) {
+        set = new Set()
+        engine.peerTopics.set(peerId, set)
+      }
+      set.add(label)
+    }
+  }
+  const peerInfos = new Map(); // peerId -> live peerInfo object (topic source of truth)
+  let attributionTimer = null;
+  function sweepAttribution() {
+    if (ctx.stopped) {
+      if (attributionTimer) {
+        clearInterval(attributionTimer)
+        attributionTimer = null
+      }
+      return
+    }
+    for (const [peerId, info] of peerInfos.entries()) {
+      if (!ctx.peers.has(peerId)) {
+        peerInfos.delete(peerId)
+        continue
+      }
+      attributePeerTopics(peerId, info)
+    }
+  }
+  function ensureAttributionSweep() {
+    if (attributionTimer) return
+    attributionTimer = setInterval(sweepAttribution, 3000)
+    if (attributionTimer.unref) attributionTimer.unref()
+  }
+  // Hooked on the engine so topic-driven code (the TunnelManager CLAIM drive)
+  // can pull the freshest labels synchronously instead of waiting for a sweep tick.
+  engine.refreshPeerTopicAttribution = sweepAttribution;
+
   // Open exchange-store replication for a peer on its connection. Only called
   // after the peer has been authenticated (trusted pairing, verified handshake,
   // or a valid one-time-share claim). The private metadata store is never exposed.
@@ -180,6 +235,13 @@ function createConnections(engine) {
       (peerInfo?.publicKey ? b4a.toString(peerInfo.publicKey, "hex") : null) ||
       `peer-${engine.connectionCount}`;
 
+    // Attribute whatever topics this connection already carries (the dialing
+    // side has them at open), then keep re-reading the live peerInfo via the
+    // attribution sweep — Hyperswarm fills/appends topics as its lookups land.
+    peerInfos.set(peerId, peerInfo);
+    attributePeerTopics(peerId, peerInfo);
+    ensureAttributionSweep();
+
     // Register cleanup handlers first so a connection that closes while the
     // (async) settings read below is in flight can never leak from the map.
     connection.on("close", () => {
@@ -206,6 +268,11 @@ function createConnections(engine) {
         }
       }
       ctx.peers.delete(peerId);
+      // Per-connection topic attribution dies with the connection — a stale
+      // label must never suppress pairing (or gate CLAIM sends) for a later,
+      // unrelated connection.
+      peerInfos.delete(peerId);
+      if (engine.peerTopics) engine.peerTopics.delete(peerId);
       engine.replicationScope.close(peerId);
       engine.emit(EVENTS.PEER_DISCONNECTED, { id: devId, peerId });
     });
@@ -321,6 +388,8 @@ function createConnections(engine) {
       transferMethod,
       pairing,
     });
+    // Let TunnelManager re-send pending TUNNEL_CLAIM to this newly found peer (code-host rendezvous)
+    try { if (engine.tunnelManager && typeof engine.tunnelManager._onPeerSignalingReady === 'function') engine.tunnelManager._onPeerSignalingReady(peerId) } catch {}
 
     if (directTrusted) {
       replicateExchange(peerId);

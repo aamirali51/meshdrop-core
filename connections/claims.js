@@ -72,6 +72,12 @@ function createClaims(ctx) {
     if (foundShare.status === 'waiting') foundShare.status = 'claimed'
     await bee.put(foundShare.id, foundShare)
 
+    // First claim on a waiting share: surface it so the host UI can reflect
+    // the claim without polling (multi-download shares only flip once).
+    try {
+      engine.emit(EVENTS.PENDING_SHARE_CLAIMED, { ...foundShare, claimerPeerId: peerId })
+    } catch {}
+
     // A claim connection never verifies a pairing challenge: drop the
     // watchdog so long downloads are not killed mid-transfer.
     if (peerObj.pairing && peerObj.pairing.timeout) {

@@ -3,12 +3,21 @@
 // TopicRegistry tracks every topic join/leave with refcounting so cleanup is
 // predictable: peers join the same topic from multiple flows (pairing, drops,
 // reconnect), and `leave` only detaches when the last reference is gone.
+//
+// It also maintains the reverse map topicHex -> label so connection code can
+// attribute an incoming Hyperswarm connection (whose peerInfo carries the raw
+// 32-byte topic) back to the label it was joined under. Keys are ALWAYS the
+// hex form of the topic hash — never a raw Buffer — so lookups from
+// peerInfo.topics (Buffers) hex-encode before touching this map.
+
+const b4a = require('b4a')
 
 class TopicRegistry {
   constructor({ computeTopicHash, swarm }) {
     this.computeTopicHash = computeTopicHash
     this.swarm = swarm
     this.counts = new Map() // label -> { count, opts }
+    this._byHash = new Map() // topicHex -> label (connection attribution)
   }
 
   join(label, opts) {
@@ -17,6 +26,7 @@ class TopicRegistry {
     const count = entry ? entry.count + 1 : 1
     this.counts.set(label, { count, opts })
     if (count === 1) {
+      this._byHash.set(b4a.toString(topicHash, 'hex'), label)
       this.swarm.join(topicHash, opts)
       this.swarm.flush().catch(() => {})
     }
@@ -38,6 +48,7 @@ class TopicRegistry {
       return
     }
     this.counts.delete(label)
+    this._byHash.delete(b4a.toString(this.computeTopicHash(label), 'hex'))
     const topicHash = this.computeTopicHash(label)
     this.swarm.leave(topicHash)
     this.swarm.flush().catch(() => {})
@@ -51,6 +62,7 @@ class TopicRegistry {
     this.swarm = swarm
     for (const [label, entry] of this.counts.entries()) {
       if (entry && entry.count > 0) {
+        this._byHash.set(b4a.toString(this.computeTopicHash(label), 'hex'), label)
         this.swarm.join(this.computeTopicHash(label), entry.opts)
       }
     }
@@ -60,6 +72,12 @@ class TopicRegistry {
   // Drop all references (used on shutdown / share cleanup).
   leaveAll() {
     for (const label of this.counts.keys()) this.leave(label)
+  }
+
+  // Map a connection's topic (Buffer or hex string) back to the joined label.
+  labelFor(topic) {
+    const hex = typeof topic === 'string' ? topic : b4a.toString(topic, 'hex')
+    return this._byHash.get(hex) || null
   }
 
   count(label) {
