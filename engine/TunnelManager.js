@@ -7,8 +7,19 @@ const { generateTunnelCode, normalizeTunnelCode } = require('../crypto.js')
 const Protomux = require('protomux')
 const c = require('compact-encoding')
 const b4a = require('b4a')
-const net = require('net')
-const dgram = require('dgram')
+// net/dgram are Node-only builtins. eval-wrap them (matching LanDiscovery.js and
+// compat.js) so bare-pack doesn't try to resolve them when bundling the engine
+// for the Bare mobile target, and so they degrade to null on a runtime without
+// them. Tunnels are hosted by the desktop engine; the mobile worklet never calls
+// into these code paths.
+let net = null
+let dgram = null
+try {
+  net = eval("require('net')")
+} catch {}
+try {
+  dgram = eval("require('dgram')")
+} catch {}
 
 const TUNNEL_PROTOCOL = 'meshdrop-tunnel-v1'
 const TUNNEL_UDP_PROTOCOL = 'meshdrop-tunnel-udp-v1'
