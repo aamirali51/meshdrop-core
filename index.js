@@ -57,7 +57,9 @@ function getDurationMs(preset) {
     '7d': 7 * 24 * 60 * 60 * 1000,
     never: 0
   }
-  return map[preset] || 30 * 60 * 1000
+  // `??`, not `||`: `never` maps to 0 (no expiry) and 0 is falsy, so `||` would
+  // silently turn a never-expiring share into the 30-minute default.
+  return map[preset] ?? 30 * 60 * 1000
 }
 
 // DHT relay fallback: on restrictive networks (symmetric NAT, TCP-only VPNs)
