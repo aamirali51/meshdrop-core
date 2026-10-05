@@ -40,6 +40,14 @@ const JOIN_TIMEOUT_MS = 30000
 // A guest whose host has been silent this long (no media offer, no state sync,
 // no close) drops the room instead of sitting in a zombie state forever.
 const HOST_SILENCE_MS = 120000
+// Staged party media is kept so re-partying reuses it, but not forever: past
+// this age a room creation reclaims the space (matches the staging sweep).
+const PARTY_MEDIA_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+// Core names owned by party media: content-addressed ones from this version,
+// plus the per-room names earlier versions used (those were never reclaimed, so
+// the startup sweep retires them). `file-drop-*` cores belong to the drop flow
+// and share the store, so they must never match here.
+const PARTY_MEDIA_CORE_RE = /^(?:party-media-|watch-)/
 
 class WatchPartyManager extends EventEmitter {
   constructor(options = {}) {
@@ -235,6 +243,7 @@ class WatchPartyManager extends EventEmitter {
         fileSize,
         fileType,
         coreKey: null,
+        coreName: null,
         manifestHash: '',
         checksum: '',
         isHost: true,
@@ -274,9 +283,13 @@ class WatchPartyManager extends EventEmitter {
             filePath,
             filename,
             fileSize,
-            fileType
+            fileType,
+            // Re-partying the same movie must not copy it a second time: the
+            // core is addressed by content, so an identical file reuses it.
+            contentAddressed: true
           })
           room.coreKey = staged.coreKey
+          room.coreName = staged.coreName
           room.manifestHash = staged.manifestHash
           room.checksum = staged.checksum
         } catch (err) {
@@ -291,6 +304,12 @@ class WatchPartyManager extends EventEmitter {
         this._teardownRoomState(room)
         throw new Error('Party media staging did not produce a playable source')
       }
+
+      // Index the staged core for retention, then reclaim anything that aged
+      // out. The sweep is fire-and-forget — reclaiming space must never delay
+      // the room announcement.
+      await this._recordStagedMedia(room.coreName, { filename, fileSize })
+      this._sweepStagedPartyMedia(room.coreName).catch(() => {})
 
       // Optional subtitle sidecar: read + normalize to WebVTT now and ride it
       // inside every media offer — no second transfer pipeline needed.
@@ -777,11 +796,14 @@ class WatchPartyManager extends EventEmitter {
       filePath: room.filePath,
       filename: room.filename,
       fileSize: room.fileSize,
-      fileType: room.fileType
+      fileType: room.fileType,
+      contentAddressed: true
     })
     room.coreKey = staged.coreKey
+    room.coreName = staged.coreName
     room.manifestHash = staged.manifestHash
     room.checksum = staged.checksum
+    await this._recordStagedMedia(room.coreName, { filename: room.filename, fileSize: room.fileSize })
 
     this._mediaReadyNotified = false
     // Re-announce (title changed) and re-offer the new media to everyone in
@@ -880,6 +902,123 @@ class WatchPartyManager extends EventEmitter {
   _shareIdForEpoch(roomCode, epoch) {
     const base = `watch-${String(roomCode).toLowerCase()}`
     return epoch > 1 ? `${base}-e${epoch}` : base
+  }
+
+  // Staged party media is deliberately kept between parties so re-partying the
+  // same movie is instant, which means it must eventually be reclaimed or the
+  // store grows without bound. This small index lives in the PRIVATE store
+  // (never replicated) and records what was staged and when, so a later room
+  // can retire what has aged out.
+  async _recordStagedMedia(coreName, info) {
+    if (!coreName || !this.engine || typeof this.engine.getBee !== 'function') return
+    try {
+      const bee = await this.engine.getBee('partyMedia')
+      // Keep the ORIGINAL stagedAt: re-partying the same movie must not push
+      // its expiry forward, or a file partyed regularly would never be retired.
+      const existing = await bee.get(coreName).catch(() => null)
+      const prev = existing && existing.value ? existing.value : null
+      await bee.put(coreName, {
+        coreName,
+        filename: (info && info.filename) || (prev && prev.filename) || '',
+        fileSize: (info && info.fileSize) || (prev && prev.fileSize) || 0,
+        stagedAt: (prev && prev.stagedAt) || Date.now()
+      })
+    } catch (err) {
+      console.warn('[WatchPartyManager] staged-media index write failed:', err.message)
+    }
+  }
+
+  // Retire party media past retention, keeping the core the caller is about to
+  // use. Best-effort throughout: reclaiming space must never block a party.
+  async _sweepStagedPartyMedia(keepCoreName) {
+    const transferEngine = this.engine && this.engine.transferEngine
+    if (!transferEngine || typeof transferEngine.releaseStagedCore !== 'function') return 0
+    const cutoff = Date.now() - PARTY_MEDIA_RETENTION_MS
+    let released = 0
+    try {
+      const bee = await this.engine.getBee('partyMedia')
+      const stale = []
+      for await (const node of bee.createReadStream()) {
+        const rec = node.value || {}
+        if (!rec.coreName || rec.coreName === keepCoreName) continue
+        if (typeof rec.stagedAt === 'number' && rec.stagedAt > cutoff) continue
+        stale.push(rec.coreName)
+      }
+      for (const coreName of stale) {
+        const ok = await transferEngine.releaseStagedCore(coreName, { compact: false }).catch(() => false)
+        await bee.del(coreName).catch(() => {})
+        if (ok) released++
+      }
+      if (released > 0) {
+        await transferEngine.compactExchangeStore().catch(() => {})
+        console.log(`[WatchPartyManager] reclaimed ${released} aged-out party media core(s)`)
+      }
+    } catch (err) {
+      console.warn('[WatchPartyManager] party media sweep failed:', err.message)
+    }
+    return released
+  }
+
+  // Reclaim party media that has no owner: cores absent from the retention index
+  // (a host that died mid-party, or media staged by a version that predates the
+  // index). A live room always writes an index entry as it stages, so an
+  // unindexed party core is an orphan.
+  async _sweepOrphanedPartyCores() {
+    const transferEngine = this.engine && this.engine.transferEngine
+    const exchangeStore = this.engine && this.engine.storage && this.engine.storage.exchangeStore
+    if (!transferEngine || typeof transferEngine.releaseStagedCore !== 'function' || !exchangeStore) return 0
+    const storage = exchangeStore.storage
+    if (!storage || typeof storage.createAliasStream !== 'function') return 0
+    // The live room's core is never an orphan, even if its index write failed.
+    const keepCoreName = this.activeRoom ? this.activeRoom.coreName : null
+
+    let known = new Set()
+    try {
+      const bee = await this.engine.getBee('partyMedia')
+      for await (const node of bee.createReadStream()) {
+        const rec = node.value || {}
+        if (rec.coreName) known.add(rec.coreName)
+      }
+    } catch (err) {
+      // An unreadable index must not be read as "nothing is owned" — that would
+      // retire every staged core on the strength of a transient read failure.
+      console.warn('[WatchPartyManager] party media index unreadable, skipping sweep:', err.message)
+      return 0
+    }
+
+    const orphans = []
+    try {
+      for await (const row of storage.createAliasStream()) {
+        const name = row && row.alias && row.alias.name
+        if (typeof name !== 'string' || !PARTY_MEDIA_CORE_RE.test(name)) continue
+        if (name === keepCoreName) continue
+        if (!known.has(name)) orphans.push(name)
+      }
+    } catch (err) {
+      console.warn('[WatchPartyManager] party core scan failed:', err.message)
+      return 0
+    }
+
+    let released = 0
+    for (const coreName of orphans) {
+      const ok = await transferEngine.releaseStagedCore(coreName, { compact: false }).catch(() => false)
+      if (ok) released++
+    }
+    if (released > 0) {
+      await transferEngine.compactExchangeStore().catch(() => {})
+      console.log(`[WatchPartyManager] reclaimed ${released} orphaned party media core(s)`)
+    }
+    return released
+  }
+
+  // Engine start: retire media left behind by earlier sessions. Deliberately
+  // not awaited on the startup path — compaction of a large backlog must never
+  // delay the engine coming up.
+  sweepStaleMedia() {
+    return this._sweepOrphanedPartyCores()
+      .catch(() => 0)
+      .then((n) => this._sweepStagedPartyMedia(null).catch(() => 0))
+      .catch(() => 0)
   }
 
   _sendToPeer(peerId, msg) {
@@ -1240,7 +1379,9 @@ class WatchPartyManager extends EventEmitter {
     }
 
     try {
-      const core = exchangeStore.get({ name: room.shareId })
+      // Served by stored core name, not shareId: the core is content-addressed
+      // so two rooms sharing one movie may point at the same core.
+      const core = exchangeStore.get({ name: room.coreName || room.shareId })
       await core.ready()
       // One protomux session per peer connection (hypercore 11 multiplexes
       // core channels on the cached session): a rejoining guest reuses the

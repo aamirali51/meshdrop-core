@@ -216,7 +216,7 @@ function createStorage({ storageDir, downloadsDir }) {
   // the noise keypair (mesh_store/noise-keypair.json) and the swarm identity
   // are preserved, so connections, trust and transfers keep working.
   async function compactStore() {
-    const names = ['identity', 'devices', 'settings', 'sync', 'transfers', 'history', 'shared']
+    const names = ['identity', 'devices', 'settings', 'sync', 'transfers', 'history', 'shared', 'partyMedia']
     const rows = new Map()
     for (const name of names) {
       try {
@@ -252,6 +252,19 @@ function createStorage({ storageDir, downloadsDir }) {
     console.log('[Storage] metadata store rebuilt')
   }
 
+  // Hand disk space back after large exchange-store deletions. Clearing a core
+  // only resets its length — RocksDB keeps the old block versions until a
+  // compaction pass, so this is what actually returns the bytes. Reads the
+  // current exchangeStore variable, so a healed/rebuild store is respected.
+  async function compactExchange() {
+    try {
+      const db = exchangeStore.storage && exchangeStore.storage.db
+      if (db && typeof db.compactRange === 'function') await db.compactRange()
+    } catch (err) {
+      console.warn('[Storage] exchange store compaction failed:', err.message)
+    }
+  }
+
   return {
     store,
     exchangeStore,
@@ -265,6 +278,7 @@ function createStorage({ storageDir, downloadsDir }) {
     setDeviceInfo,
     storeReady,
     compactStore,
+    compactExchange,
     downloadsDir
   }
 }

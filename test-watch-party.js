@@ -206,8 +206,15 @@ async function runAllTests() {
     assert('Room staged real media core (coreKey present)', typeof host.watchParty.activeRoom.coreKey === 'string' && host.watchParty.activeRoom.coreKey.length === 64)
     assert('Room carries manifest hash', typeof host.watchParty.activeRoom.manifestHash === 'string' && host.watchParty.activeRoom.manifestHash.length > 0)
 
-    // The staged core holds block 0 (manifest) + data blocks.
-    const stagedCore = host.storage.exchangeStore.get({ name: room.shareId })
+    // The staged core holds block 0 (manifest) + data blocks, and is addressed
+    // by content rather than by room: the same movie must never be copied twice.
+    const stagedCoreName = host.watchParty.activeRoom.coreName
+    assert(
+      'Party media core is content-addressed',
+      typeof stagedCoreName === 'string' && stagedCoreName.startsWith('party-media-'),
+      `coreName=${stagedCoreName}`
+    )
+    const stagedCore = host.storage.exchangeStore.get({ name: stagedCoreName })
     await stagedCore.ready()
     assert(
       'Staged core holds manifest + data blocks',
@@ -460,6 +467,194 @@ async function runAllTests() {
     assert('Completed transfer record is playable', recAfter && (recAfter.playable === true || recAfter.status === 'completed'))
     await host12.storage.exchangeStore.close().catch(() => {})
     await guest12.storage.exchangeStore.close().catch(() => {})
+
+    // ── Party media is content-addressed: the SAME movie is copied once ──────
+    // The host previously staged a per-room core, so partying the same 4K file
+    // twice held two full copies forever. Re-partying must now reuse the core.
+    const host13 = makeSide('host-13-key', 'Host Thirteen', tmpRoot)
+    const guest13 = makeSide('guest-13-key', 'Guest Thirteen', tmpRoot)
+    connectPeers(host13, guest13)
+
+    const moviePath = path.join(tmpRoot, 'blockbuster.mp4')
+    const movieBytes = Buffer.alloc(300 * 1024 + 11)
+    for (let i = 0; i < movieBytes.length; i++) movieBytes[i] = (i * 7) % 251
+    await fsp.writeFile(moviePath, movieBytes)
+
+    const firstRoom = await host13.watchParty.createRoom({ title: 'First', filePath: moviePath })
+    const firstCoreName = host13.watchParty.activeRoom.coreName
+    const firstCoreKey = host13.watchParty.activeRoom.coreKey
+    const firstCore = host13.storage.exchangeStore.get({ name: firstCoreName })
+    await firstCore.ready()
+    const firstLength = firstCore.length
+    const firstBlock = await firstCore.get(1)
+    await firstCore.close()
+    await host13.watchParty.leaveRoom()
+
+    const secondRoom = await host13.watchParty.createRoom({ title: 'Second', filePath: moviePath })
+    const secondCoreName = host13.watchParty.activeRoom.coreName
+    const secondCoreKey = host13.watchParty.activeRoom.coreKey
+    assert(
+      'Re-partying the same movie reuses the same core',
+      secondCoreName === firstCoreName && secondCoreKey === firstCoreKey,
+      `coreName ${firstCoreName} vs ${secondCoreName}`
+    )
+    const secondCore = host13.storage.exchangeStore.get({ name: secondCoreName })
+    await secondCore.ready()
+    const secondLength = secondCore.length
+    const secondBlock = await secondCore.get(1)
+    await secondCore.close()
+    assert(
+      'Re-party appended no duplicate blocks',
+      secondLength === firstLength,
+      `core.length ${firstLength} -> ${secondLength} (a second copy would double it)`
+    )
+    assert(
+      'Reused core still serves the original bytes',
+      Buffer.compare(firstBlock, secondBlock) === 0 &&
+        Buffer.compare(secondBlock.subarray(0, 65536), movieBytes.subarray(0, 65536)) === 0
+    )
+
+    // The retention index is what lets the space be given back later.
+    const mediaBee = await host13.getBee('partyMedia')
+    const indexedEntry = await mediaBee.get(secondCoreName)
+    assert(
+      'Staged party media is recorded for retention',
+      !!(indexedEntry && indexedEntry.value && indexedEntry.value.fileSize === movieBytes.length),
+      JSON.stringify(indexedEntry && indexedEntry.value)
+    )
+
+    // A different movie must NOT be served from the reused core.
+    const otherPath = path.join(tmpRoot, 'other-movie.mp4')
+    await fsp.writeFile(otherPath, Buffer.alloc(120 * 1024, 42))
+    await host13.watchParty.leaveRoom()
+    const thirdRoom = await host13.watchParty.createRoom({ title: 'Third', filePath: otherPath })
+    const thirdCoreName = host13.watchParty.activeRoom.coreName
+    const thirdCoreKey = host13.watchParty.activeRoom.coreKey
+    assert(
+      'A different movie gets its own core',
+      thirdCoreName !== firstCoreName && thirdCoreKey !== firstCoreKey,
+      `coreName=${thirdCoreName}`
+    )
+    await host13.watchParty.leaveRoom()
+
+    // ── The startup sweep reclaims orphans and leaves everything else alone ──
+    // Party media is retained between parties, so unreferenced party cores from
+    // crashed or older sessions are what the sweep exists to retire. Drop cores
+    // share this store and must never be touched.
+    const legacyCore = host13.storage.exchangeStore.get({ name: 'watch-party-legacy-0001' })
+    await legacyCore.ready()
+    await legacyCore.append(Buffer.alloc(4096, 9))
+    const legacyLength = legacyCore.length
+    await legacyCore.close()
+
+    const dropCore = host13.storage.exchangeStore.get({ name: 'file-drop-keepme' })
+    await dropCore.ready()
+    await dropCore.append(Buffer.alloc(2048, 5))
+    await dropCore.close()
+
+    const liveRoom = await host13.watchParty.createRoom({ title: 'Live', filePath: moviePath })
+    const liveCoreName = host13.watchParty.activeRoom.coreName
+    const liveCoreKey = host13.watchParty.activeRoom.coreKey
+    assert('Sweep precondition: legacy party core is non-empty', legacyLength > 0)
+    await host13.watchParty.sweepStaleMedia()
+
+    const legacyAfter = host13.storage.exchangeStore.get({ name: 'watch-party-legacy-0001' })
+    await legacyAfter.ready()
+    const legacyLengthAfter = legacyAfter.length
+    await legacyAfter.close()
+    assert(
+      'Sweep reclaimed the orphaned legacy party core',
+      legacyLengthAfter === 0,
+      `core.length ${legacyLength} -> ${legacyLengthAfter}`
+    )
+
+    const dropAfter = host13.storage.exchangeStore.get({ name: 'file-drop-keepme' })
+    await dropAfter.ready()
+    const dropLengthAfter = dropAfter.length
+    await dropAfter.close()
+    assert('Sweep left drop cores alone', dropLengthAfter === 1, `core.length=${dropLengthAfter}`)
+
+    const liveAfter = host13.storage.exchangeStore.get({ name: liveCoreName })
+    await liveAfter.ready()
+    const liveLengthAfter = liveAfter.length
+    const liveKeyAfter = liveAfter.key.toString('hex')
+    await liveAfter.close()
+    assert(
+      'Sweep kept the indexed live-room core playable',
+      liveLengthAfter > 1 && liveKeyAfter === liveCoreKey,
+      `core.length=${liveLengthAfter}`
+    )
+    assert('Live room survived the sweep intact', liveRoom.shareId === host13.watchParty.activeRoom.shareId)
+    await host13.watchParty.leaveRoom()
+
+    // ── Aged-out media is released; un-aged media is kept for reuse ─────────
+    // Retention is the primary long-term mechanism: media is held so re-partying
+    // reuses it, then given back once it ages out. Ageing here is done by
+    // rewriting the index timestamps rather than waiting a week.
+    const agedPath = path.join(tmpRoot, 'aged-out.mp4')
+    await fsp.writeFile(agedPath, Buffer.alloc(90 * 1024, 3))
+    await host13.watchParty.createRoom({ title: 'Aged', filePath: agedPath })
+    const agedCoreName = host13.watchParty.activeRoom.coreName
+    await host13.watchParty.leaveRoom()
+
+    const freshPath = path.join(tmpRoot, 'still-fresh.mp4')
+    await fsp.writeFile(freshPath, Buffer.alloc(70 * 1024, 4))
+    await host13.watchParty.createRoom({ title: 'Fresh', filePath: freshPath })
+    const freshCoreName = host13.watchParty.activeRoom.coreName
+    await host13.watchParty.leaveRoom()
+
+    const freshLengthBefore = await (async () => {
+      const c = host13.storage.exchangeStore.get({ name: freshCoreName })
+      await c.ready()
+      const n = c.length
+      await c.close()
+      return n
+    })()
+
+    // Backdate every index row except the fresh one, then sweep.
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000
+    for await (const node of mediaBee.createReadStream()) {
+      const rec = node.value || {}
+      if (!rec.coreName || rec.coreName === freshCoreName) continue
+      rec.stagedAt = Date.now() - WEEK_MS - 60000
+      await mediaBee.put(rec.coreName, rec)
+    }
+    assert('Retention precondition: aged core is non-empty', freshLengthBefore > 1)
+    await host13.watchParty.sweepStaleMedia()
+
+    const agedAfter = host13.storage.exchangeStore.get({ name: agedCoreName })
+    await agedAfter.ready()
+    const agedLengthAfter = agedAfter.length
+    await agedAfter.close()
+    assert(
+      'Sweep reclaimed the aged-out core',
+      agedLengthAfter === 0,
+      `core.length=${agedLengthAfter}`
+    )
+    const agedRow = await mediaBee.get(agedCoreName)
+    assert('Aged-out core left the retention index', !agedRow, JSON.stringify(agedRow && agedRow.value))
+
+    const freshAfter = host13.storage.exchangeStore.get({ name: freshCoreName })
+    await freshAfter.ready()
+    const freshLengthAfter = freshAfter.length
+    await freshAfter.close()
+    assert(
+      'Sweep kept un-aged media for reuse',
+      freshLengthAfter === freshLengthBefore,
+      `core.length ${freshLengthBefore} -> ${freshLengthAfter}`
+    )
+
+    // The retained core is still usable: re-partying serves it again.
+    const reuseRoom = await host13.watchParty.createRoom({ title: 'Fresh again', filePath: freshPath })
+    assert(
+      'Media kept by the sweep is still reusable',
+      reuseRoom && host13.watchParty.activeRoom.coreName === freshCoreName,
+      `coreName=${host13.watchParty.activeRoom.coreName}`
+    )
+    await host13.watchParty.leaveRoom()
+
+    await host13.storage.exchangeStore.close().catch(() => {})
+    await guest13.storage.exchangeStore.close().catch(() => {})
 
     await host.storage.exchangeStore.close().catch(() => {})
     await guestA.storage.exchangeStore.close().catch(() => {})

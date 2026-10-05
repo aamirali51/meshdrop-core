@@ -81,6 +81,7 @@ class TransferEngine {
   constructor({
     getBee,
     exchangeStore,
+    compactExchange,
     sendEvent,
     getPeers,
     getDeviceIdentity,
@@ -93,6 +94,10 @@ class TransferEngine {
   }) {
     this.getBee = getBee
     this.exchangeStore = exchangeStore
+    // Reclaims disk after large exchange-store deletions. The store handed in
+    // here may be a replication-scope wrapper with no storage API of its own,
+    // so the owner passes the real compactor.
+    this.compactExchange = compactExchange || null
     this.sendEvent = sendEvent // (eventName, data) => void
     this.getPeers = getPeers // () => Map<peerId, peerObj>
     this.getDeviceIdentity = getDeviceIdentity
@@ -430,10 +435,60 @@ class TransferEngine {
   // code topic is joined separately and the resulting coreKey/manifestHash are
   // stored on the pending share, then served to claimers. A multi-file share
   // stages one core per file (coreName differentiates them).
-  async stageDrop({ transferId, coreName = null, filePath, filename, fileSize, fileType }) {
-    const core = this.exchangeStore.get({ name: coreName || `file-drop-${transferId}` })
-    await core.ready()
+  // Read a staged core's manifest (block 0). Null when the core is empty or
+  // the block does not parse — callers read that as "nothing to reuse".
+  async _readStoredManifest(core) {
+    if (!core || core.length === 0) return null
+    try {
+      return parseManifest(await core.get(0))
+    } catch (err) {
+      return null
+    }
+  }
 
+  // Release a staged core's blocks and hand the space back to the disk.
+  // Truncating alone reclaims nothing: hypercore 11 keeps blocks as RocksDB
+  // values and the old versions survive until a compaction pass. Unless the
+  // caller is batching (compact: false) that pass runs here, because it is what
+  // actually returns the bytes.
+  async _reclaimCore(core, { compact = true } = {}) {
+    try {
+      await core.clear(0, core.length)
+      await core.truncate(0)
+    } catch (err) {
+      console.warn('[TransferEngine] core reset failed:', err.message)
+      return false
+    }
+    if (compact) await this.compactExchangeStore()
+    return true
+  }
+
+  // One pass for a batch of released cores — the per-core form is needlessly
+  // expensive when reclaiming a backlog of aged-out media.
+  async compactExchangeStore() {
+    if (typeof this.compactExchange === 'function') {
+      return this.compactExchange()
+    }
+    try {
+      const db = this.exchangeStore && this.exchangeStore.storage && this.exchangeStore.storage.db
+      if (db && typeof db.compactRange === 'function') await db.compactRange()
+    } catch (err) {
+      console.warn('[TransferEngine] exchange store compaction failed:', err.message)
+    }
+  }
+
+  // Drop a staged core by name and reclaim its bytes. Used to release party
+  // media that is past retention.
+  async releaseStagedCore(coreName, { compact = true } = {}) {
+    if (!coreName || !this.exchangeStore) return false
+    const core = this.exchangeStore.get({ name: coreName })
+    await core.ready()
+    const reclaimed = await this._reclaimCore(core, { compact })
+    await core.close().catch(() => {})
+    return reclaimed
+  }
+
+  async stageDrop({ transferId, coreName = null, filePath, filename, fileSize, fileType, contentAddressed = false }) {
     const { manifest, manifestHash } = await buildManifest({
       filePath,
       fsp: this.fsp,
@@ -443,45 +498,69 @@ class TransferEngine {
       transferId
     })
 
+    // Party media is content-addressed on the file checksum, so staging the
+    // same movie again (a re-party, a queue re-add, a resumed session) resolves
+    // to the SAME core and copies its bytes once rather than once per party.
+    // buildManifest already hashed every block above, so the address is free.
+    const name = contentAddressed
+      ? `party-media-${manifest.checksum.slice(0, 40)}`
+      : (coreName || `file-drop-${transferId}`)
+
+    const core = this.exchangeStore.get({ name })
+    await core.ready()
+
+    // A stored manifest with a different checksum means this name holds other
+    // bytes: appending would graft the new file onto the old one's blocks, so
+    // reset first and stage from scratch.
+    const stored = await this._readStoredManifest(core)
+    if (stored && stored.checksum && stored.checksum !== manifest.checksum) {
+      await this._reclaimCore(core)
+    }
+
     if (core.length === 0) {
       await core.append(Buffer.from(JSON.stringify(manifest)))
     }
 
-    // Append any missing data blocks (resume-safe: same core, byteOffset from
-    // actual core length, never from a stale counter).
-    let byteOffset = 0
-    let bytesWritten = 0
-    const fd = await this.fsp.open(filePath, 'r')
-    try {
-      const appended = Math.max(0, core.length - 1) // manifest is block 0
-      byteOffset = appended * CHUNK_SIZE
-      bytesWritten = byteOffset
-      const buf = Buffer.alloc(CHUNK_SIZE)
-      const batchSize = 128 // Batch append 8MB at a time for high disk throughput
-      let batch = []
-      while (bytesWritten < fileSize) {
-        const readRes = await fd.read(buf, 0, CHUNK_SIZE, bytesWritten)
-        const bytesRead = typeof readRes === 'number' ? readRes : (readRes?.bytesRead || 0)
-        if (bytesRead === 0) break
-        const block = Buffer.from(buf.subarray(0, bytesRead))
-        batch.push(block)
-        bytesWritten += bytesRead
-        if (batch.length >= batchSize) {
+    // Reuse: a matching checksum proves the stored blocks are this very file.
+    // If the core already holds them all there is nothing to copy.
+    if (core.length < 1 + manifest.blockCount) {
+      // Append any missing data blocks (resume-safe: same core, byteOffset from
+      // actual core length, never from a stale counter).
+      let byteOffset = 0
+      let bytesWritten = 0
+      const fd = await this.fsp.open(filePath, 'r')
+      try {
+        const appended = Math.max(0, core.length - 1) // manifest is block 0
+        byteOffset = appended * CHUNK_SIZE
+        bytesWritten = byteOffset
+        const buf = Buffer.alloc(CHUNK_SIZE)
+        const batchSize = 128 // Batch append 8MB at a time for high disk throughput
+        let batch = []
+        while (bytesWritten < fileSize) {
+          const readRes = await fd.read(buf, 0, CHUNK_SIZE, bytesWritten)
+          const bytesRead = typeof readRes === 'number' ? readRes : (readRes?.bytesRead || 0)
+          if (bytesRead === 0) break
+          const block = Buffer.from(buf.subarray(0, bytesRead))
+          batch.push(block)
+          bytesWritten += bytesRead
+          if (batch.length >= batchSize) {
+            await core.append(batch)
+            batch = []
+          }
+        }
+        if (batch.length > 0) {
           await core.append(batch)
           batch = []
         }
+      } finally {
+        await fd.close()
       }
-      if (batch.length > 0) {
-        await core.append(batch)
-        batch = []
-      }
-    } finally {
-      await fd.close()
     }
 
     await core.close().catch(() => {})
     return {
       coreKey: core.key.toString('hex'),
+      coreName: name,
       manifestHash,
       checksum: manifest.checksum,
       blockSize: manifest.blockSize,

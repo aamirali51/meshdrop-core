@@ -32,6 +32,9 @@ const { createConnections, getTransferMethod } = require('./connections/index.js
 const PAIR_WAIT_TIMEOUT = 60 * 1000 // max time pairWithCode waits for verification
 const PAIR_DRIVE_INTERVAL_MS = 5 * 1000 // pairWithCode re-announces challenges + reconnects on this cadence
 const EXPIRATION_INTERVAL_MS = 10 * 1000
+// Delay before the startup reclaim of stale watch-party media. Long enough for
+// the connection/transfer burst that follows boot to settle.
+const MEDIA_SWEEP_DELAY_MS = 20 * 1000
 // A paired device that last proved it was alive longer ago than this is shown
 // offline. Proven presence is a live authenticated peer (connections/index.js)
 // or a relay WSS round-trip touching this engine less than STALE ago. Anything
@@ -624,6 +627,7 @@ class MeshEngine extends EventEmitter {
     this.transferEngine = new TransferEngine({
       getBee: this.storage.getBee,
       exchangeStore: this.replicationScope,
+      compactExchange: this.storage.compactExchange,
       sendEvent: (event, data) => this.emit(event, data),
       getPeers: () => this.peers,
       getDeviceIdentity: () => this.storage.getDeviceIdentity(),
@@ -832,6 +836,18 @@ class MeshEngine extends EventEmitter {
     await this.replicationScope.init()
     await this.transferEngine.init()
     await this.syncEngine.init()
+
+    // Retire watch-party media left behind by earlier sessions. Party media is
+    // retained between parties so re-partying reuses it instead of copying the
+    // movie again, so something has to eventually give the space back. Deferred
+    // past the post-boot burst: the reclaim compacts RocksDB, and contending
+    // with peers connecting and transfers resuming would slow both down.
+    if (this.watchParty && typeof this.watchParty.sweepStaleMedia === 'function') {
+      const sweepTimer = setTimeout(() => {
+        this.watchParty.sweepStaleMedia().catch(() => {})
+      }, MEDIA_SWEEP_DELAY_MS)
+      if (sweepTimer && typeof sweepTimer.unref === 'function') sweepTimer.unref()
+    }
 
     const identity = await this.storage.initIdentity()
     console.log('[MeshEngine] Device identity:', identity.name, identity.id)
