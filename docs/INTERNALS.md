@@ -1,6 +1,6 @@
 # MeshDrop Internals: how a zero-cloud file transfer actually works
 
-*A tour of @mesh/core — the P2P engine behind MeshDrop. Written for the
+*A tour of @meshdrop-go/core — the P2P engine behind MeshDrop. Written for the
 Holepunch community after the "explain the internals" ask. Everything here
 is in the open: [meshdrop-core](https://github.com/aamirali51/meshdrop-core)
 is public, and this post links the exact modules.*

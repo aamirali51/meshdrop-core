@@ -1,6 +1,6 @@
 'use strict'
 
-// @mesh/core — zero-cloud P2P messenger + file-transfer engine.
+// @meshdrop-go/core — zero-cloud P2P messenger + file-transfer engine.
 //
 // Single entrypoint: `MeshEngine`, an EventEmitter that owns the full P2P
 // stack (Hyperswarm / HyperDHT / Noise XX, LAN discovery, trust + pairing,

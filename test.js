@@ -1,6 +1,6 @@
 'use strict'
 
-// End-to-end verification for @mesh/core — no Electron, no IPC.
+// End-to-end verification for @meshdrop-go/core — no Electron, no IPC.
 //
 //   node core/test.js
 //

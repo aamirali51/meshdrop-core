@@ -1,6 +1,6 @@
 'use strict'
 
-// Single protocol schema for the @mesh/core P2P wire.
+// Single protocol schema for the @meshdrop-go/core P2P wire.
 //
 // This file is the one source of truth for:
 //   - peer message types exchanged over the p2p-signal-v1 channel

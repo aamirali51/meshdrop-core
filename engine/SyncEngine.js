@@ -1,7 +1,7 @@
 'use strict'
 
 // SyncEngine — fast, zero-duplication, memory-safe folder synchronization
-// for @mesh/core (Desktop & Mobile).
+// for @meshdrop-go/core (Desktop & Mobile).
 //
 // Built on a modular 3-Way Baseline Snapshot Architecture:
 //  - SnapshotStore: Hyperbee/RocksDB baseline snapshot & manifest persistence

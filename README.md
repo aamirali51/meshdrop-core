@@ -1,4 +1,4 @@
-# @mesh/core
+# @meshdrop-go/core
 
 Zero-cloud, P2P messenger + file-transfer engine extracted from the MeshDrop
 app. Pure JavaScript, platform-agnostic (Node >= 18; runs on desktop
@@ -9,13 +9,13 @@ Part of the [MeshDrop](https://github.com/aamirali51/meshdrop-app) ecosystem.
 | Repository | Visibility | Contents |
 |------------|-----------|----------|
 | [meshdrop-app](https://github.com/aamirali51/meshdrop-app) | Private | Desktop + mobile clients |
-| **meshdrop-core** (this repo) | Public | P2P engine — `@mesh/core` |
+| **meshdrop-core** (this repo) | Public | P2P engine — `@meshdrop-go/core` |
 | [meshdrop-releases](https://github.com/aamirali51/meshdrop-releases) | Public | Release artifacts for the auto-updater |
 
 ## Install
 
 ```sh
-npm install @mesh/core
+npm install @meshdrop-go/core
 ```
 
 Dependencies: `hyperswarm`, `hypercore-crypto`, `corestore`, `hyperbee`,
@@ -25,7 +25,7 @@ Electron/pear/bare-\* modules.
 ## Usage
 
 ```js
-const { MeshEngine } = require('@mesh/core')
+const { MeshEngine } = require('@meshdrop-go/core')
 
 const engine = new MeshEngine({
   storageDir: '/path/to/engine-data', // required

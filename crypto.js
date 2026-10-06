@@ -1,6 +1,6 @@
 'use strict'
 
-// Cryptographic primitives for @mesh/core.
+// Cryptographic primitives for @meshdrop-go/core.
 //
 // Everything here is built on node:crypto plus hypercore-crypto (which ships
 // with the hyperswarm stack and is already required for noise keypairs and DHT

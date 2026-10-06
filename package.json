@@ -1,5 +1,5 @@
 {
-  "name": "@mesh/core",
+  "name": "@meshdrop-go/core",
   "version": "1.0.60",
   "description": "Zero-cloud P2P messenger and file-transfer engine. Platform-agnostic core for MeshDrop (iOS, Android, macOS, Windows, Linux). No Electron, no IPC, no cloud.",
   "license": "MIT",
