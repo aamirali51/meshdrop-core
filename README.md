@@ -1,15 +1,17 @@
 # @meshdrop-go/core
 
 Zero-cloud, P2P messenger + file-transfer engine extracted from the MeshDrop
-app. Pure JavaScript, platform-agnostic (Node >= 18; runs on desktop
-and mobile Node threads). **No Electron, no IPC, no cloud.**
+app. Pure JavaScript, platform-agnostic (Node >= 18; runs on desktop, mobile
+Node threads, and the headless `meshdrop-host`). **No Electron, no IPC, no
+cloud.**
 
 Part of the [MeshDrop](https://github.com/aamirali51/meshdrop-app) ecosystem.
 
 | Repository | Visibility | Contents |
 |------------|-----------|----------|
-| [meshdrop-app](https://github.com/aamirali51/meshdrop-app) | Private | Desktop + mobile clients |
+| [meshdrop-app](https://github.com/aamirali51/meshdrop-app) | Public | Desktop + mobile clients |
 | **meshdrop-core** (this repo) | Public | P2P engine — `@meshdrop-go/core` |
+| [meshdrop-host](https://github.com/aamirali51/meshdrop-host) | Public | Headless host + `mesh` CLI — `@meshdrop-go/host` |
 | [meshdrop-releases](https://github.com/aamirali51/meshdrop-releases) | Public | Release artifacts for the auto-updater |
 
 ## Install
@@ -17,6 +19,8 @@ Part of the [MeshDrop](https://github.com/aamirali51/meshdrop-app) ecosystem.
 ```sh
 npm install @meshdrop-go/core
 ```
+
+Published on npm: <https://www.npmjs.com/package/@meshdrop-go/core>.
 
 Dependencies: `hyperswarm`, `hypercore-crypto`, `corestore`, `hyperbee`,
 `protomux`, `compact-encoding` — the standard Holepunch P2P stack. No
@@ -71,6 +75,12 @@ await engine.offerFile(peer.publicKey, '/absolute/path/to/file.bin')
 | `await listTransfers()`                            | Persisted transfer records                                                                     |
 | `getPeers()`                                       | Connected, handshake-complete peer device records                                              |
 | `getStatus()`                                      | `{ connected, peerCount, relayedPeerCount, directPeerCount }`                                  |
+
+Beyond the core transfer API, the engine also implements **Drop codes**
+(create / claim / confirm one-time links), **publishable shared folders**,
+**tunnels**, **folder sync**, and **watch-party** media rooms. Consumers drive
+these through the same engine instance — see [`meshdrop-host`](https://github.com/aamirali51/meshdrop-host)
+for a headless reference client.
 
 ## Events
 
